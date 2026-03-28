@@ -33,6 +33,13 @@ Add to your MCP settings:
 claude mcp add metro-mcp -- bunx metro-mcp --port 19000
 ```
 
+## Requirements
+
+- **Bun** 1.0+ (runtime)
+- **iOS**: Xcode 14+ with Simulator (`xcrun simctl` is used for most operations)
+- **Android**: Android SDK with `adb` on your PATH
+- **IDB** *(optional)*: Some iOS operations fall back to [IDB (idb-companion)](https://github.com/facebook/idb) — install with `brew install idb-companion`. Tools will tell you when IDB is needed and how to install it.
+
 ## How It Works
 
 metro-mcp connects to your running Metro dev server the same way Chrome DevTools does:
@@ -140,12 +147,14 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 
 ### UI Interact
 
-- **`list_elements`** — Get accessibility tree with labels, types, coordinates.
-- **`tap_element`** — Tap by label, testID, or coordinates.
-- **`swipe`** — Swipe up/down/left/right.
-- **`type_text`** — Type text into focused input.
-- **`press_button`** — Press HOME, BACK, VOLUME, etc.
-- **`long_press`** — Long press at coordinates.
+All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB as a last resort. IDB is optional — tools will prompt you to install it when needed.
+
+- **`list_elements`** — Get interactive elements from the React component tree (labels, testIDs, roles). No IDB needed.
+- **`tap_element`** — Tap by label/testID (CDP fiber tree) or coordinates (simctl/adb → IDB fallback).
+- **`type_text`** — Type into a TextInput by testID/label or the first visible input (CDP → adb → IDB).
+- **`long_press`** — Long press by label/testID (CDP) or coordinates (adb → IDB).
+- **`swipe`** — Scroll/swipe in a direction (CDP ScrollView → adb → IDB).
+- **`press_button`** — Press HOME (simctl), BACK/ENTER/DELETE (CDP + adb), VOLUME/POWER (adb → IDB).
 
 ### Navigation (no app changes needed)
 

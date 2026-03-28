@@ -16,8 +16,8 @@ export const commandsPlugin = definePlugin({
           (function() {
             var commands = {};
             // Check both conventions
-            var src = (global.__METRO_MCP__ && global.__METRO_MCP__.commands)
-              || global.__METRO_MCP_COMMANDS__
+            var src = (globalThis.__METRO_MCP__ && globalThis.__METRO_MCP__.commands)
+              || globalThis.__METRO_MCP_COMMANDS__
               || null;
             if (!src) return { available: false, message: 'No commands registered. See metro-mcp docs for setup.' };
             var names = Object.keys(src);
@@ -44,8 +44,8 @@ export const commandsPlugin = definePlugin({
 
         const result = await ctx.evalInApp(`
           (async function() {
-            var src = (global.__METRO_MCP__ && global.__METRO_MCP__.commands)
-              || global.__METRO_MCP_COMMANDS__
+            var src = (globalThis.__METRO_MCP__ && globalThis.__METRO_MCP__.commands)
+              || globalThis.__METRO_MCP_COMMANDS__
               || null;
             if (!src) return { error: 'No commands registered.' };
             var cmd = src['${escapedName}'];

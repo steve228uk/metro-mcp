@@ -1,4 +1,13 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(bun run:*)",
+      "mcp__metro-mcp__list_devices",
+      "mcp__metro-mcp__list_elements",
+      "mcp__metro-mcp__get_component_tree",
+      "mcp__metro-mcp__evaluate_js"
+    ]
+  },
   "disabledMcpjsonServers": [
     "metro-mcp"
   ]

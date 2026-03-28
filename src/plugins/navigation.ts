@@ -10,12 +10,12 @@ export const navigationPlugin = definePlugin({
     const GET_NAV_STATE_EXPR = `
       (function() {
         // Try client SDK first
-        if (global.__METRO_MCP__?.navigation?.getState) {
-          return global.__METRO_MCP__.navigation.getState();
+        if (globalThis.__METRO_MCP__?.navigation?.getState) {
+          return globalThis.__METRO_MCP__.navigation.getState();
         }
 
         // Walk fiber tree to find NavigationContainer
-        var hook = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+        var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
         if (!hook || !hook.getFiberRoots) return null;
 
         var fiberRoots;

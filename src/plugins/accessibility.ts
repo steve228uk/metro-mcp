@@ -16,7 +16,7 @@ export const accessibilityPlugin = definePlugin({
   async setup(ctx) {
     const AUDIT_EXPR = `
       (function() {
-        var hook = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+        var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
         if (!hook || !hook.getFiberRoots) return null;
 
         var fiberRoots;
@@ -174,7 +174,7 @@ export const accessibilityPlugin = definePlugin({
 
         const expr = `
           (function() {
-            var hook = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+            var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
             if (!hook || !hook.getFiberRoots) return null;
             var fiberRoots;
             for (var i = 1; i <= 5; i++) {
@@ -220,7 +220,7 @@ export const accessibilityPlugin = definePlugin({
       handler: async () => {
         const expr = `
           (function() {
-            var hook = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+            var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
             if (!hook || !hook.getFiberRoots) return null;
             var fiberRoots;
             for (var i = 1; i <= 5; i++) {

@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { extractCDPExceptionMessage } from '../utils/cdp.js';
 
 export const evaluatePlugin = definePlugin({
   name: 'evaluate',
@@ -14,31 +13,14 @@ export const evaluatePlugin = definePlugin({
       parameters: z.object({
         expression: z.string().describe('JavaScript expression to evaluate'),
         awaitPromise: z.boolean().default(true).describe('Wait for promise to resolve if expression returns a promise'),
-        returnByValue: z.boolean().default(true).describe('Return the result by value (serialized)'),
       }),
-      handler: async ({ expression, awaitPromise, returnByValue }) => {
-        if (!ctx.cdp.isConnected()) {
-          return 'Not connected to Metro. Use list_devices to check connection status.';
+      handler: async ({ expression, awaitPromise }) => {
+        try {
+          const value = await ctx.evalInApp(expression, { awaitPromise });
+          return value === undefined ? 'undefined' : value;
+        } catch (err) {
+          return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
-
-        const result = (await ctx.cdp.send('Runtime.evaluate', {
-          expression,
-          awaitPromise,
-          returnByValue,
-          generatePreview: true,
-          userGesture: true,
-        })) as Record<string, unknown>;
-
-        if (result.exceptionDetails) {
-          return `Error: ${extractCDPExceptionMessage(result.exceptionDetails as Record<string, unknown>, 'Evaluation error')}`;
-        }
-
-        const value = result.result as Record<string, unknown>;
-        if (value.type === 'undefined') return 'undefined';
-        if (value.subtype === 'null') return 'null';
-        if (value.value !== undefined) return value.value;
-        if (value.description) return value.description;
-        return value;
       },
     });
   },

@@ -15,7 +15,7 @@ export const maestroPlugin = definePlugin({
     }>> {
       const expr = `
         (function() {
-          var hook = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+          var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
           if (!hook || !hook.getFiberRoots) return [];
           var fiberRoots;
           for (var i = 1; i <= 5; i++) {
@@ -180,14 +180,14 @@ export const maestroPlugin = definePlugin({
           // Inject a recording hook
           await ctx.evalInApp(`
             (function() {
-              global.__METRO_MCP_RECORDING__ = [];
+              globalThis.__METRO_MCP_RECORDING__ = [];
               // Patch console to capture navigation events
               var origNav = console.info;
               console.info = function() {
                 var args = Array.from(arguments);
                 var msg = args.join(' ');
                 if (msg.includes('navigate') || msg.includes('press') || msg.includes('tap')) {
-                  global.__METRO_MCP_RECORDING__.push({
+                  globalThis.__METRO_MCP_RECORDING__.push({
                     time: Date.now(),
                     type: 'interaction',
                     description: msg,
@@ -201,8 +201,8 @@ export const maestroPlugin = definePlugin({
         } else {
           const events = await ctx.evalInApp(`
             (function() {
-              var events = global.__METRO_MCP_RECORDING__ || [];
-              delete global.__METRO_MCP_RECORDING__;
+              var events = globalThis.__METRO_MCP_RECORDING__ || [];
+              delete globalThis.__METRO_MCP_RECORDING__;
               return events;
             })()
           `, { timeout: 5000 });

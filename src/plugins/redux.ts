@@ -19,20 +19,18 @@ export const reduxPlugin = definePlugin({
         const getStateExpr = `
           (function() {
             // Client SDK
-            if (typeof global !== 'undefined' && global.__METRO_MCP__?.redux?.getState) {
-              return global.__METRO_MCP__.redux.getState();
+            if (globalThis.__METRO_MCP__?.redux?.getState) {
+              return globalThis.__METRO_MCP__.redux.getState();
             }
             // Redux DevTools
-            if (typeof global !== 'undefined' && global.__REDUX_DEVTOOLS_EXTENSION__) {
-              var stores = global.__REDUX_DEVTOOLS_EXTENSION__.getStores?.();
+            if (globalThis.__REDUX_DEVTOOLS_EXTENSION__) {
+              var stores = globalThis.__REDUX_DEVTOOLS_EXTENSION__.getStores?.();
               if (stores && stores.length > 0) return stores[0].getState();
             }
             // Common global patterns
-            if (typeof global !== 'undefined') {
-              if (global.__REDUX_STORE__) return global.__REDUX_STORE__.getState();
-              if (global.store?.getState) return global.store.getState();
-              if (global.__store__?.getState) return global.__store__.getState();
-            }
+            if (globalThis.__REDUX_STORE__) return globalThis.__REDUX_STORE__.getState();
+            if (globalThis.store?.getState) return globalThis.store.getState();
+            if (globalThis.__store__?.getState) return globalThis.__store__.getState();
             return '__REDUX_NOT_FOUND__';
           })()
         `;
@@ -72,9 +70,9 @@ export const reduxPlugin = definePlugin({
         const expr = `
           (function() {
             var action = ${action};
-            if (global.__METRO_MCP__?.redux?.dispatch) return global.__METRO_MCP__.redux.dispatch(action);
-            if (global.__REDUX_STORE__?.dispatch) return global.__REDUX_STORE__.dispatch(action);
-            if (global.store?.dispatch) return global.store.dispatch(action);
+            if (globalThis.__METRO_MCP__?.redux?.dispatch) return globalThis.__METRO_MCP__.redux.dispatch(action);
+            if (globalThis.__REDUX_STORE__?.dispatch) return globalThis.__REDUX_STORE__.dispatch(action);
+            if (globalThis.store?.dispatch) return globalThis.store.dispatch(action);
             return '__REDUX_NOT_FOUND__';
           })()
         `;
@@ -92,8 +90,8 @@ export const reduxPlugin = definePlugin({
       handler: async ({ limit }) => {
         const expr = `
           (function() {
-            if (global.__METRO_MCP__?.redux?.actions) {
-              var actions = global.__METRO_MCP__.redux.actions;
+            if (globalThis.__METRO_MCP__?.redux?.actions) {
+              var actions = globalThis.__METRO_MCP__.redux.actions;
               if (typeof actions.getAll === 'function') return actions.getAll();
               if (Array.isArray(actions)) return actions;
             }
@@ -116,9 +114,9 @@ export const reduxPlugin = definePlugin({
         try {
           const expr = `
             (function() {
-              if (global.__METRO_MCP__?.redux?.getState) return global.__METRO_MCP__.redux.getState();
-              if (global.__REDUX_STORE__?.getState) return global.__REDUX_STORE__.getState();
-              if (global.store?.getState) return global.store.getState();
+              if (globalThis.__METRO_MCP__?.redux?.getState) return globalThis.__METRO_MCP__.redux.getState();
+              if (globalThis.__REDUX_STORE__?.getState) return globalThis.__REDUX_STORE__.getState();
+              if (globalThis.store?.getState) return globalThis.store.getState();
               return null;
             })()
           `;

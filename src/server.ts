@@ -155,19 +155,39 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
         }
       },
       evalInApp: async (expression: string, options?: EvalOptions) => {
-        if (!cdpClient.isConnected()) {
-          throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+        async function tryEval() {
+          if (!cdpClient.isConnected()) {
+            // Wait for any in-progress connection first, then reconnect if still not connected
+            const connected = await cdpClient.waitForConnection();
+            if (!connected) await connectToMetro();
+          }
+          if (!cdpClient.isConnected()) {
+            throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+          }
+          const result = (await cdpClient.send('Runtime.evaluate', {
+            expression,
+            returnByValue: true,
+            awaitPromise: options?.awaitPromise ?? false,
+            timeout: options?.timeout,
+          })) as Record<string, unknown>;
+          if (result.exceptionDetails) {
+            throw new Error(extractCDPExceptionMessage(result.exceptionDetails as Record<string, unknown>));
+          }
+          return (result.result as Record<string, unknown>).value;
         }
-        const result = (await cdpClient.send('Runtime.evaluate', {
-          expression,
-          returnByValue: true,
-          awaitPromise: options?.awaitPromise ?? false,
-          timeout: options?.timeout,
-        })) as Record<string, unknown>;
-        if (result.exceptionDetails) {
-          throw new Error(extractCDPExceptionMessage(result.exceptionDetails as Record<string, unknown>));
+        try {
+          return await tryEval();
+        } catch (err) {
+          if (err instanceof Error && (
+            err.message === 'WebSocket closed' ||
+            err.message === 'Not connected to CDP target' ||
+            err.message === 'Not connected to Metro. Use list_devices to check connection status.'
+          )) {
+            await connectToMetro();
+            return await tryEval();
+          }
+          throw err;
         }
-        return (result.result as Record<string, unknown>).value;
       },
       config: config as unknown as Record<string, unknown>,
       logger: pluginLogger,

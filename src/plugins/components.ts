@@ -4,7 +4,7 @@ import { definePlugin } from '../plugin.js';
 // JS expression to walk the React fiber tree
 const WALK_FIBER_EXPR = `
 (function() {
-  var hook = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+  var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
   if (!hook || !hook.getFiberRoots) return null;
 
   var roots = [];
@@ -30,7 +30,7 @@ const WALK_FIBER_EXPR = `
   }
 
   function walkFiber(fiber, depth) {
-    if (!fiber || depth > (OPTIONS.maxDepth || 50)) return null;
+    if (!fiber || depth > (OPTIONS.maxDepth || 200)) return null;
 
     var name = getName(fiber);
     var node = null;
@@ -158,7 +158,7 @@ export const componentsPlugin = definePlugin({
       handler: async ({ name }) => {
         const expr = `
           (function() {
-            var hook = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+            var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
             if (!hook || !hook.getFiberRoots) return null;
 
             var fiberRoots;
