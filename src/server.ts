@@ -1,0 +1,241 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import type {
+  MetroMCPConfig,
+  PluginContext,
+  PluginDefinition,
+  ToolConfig,
+  ResourceConfig,
+  PromptConfig,
+} from './plugin.js';
+import { CDPClient } from './metro/connection.js';
+import { scanMetroPorts, selectBestTarget, fetchTargets } from './metro/discovery.js';
+import { createLogger } from './utils/logger.js';
+import { createFormatUtils } from './utils/format.js';
+
+// Built-in plugins
+import { consolePlugin } from './plugins/console.js';
+import { networkPlugin } from './plugins/network.js';
+import { errorsPlugin } from './plugins/errors.js';
+import { evaluatePlugin } from './plugins/evaluate.js';
+import { devicePlugin } from './plugins/device.js';
+import { sourcePlugin } from './plugins/source.js';
+import { reduxPlugin } from './plugins/redux.js';
+import { componentsPlugin } from './plugins/components.js';
+import { storagePlugin } from './plugins/storage.js';
+import { bundlePlugin } from './plugins/bundle.js';
+import { simulatorPlugin } from './plugins/simulator.js';
+import { deeplinkPlugin } from './plugins/deeplink.js';
+import { uiInteractPlugin } from './plugins/ui-interact.js';
+import { navigationPlugin } from './plugins/navigation.js';
+import { accessibilityPlugin } from './plugins/accessibility.js';
+import { commandsPlugin } from './plugins/commands.js';
+import { maestroPlugin } from './plugins/maestro.js';
+import { promptsPlugin } from './plugins/prompts.js';
+
+const logger = createLogger('server');
+
+const BUILT_IN_PLUGINS: PluginDefinition[] = [
+  consolePlugin,
+  networkPlugin,
+  errorsPlugin,
+  evaluatePlugin,
+  devicePlugin,
+  sourcePlugin,
+  reduxPlugin,
+  componentsPlugin,
+  storagePlugin,
+  bundlePlugin,
+  simulatorPlugin,
+  deeplinkPlugin,
+  uiInteractPlugin,
+  navigationPlugin,
+  accessibilityPlugin,
+  commandsPlugin,
+  maestroPlugin,
+  promptsPlugin,
+];
+
+export async function startServer(config: Required<MetroMCPConfig>): Promise<void> {
+  const mcpServer = new McpServer(
+    {
+      name: 'metro-mcp',
+      version: '0.1.0',
+    },
+    {
+      instructions: `React Native runtime debugging MCP server. Connects to Metro bundler via Chrome DevTools Protocol to provide console logs, network requests, component tree inspection, state management debugging, device control, and more. Use list_devices to see connected targets, then use other tools to inspect and interact with the running app.`,
+    }
+  );
+
+  const cdpClient = new CDPClient();
+  const formatUtils = createFormatUtils();
+
+  // Create the plugin context factory
+  function createPluginContext(plugin: PluginDefinition): PluginContext {
+    const pluginLogger = createLogger(plugin.name);
+    return {
+      cdp: cdpClient,
+      registerTool: <T extends z.ZodType>(name: string, toolConfig: ToolConfig<T>) => {
+        try {
+          mcpServer.tool(
+            name,
+            toolConfig.description,
+            toolConfig.parameters instanceof z.ZodObject
+              ? (toolConfig.parameters as z.ZodObject<z.ZodRawShape>).shape
+              : { input: toolConfig.parameters },
+            async (args) => {
+              try {
+                const result = await toolConfig.handler(args as z.infer<T>);
+                const content = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+                return { content: [{ type: 'text' as const, text: content }] };
+              } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
+              }
+            }
+          );
+          pluginLogger.debug(`Registered tool: ${name}`);
+        } catch (err) {
+          pluginLogger.error(`Failed to register tool ${name}:`, err);
+        }
+      },
+      registerResource: (uri: string, resourceConfig: ResourceConfig) => {
+        try {
+          mcpServer.resource(
+            resourceConfig.name,
+            uri,
+            { description: resourceConfig.description, mimeType: resourceConfig.mimeType || 'application/json' },
+            async () => {
+              const content = await resourceConfig.handler();
+              return { contents: [{ uri, text: content, mimeType: resourceConfig.mimeType || 'application/json' }] };
+            }
+          );
+          pluginLogger.debug(`Registered resource: ${uri}`);
+        } catch (err) {
+          pluginLogger.error(`Failed to register resource ${uri}:`, err);
+        }
+      },
+      registerPrompt: (name: string, promptConfig: PromptConfig) => {
+        try {
+          // Build args schema shape for MCP SDK
+          const argsShape: Record<string, z.ZodType> = {};
+          if (promptConfig.arguments) {
+            for (const arg of promptConfig.arguments) {
+              argsShape[arg.name] = arg.required ? z.string() : z.string().optional();
+            }
+          }
+          mcpServer.prompt(
+            name,
+            promptConfig.description,
+            argsShape,
+            async (args) => {
+              const messages = await promptConfig.handler(args as Record<string, string>);
+              return {
+                messages: messages.map((m) => ({
+                  role: m.role as 'user' | 'assistant',
+                  content: { type: 'text' as const, text: m.content },
+                })),
+              };
+            }
+          );
+          pluginLogger.debug(`Registered prompt: ${name}`);
+        } catch (err) {
+          pluginLogger.error(`Failed to register prompt ${name}:`, err);
+        }
+      },
+      config: config as unknown as Record<string, unknown>,
+      logger: pluginLogger,
+      metro: {
+        host: config.metro.host!,
+        port: config.metro.port!,
+        fetch: async (path: string) => {
+          return fetch(`http://${config.metro.host}:${config.metro.port}${path}`);
+        },
+      },
+      exec: async (command: string) => {
+        const proc = Bun.spawn(['sh', '-c', command], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        const stdout = await new Response(proc.stdout).text();
+        const stderr = await new Response(proc.stderr).text();
+        await proc.exited;
+        if (proc.exitCode !== 0) {
+          throw new Error(stderr || `Command failed with exit code ${proc.exitCode}`);
+        }
+        return stdout;
+      },
+      format: formatUtils,
+    };
+  }
+
+  // Load and initialize all plugins
+  const allPlugins = [...BUILT_IN_PLUGINS];
+
+  // Load external plugins from config
+  for (const pluginPath of config.plugins) {
+    try {
+      const mod = await import(pluginPath);
+      const plugin: PluginDefinition = mod.default || mod;
+      if (plugin?.name && typeof plugin?.setup === 'function') {
+        allPlugins.push(plugin);
+        logger.info(`Loaded external plugin: ${plugin.name}`);
+      }
+    } catch (err) {
+      logger.error(`Failed to load plugin ${pluginPath}:`, err);
+    }
+  }
+
+  // Initialize plugins
+  for (const plugin of allPlugins) {
+    try {
+      const ctx = createPluginContext(plugin);
+      await plugin.setup(ctx);
+      logger.debug(`Initialized plugin: ${plugin.name}`);
+    } catch (err) {
+      logger.error(`Failed to initialize plugin ${plugin.name}:`, err);
+    }
+  }
+
+  // Connect to Metro
+  async function connectToMetro(): Promise<boolean> {
+    try {
+      let servers;
+      if (config.metro.autoDiscover) {
+        servers = await scanMetroPorts(config.metro.host!);
+      } else {
+        const targets = await fetchTargets(config.metro.host!, config.metro.port!);
+        servers = targets.length > 0 ? [{ host: config.metro.host!, port: config.metro.port!, targets }] : [];
+      }
+
+      if (servers.length === 0) {
+        logger.warn('No Metro servers found. Tools will report disconnected status.');
+        return false;
+      }
+
+      const server = servers[0];
+      config.metro.port = server.port;
+      const target = selectBestTarget(server.targets);
+
+      if (!target) {
+        logger.warn('No suitable CDP target found.');
+        return false;
+      }
+
+      await cdpClient.connect(target);
+      return true;
+    } catch (err) {
+      logger.warn('Could not connect to Metro:', err);
+      return false;
+    }
+  }
+
+  // Start MCP transport
+  const transport = new StdioServerTransport();
+  await mcpServer.connect(transport);
+  logger.info('MCP server started');
+
+  // Try connecting to Metro (non-blocking — server works without connection)
+  void connectToMetro();
+}

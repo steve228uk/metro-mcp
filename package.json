@@ -1,0 +1,44 @@
+{
+  "name": "metro-mcp",
+  "version": "0.1.0",
+  "description": "Plugin-based MCP server for React Native runtime debugging, inspection, and automation via Metro/CDP",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "metro-mcp": "bin/metro-mcp.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client/index.ts",
+    "./plugin": "./src/plugin.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run --watch src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target node",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "mcp",
+    "react-native",
+    "expo",
+    "metro",
+    "debugging",
+    "devtools",
+    "cdp",
+    "model-context-protocol"
+  ],
+  "author": "Stephen Radford",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.10",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
