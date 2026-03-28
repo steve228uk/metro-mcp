@@ -7,22 +7,6 @@ export const reduxPlugin = definePlugin({
   description: 'Redux state inspection via Runtime.evaluate',
 
   async setup(ctx) {
-    async function evalInApp(expression: string): Promise<unknown> {
-      if (!ctx.cdp.isConnected()) throw new Error('Not connected');
-      const result = (await ctx.cdp.send('Runtime.evaluate', {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-      })) as Record<string, unknown>;
-
-      if (result.exceptionDetails) {
-        const ex = result.exceptionDetails as Record<string, unknown>;
-        throw new Error((ex.text as string) || 'Evaluation failed');
-      }
-      const val = result.result as Record<string, unknown>;
-      return val.value;
-    }
-
     ctx.registerTool('get_redux_state', {
       description:
         'Get the current Redux state tree or a specific slice. Works without client SDK if Redux DevTools extension is present or store is exposed globally.',
@@ -53,7 +37,7 @@ export const reduxPlugin = definePlugin({
           })()
         `;
 
-        const state = await evalInApp(getStateExpr);
+        const state = await ctx.evalInApp(getStateExpr, { awaitPromise: true });
         if (state === '__REDUX_NOT_FOUND__') {
           return 'Redux store not found. Ensure Redux DevTools extension is enabled, or use the metro-mcp client SDK, or expose your store globally.';
         }
@@ -94,7 +78,7 @@ export const reduxPlugin = definePlugin({
             return '__REDUX_NOT_FOUND__';
           })()
         `;
-        const result = await evalInApp(expr);
+        const result = await ctx.evalInApp(expr, { awaitPromise: true });
         if (result === '__REDUX_NOT_FOUND__') return 'Redux store not found.';
         return `Dispatched: ${type}`;
       },
@@ -116,7 +100,7 @@ export const reduxPlugin = definePlugin({
             return '__NO_ACTIONS__';
           })()
         `;
-        const result = await evalInApp(expr);
+        const result = await ctx.evalInApp(expr, { awaitPromise: true });
         if (result === '__NO_ACTIONS__') {
           return 'Action history not available. Install the metro-mcp client SDK to track Redux actions in real-time.';
         }
@@ -138,7 +122,7 @@ export const reduxPlugin = definePlugin({
               return null;
             })()
           `;
-          const state = await evalInApp(expr);
+          const state = await ctx.evalInApp(expr, { awaitPromise: true });
           return JSON.stringify(state, null, 2);
         } catch {
           return JSON.stringify({ error: 'Redux state not available' });

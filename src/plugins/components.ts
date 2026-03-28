@@ -95,20 +95,6 @@ export const componentsPlugin = definePlugin({
   description: 'React component tree inspection via fiber tree walking',
 
   async setup(ctx) {
-    async function evalInApp(expression: string): Promise<unknown> {
-      if (!ctx.cdp.isConnected()) throw new Error('Not connected');
-      const result = (await ctx.cdp.send('Runtime.evaluate', {
-        expression,
-        returnByValue: true,
-        timeout: 5000,
-      })) as Record<string, unknown>;
-
-      if (result.exceptionDetails) {
-        throw new Error('Failed to walk fiber tree');
-      }
-      return (result.result as Record<string, unknown>).value;
-    }
-
     ctx.registerTool('get_component_tree', {
       description:
         'Get the React component tree of the running app. Use structureOnly=true for a compact view (~1-3KB).',
@@ -120,7 +106,7 @@ export const componentsPlugin = definePlugin({
       handler: async ({ structureOnly, maxDepth, compact: isCompact }) => {
         const options = JSON.stringify({ structureOnly, maxDepth, includeTestIds: true });
         const expr = WALK_FIBER_EXPR.replace('__OPTIONS__', options);
-        const tree = await evalInApp(expr);
+        const tree = await ctx.evalInApp(expr, { timeout: 5000 });
         if (!tree) return 'Component tree not available. Ensure React DevTools hook is present.';
         if (isCompact) return ctx.format.compact(tree);
         return tree;
@@ -140,7 +126,7 @@ export const componentsPlugin = definePlugin({
           includeTestIds: true,
         });
         const expr = WALK_FIBER_EXPR.replace('__OPTIONS__', options);
-        const tree = await evalInApp(expr);
+        const tree = await ctx.evalInApp(expr, { timeout: 5000 });
         if (!tree) return 'Component tree not available.';
 
         const matches: unknown[] = [];
@@ -240,7 +226,7 @@ export const componentsPlugin = definePlugin({
             return result;
           })()
         `;
-        const result = await evalInApp(expr);
+        const result = await ctx.evalInApp(expr, { timeout: 5000 });
         if (!result) return `Component "${name}" not found in the tree.`;
         return result;
       },
@@ -257,7 +243,7 @@ export const componentsPlugin = definePlugin({
           includeTestIds: true,
         });
         const expr = WALK_FIBER_EXPR.replace('__OPTIONS__', options);
-        const tree = await evalInApp(expr);
+        const tree = await ctx.evalInApp(expr, { timeout: 5000 });
         if (!tree) return 'Component tree not available.';
 
         const elements: Array<{ name: string; testID?: string; accessibilityLabel?: string; accessibilityRole?: string }> = [];

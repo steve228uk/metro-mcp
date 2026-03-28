@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import { extractCDPExceptionMessage } from '../utils/cdp.js';
 
 export const evaluatePlugin = definePlugin({
   name: 'evaluate',
@@ -29,14 +30,7 @@ export const evaluatePlugin = definePlugin({
         })) as Record<string, unknown>;
 
         if (result.exceptionDetails) {
-          const exception = result.exceptionDetails as Record<string, unknown>;
-          const exObj = exception.exception as Record<string, unknown>;
-          const message =
-            (exObj?.description as string) ||
-            (exObj?.value as string) ||
-            (exception?.text as string) ||
-            'Evaluation error';
-          return `Error: ${message}`;
+          return `Error: ${extractCDPExceptionMessage(result.exceptionDetails as Record<string, unknown>, 'Evaluation error')}`;
         }
 
         const value = result.result as Record<string, unknown>;

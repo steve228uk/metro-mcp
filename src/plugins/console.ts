@@ -49,13 +49,6 @@ export const consolePlugin = definePlugin({
       });
     });
 
-    // Re-enable on reconnect
-    ctx.cdp.on('reconnected', async () => {
-      try { await ctx.cdp.send('Runtime.enable'); } catch {}
-    });
-
-    try { await ctx.cdp.send('Runtime.enable'); } catch {}
-
     ctx.registerTool('get_console_logs', {
       description: 'Get recent console output from the React Native app. Filter by log level and search text.',
       parameters: z.object({

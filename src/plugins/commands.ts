@@ -7,26 +7,12 @@ export const commandsPlugin = definePlugin({
   description: 'Custom app commands via global.__METRO_MCP__.commands',
 
   async setup(ctx) {
-    async function evalInApp(expression: string): Promise<unknown> {
-      if (!ctx.cdp.isConnected()) throw new Error('Not connected');
-      const result = (await ctx.cdp.send('Runtime.evaluate', {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-      })) as Record<string, unknown>;
-      if (result.exceptionDetails) {
-        const ex = result.exceptionDetails as Record<string, unknown>;
-        throw new Error((ex.text as string) || 'Command execution failed');
-      }
-      return (result.result as Record<string, unknown>).value;
-    }
-
     ctx.registerTool('list_commands', {
       description:
         'List all custom commands registered by the app. Commands are registered on global.__METRO_MCP__.commands or global.__METRO_MCP_COMMANDS__.',
       parameters: z.object({}),
       handler: async () => {
-        const result = await evalInApp(`
+        const result = await ctx.evalInApp(`
           (function() {
             var commands = {};
             // Check both conventions
@@ -56,7 +42,7 @@ export const commandsPlugin = definePlugin({
         const escapedName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
         const paramsJson = JSON.stringify(params || {});
 
-        const result = await evalInApp(`
+        const result = await ctx.evalInApp(`
           (async function() {
             var src = (global.__METRO_MCP__ && global.__METRO_MCP__.commands)
               || global.__METRO_MCP_COMMANDS__
@@ -72,7 +58,7 @@ export const commandsPlugin = definePlugin({
               return { error: e.message || String(e) };
             }
           })()
-        `);
+        `, { awaitPromise: true });
         return result;
       },
     });

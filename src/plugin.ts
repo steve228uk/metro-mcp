@@ -52,6 +52,15 @@ export interface PromptConfig {
   handler: (args: Record<string, string>) => Promise<Array<{ role: 'user' | 'assistant'; content: string }>>;
 }
 
+// ── Eval Options ──
+
+export interface EvalOptions {
+  /** Wait for a returned Promise to resolve before returning the value */
+  awaitPromise?: boolean;
+  /** CDP timeout in milliseconds (default: 10000) */
+  timeout?: number;
+}
+
 // ── Plugin Context ──
 
 export interface PluginContext {
@@ -68,6 +77,8 @@ export interface PluginContext {
   };
   exec(command: string): Promise<string>;
   format: FormatUtils;
+  /** Evaluate a JavaScript expression in the connected app runtime */
+  evalInApp(expression: string, options?: EvalOptions): Promise<unknown>;
 }
 
 // ── Logger ──

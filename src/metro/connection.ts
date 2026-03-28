@@ -38,7 +38,6 @@ export class CDPClient implements CDPConnection {
     this.target = target;
     this.suppressReconnect = false;
     await this.doConnect(target.webSocketDebuggerUrl);
-    // Notify plugins to enable their CDP domains (same as on reconnect)
     this.emit('reconnected', {});
   }
 

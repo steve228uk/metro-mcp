@@ -1,7 +1,7 @@
 {
   "name": "metro-mcp",
   "version": "0.1.0",
-  "description": "Plugin-based MCP server for React Native runtime debugging, inspection, and automation via Metro/CDP",
+  "description": "Plugin-based MCP server for React Native/Expo runtime debugging, inspection, and automation via Metro/CDP",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -43,7 +43,9 @@
     "debugging",
     "devtools",
     "cdp",
-    "model-context-protocol"
+    "model-context-protocol",
+    "ai",
+    "agentic"
   ],
   "author": "Stephen Radford",
   "license": "MIT",

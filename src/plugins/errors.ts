@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { CircularBuffer } from '../utils/buffer.js';
 import { formatTimestamp } from '../utils/format.js';
+import { extractCDPExceptionMessage } from '../utils/cdp.js';
 
 interface ErrorEntry {
   timestamp: number;
@@ -19,15 +20,13 @@ export const errorsPlugin = definePlugin({
     const buffer = new CircularBuffer<ErrorEntry>(100);
 
     ctx.cdp.on('Runtime.exceptionThrown', async (params) => {
-      const exception = params.exceptionDetails as Record<string, unknown>;
-      const exObj = exception?.exception as Record<string, unknown>;
-      const message =
-        (exObj?.description as string) ||
-        (exObj?.value as string) ||
-        (exception?.text as string) ||
-        'Unknown error';
+      const message = extractCDPExceptionMessage(
+        params.exceptionDetails as Record<string, unknown>,
+        'Unknown error'
+      );
 
-      const stackTrace = exception?.stackTrace as Record<string, unknown>;
+      const exceptionDetails = params.exceptionDetails as Record<string, unknown>;
+      const stackTrace = exceptionDetails?.stackTrace as Record<string, unknown>;
       const stack = stackTrace?.callFrames
         ? JSON.stringify(stackTrace.callFrames)
         : undefined;
@@ -65,12 +64,6 @@ export const errorsPlugin = definePlugin({
 
       buffer.push(entry);
     });
-
-    ctx.cdp.on('reconnected', async () => {
-      try { await ctx.cdp.send('Runtime.enable'); } catch {}
-    });
-
-    try { await ctx.cdp.send('Runtime.enable'); } catch {}
 
     ctx.registerTool('get_errors', {
       description: 'Get recent uncaught exceptions and errors from the React Native app.',

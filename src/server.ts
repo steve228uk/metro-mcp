@@ -8,11 +8,13 @@ import type {
   ToolConfig,
   ResourceConfig,
   PromptConfig,
+  EvalOptions,
 } from './plugin.js';
 import { CDPClient } from './metro/connection.js';
 import { scanMetroPorts, selectBestTarget, fetchTargets } from './metro/discovery.js';
 import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
+import { extractCDPExceptionMessage } from './utils/cdp.js';
 
 // Built-in plugins
 import { consolePlugin } from './plugins/console.js';
@@ -70,6 +72,14 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
 
   const cdpClient = new CDPClient();
   const formatUtils = createFormatUtils();
+
+  // Enable required CDP domains on every connection (initial and reconnect).
+  cdpClient.on('reconnected', async () => {
+    await Promise.all([
+      cdpClient.send('Runtime.enable').catch(() => {}),
+      cdpClient.send('Network.enable').catch(() => {}),
+    ]);
+  });
 
   // Create the plugin context factory
   function createPluginContext(plugin: PluginDefinition): PluginContext {
@@ -143,6 +153,21 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
         } catch (err) {
           pluginLogger.error(`Failed to register prompt ${name}:`, err);
         }
+      },
+      evalInApp: async (expression: string, options?: EvalOptions) => {
+        if (!cdpClient.isConnected()) {
+          throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+        }
+        const result = (await cdpClient.send('Runtime.evaluate', {
+          expression,
+          returnByValue: true,
+          awaitPromise: options?.awaitPromise ?? false,
+          timeout: options?.timeout,
+        })) as Record<string, unknown>;
+        if (result.exceptionDetails) {
+          throw new Error(extractCDPExceptionMessage(result.exceptionDetails as Record<string, unknown>));
+        }
+        return (result.result as Record<string, unknown>).value;
       },
       config: config as unknown as Record<string, unknown>,
       logger: pluginLogger,

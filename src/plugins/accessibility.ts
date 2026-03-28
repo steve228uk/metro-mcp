@@ -14,25 +14,6 @@ export const accessibilityPlugin = definePlugin({
   description: 'Accessibility auditing via fiber tree inspection',
 
   async setup(ctx) {
-    async function evalInApp(expression: string): Promise<unknown> {
-      if (!ctx.cdp.isConnected()) throw new Error('Not connected');
-      const result = (await ctx.cdp.send('Runtime.evaluate', {
-        expression,
-        returnByValue: true,
-        timeout: 10000,
-      })) as Record<string, unknown>;
-      if (result.exceptionDetails) {
-        const details = result.exceptionDetails as Record<string, unknown>;
-        const exception = details.exception as Record<string, unknown> | undefined;
-        const message =
-          (exception?.description as string) ||
-          (details.text as string) ||
-          'Evaluation failed';
-        throw new Error(message);
-      }
-      return (result.result as Record<string, unknown>).value;
-    }
-
     const AUDIT_EXPR = `
       (function() {
         var hook = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
@@ -163,7 +144,7 @@ export const accessibilityPlugin = definePlugin({
         severity: z.enum(['all', 'error', 'warning', 'info']).default('all').describe('Filter by severity level'),
       }),
       handler: async ({ severity }) => {
-        const issues = (await evalInApp(AUDIT_EXPR)) as AccessibilityIssue[] | null;
+        const issues = (await ctx.evalInApp(AUDIT_EXPR)) as AccessibilityIssue[] | null;
         if (!issues) return 'Could not access component tree for audit.';
         if (issues.length === 0) return 'No accessibility issues found!';
 
@@ -227,7 +208,7 @@ export const accessibilityPlugin = definePlugin({
             };
           })()
         `;
-        const result = await evalInApp(expr);
+        const result = await ctx.evalInApp(expr);
         if (!result) return `Element not found.`;
         return result;
       },
@@ -277,7 +258,7 @@ export const accessibilityPlugin = definePlugin({
             return stats;
           })()
         `;
-        const result = await evalInApp(expr);
+        const result = await ctx.evalInApp(expr);
         if (!result) return 'Could not access component tree.';
         return result;
       },

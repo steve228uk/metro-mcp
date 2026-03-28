@@ -69,12 +69,6 @@ export const networkPlugin = definePlugin({
       }
     });
 
-    ctx.cdp.on('reconnected', async () => {
-      try { await ctx.cdp.send('Network.enable'); } catch {}
-    });
-
-    try { await ctx.cdp.send('Network.enable'); } catch {}
-
     ctx.registerTool('get_network_requests', {
       description: 'Get recent network requests from the React Native app.',
       parameters: z.object({

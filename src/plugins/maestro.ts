@@ -7,17 +7,6 @@ export const maestroPlugin = definePlugin({
   description: 'Maestro test flow generation from component tree data',
 
   async setup(ctx) {
-    async function evalInApp(expression: string): Promise<unknown> {
-      if (!ctx.cdp.isConnected()) throw new Error('Not connected');
-      const result = (await ctx.cdp.send('Runtime.evaluate', {
-        expression,
-        returnByValue: true,
-        timeout: 5000,
-      })) as Record<string, unknown>;
-      if (result.exceptionDetails) throw new Error('Evaluation failed');
-      return (result.result as Record<string, unknown>).value;
-    }
-
     async function getTestableElements(): Promise<Array<{
       name: string;
       testID?: string;
@@ -58,7 +47,7 @@ export const maestroPlugin = definePlugin({
           return elements;
         })()
       `;
-      return ((await evalInApp(expr)) as Array<{
+      return ((await ctx.evalInApp(expr, { timeout: 5000 })) as Array<{
         name: string;
         testID?: string;
         accessibilityLabel?: string;
@@ -189,7 +178,7 @@ export const maestroPlugin = definePlugin({
       handler: async ({ action }) => {
         if (action === 'start') {
           // Inject a recording hook
-          await evalInApp(`
+          await ctx.evalInApp(`
             (function() {
               global.__METRO_MCP_RECORDING__ = [];
               // Patch console to capture navigation events
@@ -207,16 +196,16 @@ export const maestroPlugin = definePlugin({
                 origNav.apply(console, arguments);
               };
             })()
-          `);
+          `, { timeout: 5000 });
           return 'Recording started. Interact with the app, then call record_interaction with action="stop".';
         } else {
-          const events = await evalInApp(`
+          const events = await ctx.evalInApp(`
             (function() {
               var events = global.__METRO_MCP_RECORDING__ || [];
               delete global.__METRO_MCP_RECORDING__;
               return events;
             })()
-          `);
+          `, { timeout: 5000 });
 
           if (!Array.isArray(events) || events.length === 0) {
             return 'No interactions recorded. Use generate_maestro_flow instead for description-based generation.';

@@ -7,25 +7,11 @@ export const storagePlugin = definePlugin({
   description: 'AsyncStorage reading via Runtime.evaluate',
 
   async setup(ctx) {
-    async function evalInApp(expression: string): Promise<unknown> {
-      if (!ctx.cdp.isConnected()) throw new Error('Not connected');
-      const result = (await ctx.cdp.send('Runtime.evaluate', {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-      })) as Record<string, unknown>;
-
-      if (result.exceptionDetails) {
-        throw new Error('AsyncStorage access failed');
-      }
-      return (result.result as Record<string, unknown>).value;
-    }
-
     ctx.registerTool('get_storage_keys', {
       description: 'List all AsyncStorage keys in the React Native app.',
       parameters: z.object({}),
       handler: async () => {
-        const result = await evalInApp(`
+        const result = await ctx.evalInApp(`
           (async function() {
             try {
               var AsyncStorage = require('@react-native-async-storage/async-storage').default
@@ -37,7 +23,7 @@ export const storagePlugin = definePlugin({
               return { error: e.message };
             }
           })()
-        `);
+        `, { awaitPromise: true });
         return result;
       },
     });
@@ -49,7 +35,7 @@ export const storagePlugin = definePlugin({
       }),
       handler: async ({ key }) => {
         const escapedKey = key.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        const result = await evalInApp(`
+        const result = await ctx.evalInApp(`
           (async function() {
             try {
               var AsyncStorage = require('@react-native-async-storage/async-storage').default
@@ -62,7 +48,7 @@ export const storagePlugin = definePlugin({
               return { error: e.message };
             }
           })()
-        `);
+        `, { awaitPromise: true });
         return result;
       },
     });
@@ -73,7 +59,7 @@ export const storagePlugin = definePlugin({
         maxLength: z.number().default(500).describe('Max length for each value'),
       }),
       handler: async ({ maxLength }) => {
-        const result = await evalInApp(`
+        const result = await ctx.evalInApp(`
           (async function() {
             try {
               var AsyncStorage = require('@react-native-async-storage/async-storage').default
@@ -96,7 +82,7 @@ export const storagePlugin = definePlugin({
               return { error: e.message };
             }
           })()
-        `);
+        `, { awaitPromise: true });
         return result;
       },
     });

@@ -7,20 +7,6 @@ export const navigationPlugin = definePlugin({
   description: 'React Navigation / Expo Router state inspection',
 
   async setup(ctx) {
-    async function evalInApp(expression: string): Promise<unknown> {
-      if (!ctx.cdp.isConnected()) throw new Error('Not connected');
-      const result = (await ctx.cdp.send('Runtime.evaluate', {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-      })) as Record<string, unknown>;
-
-      if (result.exceptionDetails) {
-        throw new Error('Navigation state access failed');
-      }
-      return (result.result as Record<string, unknown>).value;
-    }
-
     const GET_NAV_STATE_EXPR = `
       (function() {
         // Try client SDK first
@@ -86,7 +72,7 @@ export const navigationPlugin = definePlugin({
         compact: z.boolean().default(false).describe('Return compact format'),
       }),
       handler: async ({ compact: isCompact }) => {
-        const state = await evalInApp(GET_NAV_STATE_EXPR);
+        const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
         if (!state) {
           return 'Navigation state not found. Ensure your app uses React Navigation or Expo Router.';
         }
@@ -120,7 +106,7 @@ export const navigationPlugin = definePlugin({
             return getFocusedRoute(state);
           })()
         `;
-        const result = await evalInApp(expr);
+        const result = await ctx.evalInApp(expr, { awaitPromise: true });
         if (!result) return 'No focused route found.';
         return result;
       },
@@ -130,7 +116,7 @@ export const navigationPlugin = definePlugin({
       description: 'Get the navigation back stack / history.',
       parameters: z.object({}),
       handler: async () => {
-        const state = await evalInApp(GET_NAV_STATE_EXPR);
+        const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
         if (!state || typeof state !== 'object') return 'Navigation state not found.';
 
         const navState = state as Record<string, unknown>;
@@ -150,7 +136,7 @@ export const navigationPlugin = definePlugin({
       description: 'List all registered route names in the app.',
       parameters: z.object({}),
       handler: async () => {
-        const state = await evalInApp(GET_NAV_STATE_EXPR);
+        const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
         if (!state || typeof state !== 'object') return 'Navigation state not found.';
 
         const routeNames = new Set<string>();
@@ -174,7 +160,7 @@ export const navigationPlugin = definePlugin({
       description: 'Current React Navigation / Expo Router state',
       handler: async () => {
         try {
-          const state = await evalInApp(GET_NAV_STATE_EXPR);
+          const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
           return JSON.stringify(state, null, 2);
         } catch {
           return JSON.stringify({ error: 'Navigation state not available' });
