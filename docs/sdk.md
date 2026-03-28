@@ -33,6 +33,10 @@ if (__DEV__) {
 Install as a dev dependency:
 
 ```bash
+npm install --save-dev metro-mcp
+# or
+yarn add --dev metro-mcp
+# or
 bun add -d metro-mcp
 ```
 
