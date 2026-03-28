@@ -9,7 +9,7 @@ You can register commands and expose custom state directly on a global — no pa
 ```typescript
 // In your app entry point (dev only)
 if (__DEV__) {
-  global.__METRO_MCP__ = {
+  globalThis.__METRO_MCP__ = {
     commands: {
       login: async ({ email, password }) => {
         return await authService.login(email, password);

@@ -48,9 +48,6 @@ export class CDPClient implements CDPConnection {
     this.emit('reconnected', {});
   }
 
-  /**
-   * Wait for an in-progress connection attempt to finish, if any.
-   */
   async waitForConnection(): Promise<boolean> {
     if (this._isConnected) return true;
     if (this.connectingPromise) {

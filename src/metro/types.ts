@@ -13,6 +13,12 @@ export interface MetroTarget {
   deviceName?: string;
   reactNative?: {
     logicalDeviceId?: string;
+    capabilities?: {
+      nativePageReloads?: boolean;
+      nativeSourceCodeFetching?: boolean;
+      /** true = New Architecture / Fusebox inspector. CDP Profiler domain is not forwarded in this mode. */
+      prefersFuseboxFrontend?: boolean;
+    };
   };
   vm?: string;
 }

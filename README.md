@@ -87,10 +87,11 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 | **navigation** | 4 | React Navigation / Expo Router state |
 | **accessibility** | 3 | Accessibility auditing |
 | **commands** | 2 | Custom app commands |
+| **profiler** | 5 | CPU profiling (Hermes CDP) + React render tracking |
 | **maestro** | 2 | Maestro test flow generation |
 | **appium** | 3 | Appium/WebdriverIO Jest test generation |
 
-**Total: 50 tools, 7 resources, 7 prompts** — see the [full tools reference](docs/tools.md).
+**Total: 55 tools, 9 resources, 7 prompts** — see the [full tools reference](docs/tools.md).
 
 ## App Integration (Optional)
 
@@ -98,7 +99,7 @@ Register custom commands and expose state to the MCP server — no package neede
 
 ```typescript
 if (__DEV__) {
-  global.__METRO_MCP__ = {
+  globalThis.__METRO_MCP__ = {
     commands: {
       // Run custom actions from the MCP client
       login: async ({ email, password }) => {
@@ -121,7 +122,7 @@ if (__DEV__) {
 
 Use `list_commands` and `run_command` to call these from the MCP client.
 
-For enhanced features like real-time Redux action tracking, navigation events, and performance marks, see the [optional client SDK](docs/sdk.md).
+For enhanced features like real-time Redux action tracking, navigation events, performance marks, and React render profiling, see the [optional client SDK](docs/sdk.md) and [profiling guide](docs/profiling.md).
 
 ## Configuration
 

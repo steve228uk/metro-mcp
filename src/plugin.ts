@@ -8,6 +8,8 @@ export interface CDPConnection {
   on(event: string, handler: (params: Record<string, unknown>) => void): void;
   off(event: string, handler: (params: Record<string, unknown>) => void): void;
   isConnected(): boolean;
+  /** Returns metadata about the currently connected CDP target, or null if not connected. */
+  getTarget(): { description?: string; reactNative?: { capabilities?: { prefersFuseboxFrontend?: boolean } } } | null;
 }
 
 // ── Format Utilities ──
@@ -119,6 +121,15 @@ export interface MetroMCPConfig {
   };
   network?: {
     interceptFetch?: boolean;
+  };
+  profiler?: {
+    /**
+     * Whether the app uses the New Architecture (Bridgeless/Fusebox).
+     * When true (default), the React DevTools hook is used as the primary profiling
+     * path and CDP Profiler domain fallbacks are skipped.
+     * Set to false for legacy bridge apps that expose the CDP Profiler domain.
+     */
+    newArchitecture?: boolean;
   };
 }
 

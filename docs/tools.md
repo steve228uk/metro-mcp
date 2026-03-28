@@ -107,6 +107,23 @@ All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB
 - **`list_commands`** — List custom commands registered by the app.
 - **`run_command`** — Execute a custom command with parameters.
 
+## Profiler
+
+See the [profiling guide](profiling.md) for a full explanation of CDP CPU profiling vs React `<Profiler>`.
+
+- **`start_profiling`** — Start Hermes CPU profiling via CDP. Param: `samplingInterval` in µs (default 1000). Captures all JS execution — React, Redux, navigation, your code.
+- **`stop_profiling`** — Stop profiling and return top functions ranked by self time and total time. Params: `topN` (default 20), `includeNative` (default false).
+- **`get_profile_status`** — Check whether profiling is active and whether a previous profile is available.
+- **`get_flamegraph`** — Return the current profiling results as a human-readable text flamegraph: CPU call tree + ranked chart + React render chart.
+- **`get_react_renders`** — Read render timings from `<Profiler onRender={trackRender}>` components. Returns renders sorted by `actualDuration` with `memoSavingsPercent`. Requires `trackRender` from `metro-mcp/client`. Param: `clear` (bool).
+
+### Profiler Resources
+
+| URI | Description |
+|-----|-------------|
+| `metro://profiler/flamegraph` | CPU call tree with time bars + ranked self-time chart + React render chart (text) |
+| `metro://profiler/data` | Raw JSON: full CDP Profile object + React render records with memo savings |
+
 ## Maestro
 
 - **`generate_maestro_flow`** — Generate Maestro YAML from a test description.
@@ -141,6 +158,8 @@ All tools support modifiers to reduce context window usage:
 | `metro://redux/state` | Redux state snapshot |
 | `metro://navigation` | Navigation state |
 | `metro://bundle/status` | Metro bundle status |
+| `metro://profiler/flamegraph` | CPU flamegraph + React render chart (text) |
+| `metro://profiler/data` | Raw JSON profiling data for agent analysis |
 
 ## Prompts
 

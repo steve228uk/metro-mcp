@@ -38,5 +38,21 @@ export default defineConfig({
   network: {
     interceptFetch: false,  // Opt-in: inject JS to wrap fetch()
   },
+  profiler: {
+    newArchitecture: true,  // Set to false for legacy bridge apps
+  },
 });
 ```
+
+## Profiler Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `profiler.newArchitecture` | `true` | Controls which profiling path is used. When `true` (default), `__REACT_DEVTOOLS_GLOBAL_HOOK__` is used as the primary path — works on all architectures including Bridgeless/Fusebox. When `false`, CDP `Profiler.*` domain calls are attempted first (suitable for legacy bridge apps). |
+
+### Which value should I use?
+
+- **Expo SDK 50+ / RN 0.74+ (New Architecture / Bridgeless)**: keep `true` (default)
+- **Legacy bridge apps on older RN / Hermes**: set to `false` — the CDP Profiler domain may be available and provides a lower-overhead CPU call-graph
+
+The server also auto-detects Fusebox targets via the `prefersFuseboxFrontend` CDP capability and skips CDP fallbacks automatically, regardless of this setting.

@@ -18,6 +18,9 @@ const DEFAULT_CONFIG: Required<MetroMCPConfig> = {
   network: {
     interceptFetch: false,
   },
+  profiler: {
+    newArchitecture: true,
+  },
 };
 
 /**
@@ -92,5 +95,8 @@ function mergeConfig(target: Required<MetroMCPConfig>, source: MetroMCPConfig): 
   }
   if (source.network) {
     if (source.network.interceptFetch !== undefined) target.network.interceptFetch = source.network.interceptFetch;
+  }
+  if (source.profiler) {
+    if (source.profiler.newArchitecture !== undefined) target.profiler.newArchitecture = source.profiler.newArchitecture;
   }
 }

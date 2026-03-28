@@ -2,7 +2,7 @@
  * metro-mcp Client SDK
  *
  * Optional dev dependency for enhanced features.
- * All features register on global.__METRO_MCP__ which the server
+ * All features register on globalThis.__METRO_MCP__ which the server
  * discovers via Runtime.evaluate.
  *
  * Usage:
@@ -25,7 +25,6 @@ import { LifecycleTracker } from './lifecycle.js';
 import { ClientBuffer } from './client-buffer.js';
 
 declare const __DEV__: boolean;
-declare const global: Record<string, unknown>;
 
 export interface MetroMCPGlobal {
   commands: Record<string, (params: Record<string, unknown>) => unknown>;
@@ -51,6 +50,8 @@ export interface MetroMCPGlobal {
   lifecycle?: {
     events: ClientBuffer<unknown>;
   };
+  renders?: unknown[];
+  clearRenders?: () => void;
 }
 
 export class MetroMCPClient {
@@ -70,8 +71,8 @@ export class MetroMCPClient {
     this.stateManager = new StateSubscriptionManager();
     this.lifecycleTracker = new LifecycleTracker();
 
-    // Register on global
-    (global as Record<string, unknown>).__METRO_MCP__ = this.mcpGlobal;
+    // Register on globalThis
+    (globalThis as Record<string, unknown>).__METRO_MCP__ = this.mcpGlobal;
   }
 
   // ── Custom Commands ──
@@ -157,7 +158,8 @@ export class MetroMCPClient {
 // Also export individual pieces for tree-shaking
 export { createReduxMiddleware } from './middleware/redux.js';
 export { createNavigationTracking } from './middleware/navigation.js';
-export { PerformanceTracker } from './performance.js';
+export { PerformanceTracker, trackRender } from './performance.js';
+export type { RenderRecord } from './performance.js';
 export { StructuredLogger } from './logger.js';
 export { StateSubscriptionManager } from './state.js';
 export { LifecycleTracker } from './lifecycle.js';
@@ -167,7 +169,7 @@ export function registerCommand(
   name: string,
   handler: (params: Record<string, unknown>) => unknown
 ): void {
-  const g = global as Record<string, unknown>;
+  const g = globalThis as Record<string, unknown>;
   if (!g.__METRO_MCP__) {
     g.__METRO_MCP__ = { commands: {} };
   }

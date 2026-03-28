@@ -43,17 +43,27 @@ export const promptsPlugin = definePlugin({
     });
 
     ctx.registerPrompt('debug-performance', {
-      description: 'Analyze performance: network timing, render analysis',
+      description: 'Profile JS CPU usage and React render performance, then summarize findings with a flamegraph',
       handler: async () => [
         {
           role: 'user',
           content: `I need to analyze my React Native app's performance. Please:
-1. Get network requests with timing data (get_network_requests)
-2. Check for slow requests (search_network — look for responses > 1s)
-3. Check console logs for performance warnings (get_console_logs with search for "slow" or "performance")
-4. Get the component tree to check for deep nesting (get_component_tree with structureOnly=true)
-5. Check for re-render indicators in logs
-6. Summarize performance findings and recommendations`,
+1. Check the current profiler status (get_profile_status)
+2. Clear any existing React render data (get_react_renders with clear=true)
+3. Start CPU profiling (start_profiling with default samplingInterval)
+4. Tell me to perform the interaction I want to profile, then wait for me to confirm it's done
+5. After I confirm:
+   a. Stop CPU profiling and get the analysis (stop_profiling)
+   b. Read React render timings (get_react_renders)
+   c. Read the flamegraph resource (metro://profiler/flamegraph) for a combined visual breakdown
+   d. Check for slow network requests (search_network — look for responses > 1s)
+   e. Check console logs for perf warnings (get_console_logs with search="slow" or "perf")
+6. Summarize:
+   - Top JS CPU hotspots by self time — which function and file is burning the most CPU
+   - Slowest React component renders and whether memoization (memo/useMemo) is helping — compare actualDuration vs baseDuration
+   - Components that re-render frequently (high count in the summary)
+   - Any slow network requests contributing to perceived slowness
+   - Concrete, prioritised recommendations`,
         },
       ],
     });
