@@ -21,7 +21,15 @@ export const accessibilityPlugin = definePlugin({
         returnByValue: true,
         timeout: 10000,
       })) as Record<string, unknown>;
-      if (result.exceptionDetails) throw new Error('Evaluation failed');
+      if (result.exceptionDetails) {
+        const details = result.exceptionDetails as Record<string, unknown>;
+        const exception = details.exception as Record<string, unknown> | undefined;
+        const message =
+          (exception?.description as string) ||
+          (details.text as string) ||
+          'Evaluation failed';
+        throw new Error(message);
+      }
       return (result.result as Record<string, unknown>).value;
     }
 

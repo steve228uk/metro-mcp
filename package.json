@@ -3,19 +3,36 @@
   "version": "0.1.0",
   "description": "Plugin-based MCP server for React Native runtime debugging, inspection, and automation via Metro/CDP",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "bin": {
-    "metro-mcp": "bin/metro-mcp.ts"
+    "metro-mcp": "dist/bin/metro-mcp.js"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./client": "./src/client/index.ts",
-    "./plugin": "./src/plugin.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/index.d.ts",
+      "import": "./dist/client/index.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    }
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target node",
+    "clean": "rm -rf dist",
+    "build": "bun run clean && bun run build:js && bun run build:bin && bun run build:types",
+    "build:js": "bun build src/index.ts src/client/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external zod",
+    "build:bin": "bun build bin/metro-mcp.ts --outfile dist/bin/metro-mcp.js --target bun --external @modelcontextprotocol/sdk --external zod && chmod +x dist/bin/metro-mcp.js",
+    "build:types": "bunx tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [

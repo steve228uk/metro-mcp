@@ -70,6 +70,8 @@ export const errorsPlugin = definePlugin({
       try { await ctx.cdp.send('Runtime.enable'); } catch {}
     });
 
+    try { await ctx.cdp.send('Runtime.enable'); } catch {}
+
     ctx.registerTool('get_errors', {
       description: 'Get recent uncaught exceptions and errors from the React Native app.',
       parameters: z.object({

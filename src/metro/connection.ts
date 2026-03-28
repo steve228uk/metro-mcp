@@ -37,7 +37,9 @@ export class CDPClient implements CDPConnection {
   async connect(target: MetroTarget): Promise<void> {
     this.target = target;
     this.suppressReconnect = false;
-    return this.doConnect(target.webSocketDebuggerUrl);
+    await this.doConnect(target.webSocketDebuggerUrl);
+    // Notify plugins to enable their CDP domains (same as on reconnect)
+    this.emit('reconnected', {});
   }
 
   private doConnect(url: string): Promise<void> {
