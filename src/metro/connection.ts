@@ -21,16 +21,12 @@ export class CDPClient implements CDPConnection {
   private messageId = 0;
   private pendingRequests = new Map<number, PendingRequest>();
   private eventHandlers = new Map<string, Set<CDPEventHandler>>();
-  private reconnectAttempts = 0;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private keepAliveTimer: ReturnType<typeof setInterval> | null = null;
   private connectingPromise: Promise<void> | null = null;
   private suppressReconnect = false;
   private _isConnected = false;
   private target: MetroTarget | null = null;
 
-  private readonly maxReconnectAttempts = 10;
-  private readonly reconnectDelays = [1000, 2000, 4000, 8000, 16000];
   private readonly requestTimeout = 10000;
   private readonly keepAliveInterval = 15000;
 
@@ -38,7 +34,6 @@ export class CDPClient implements CDPConnection {
    * Connect to a CDP target.
    */
   async connect(target: MetroTarget): Promise<void> {
-    this.clearReconnectTimer();
     this.stopKeepAlive();
     this.target = target;
     this.suppressReconnect = false;
@@ -65,10 +60,10 @@ export class CDPClient implements CDPConnection {
     return new Promise((resolve, reject) => {
       try {
         this.ws = new WebSocket(url);
+        const socketForThisConnection = this.ws;
 
         this.ws.onopen = () => {
           this._isConnected = true;
-          this.reconnectAttempts = 0;
           this.startKeepAlive();
           logger.info(`Connected to ${this.target?.title || 'unknown'}`);
           resolve();
@@ -79,15 +74,17 @@ export class CDPClient implements CDPConnection {
         };
 
         this.ws.onclose = () => {
+          // Ignore close events from a replaced socket — a new connection is already in progress
+          if (this.ws !== socketForThisConnection) return;
           this._isConnected = false;
           this.stopKeepAlive();
           this.rejectAllPending('WebSocket closed');
           if (!this.suppressReconnect) {
-            this.scheduleReconnect();
+            this.emit('disconnected', {});
           }
         };
 
-        this.ws.onerror = (event) => {
+        this.ws.onerror = () => {
           logger.error('WebSocket error');
           if (!this._isConnected) {
             reject(new Error('Failed to connect to CDP target'));
@@ -159,20 +156,12 @@ export class CDPClient implements CDPConnection {
   disconnect(): void {
     this.suppressReconnect = true;
     this.stopKeepAlive();
-    this.clearReconnectTimer();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
     }
     this._isConnected = false;
     this.rejectAllPending('Disconnected');
-  }
-
-  private clearReconnectTimer(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
   }
 
   private startKeepAlive(): void {
@@ -237,33 +226,6 @@ export class CDPClient implements CDPConnection {
       pending.reject(new Error(reason));
     }
     this.pendingRequests.clear();
-  }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      logger.error('Max reconnection attempts reached');
-      return;
-    }
-
-    const delayIndex = Math.min(this.reconnectAttempts, this.reconnectDelays.length - 1);
-    const delay = this.reconnectDelays[delayIndex];
-    this.reconnectAttempts++;
-
-    logger.info(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-
-    this.reconnectTimer = setTimeout(async () => {
-      if (this.target && !this.suppressReconnect && !this.connectingPromise) {
-        try {
-          this.connectingPromise = this.doConnect(this.target.webSocketDebuggerUrl);
-          await this.connectingPromise;
-          this.connectingPromise = null;
-          this.emit('reconnected', {});
-        } catch {
-          this.connectingPromise = null;
-          // doConnect failure will trigger onclose → scheduleReconnect
-        }
-      }
-    }, delay);
   }
 
   private emit(event: string, params: Record<string, unknown>): void {

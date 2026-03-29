@@ -75,12 +75,36 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
   const cdpClient = new CDPClient();
   const formatUtils = createFormatUtils();
 
+  // Server-side reconnect state — single source of truth for all reconnect logic.
+  const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000];
+  const MAX_RECONNECT_ATTEMPTS = 10;
+  let reconnectAttempts = 0;
+  let isReconnecting = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function waitForReconnect(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      if (!isReconnecting) { resolve(); return; }
+      const check = setInterval(() => {
+        if (!isReconnecting) { clearInterval(check); resolve(); }
+      }, 100);
+    });
+  }
+
   // Enable required CDP domains on every connection (initial and reconnect).
   cdpClient.on('reconnected', async () => {
+    reconnectAttempts = 0;
+    isReconnecting = false;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     await Promise.all([
       cdpClient.send('Runtime.enable').catch(() => {}),
       cdpClient.send('Network.enable').catch(() => {}),
     ]);
+  });
+
+  // Drive all reconnection through connectToMetro() so we always get a fresh target URL.
+  cdpClient.on('disconnected', () => {
+    scheduleReconnect();
   });
 
   // Create the plugin context factory
@@ -159,9 +183,13 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
       evalInApp: async (expression: string, options?: EvalOptions) => {
         async function tryEval() {
           if (!cdpClient.isConnected()) {
-            // Wait for any in-progress connection first, then reconnect if still not connected
-            const connected = await cdpClient.waitForConnection();
-            if (!connected) await connectToMetro();
+            if (isReconnecting) {
+              // A reconnect is already in flight — wait for it rather than starting another
+              await waitForReconnect();
+            } else {
+              const connected = await cdpClient.waitForConnection();
+              if (!connected) await connectToMetro();
+            }
           }
           if (!cdpClient.isConnected()) {
             throw new Error('Not connected to Metro. Use list_devices to check connection status.');
@@ -185,7 +213,11 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
             err.message === 'Not connected to CDP target' ||
             err.message === 'Not connected to Metro. Use list_devices to check connection status.'
           )) {
-            await connectToMetro();
+            if (isReconnecting) {
+              await waitForReconnect();
+            } else {
+              await connectToMetro();
+            }
             return await tryEval();
           }
           throw err;
@@ -245,8 +277,14 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     }
   }
 
-  // Connect to Metro
+  // Connect to Metro — always re-discovers targets to get a fresh webSocketDebuggerUrl.
+  // Idempotent: concurrent callers wait for the in-flight attempt to finish.
   async function connectToMetro(): Promise<boolean> {
+    if (isReconnecting) {
+      await waitForReconnect();
+      return cdpClient.isConnected();
+    }
+    isReconnecting = true;
     try {
       let servers;
       if (config.metro.autoDiscover) {
@@ -275,7 +313,33 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     } catch (err) {
       logger.warn('Could not connect to Metro:', err);
       return false;
+    } finally {
+      isReconnecting = false;
     }
+  }
+
+  // Schedule a reconnect with exponential backoff, driven from server.ts so we always
+  // re-fetch a fresh target URL from Metro's /json endpoint.
+  function scheduleReconnect(): void {
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      logger.error('Max reconnection attempts reached, giving up');
+      return;
+    }
+    if (reconnectTimer !== null || isReconnecting) return; // already scheduled or in progress
+
+    const delay = RECONNECT_DELAYS[Math.min(reconnectAttempts, RECONNECT_DELAYS.length - 1)];
+    reconnectAttempts++;
+    logger.info(`Reconnecting to Metro in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+
+    isReconnecting = true;
+    reconnectTimer = setTimeout(async () => {
+      reconnectTimer = null;
+      isReconnecting = false;
+      const success = await connectToMetro();
+      if (!success) {
+        scheduleReconnect();
+      }
+    }, delay);
   }
 
   // Start MCP transport

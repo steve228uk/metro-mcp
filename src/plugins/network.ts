@@ -69,6 +69,18 @@ export const networkPlugin = definePlugin({
       }
     });
 
+    // When the CDP connection drops, flush any in-flight requests to the buffer so they
+    // are visible rather than silently lost.
+    ctx.cdp.on('disconnected', () => {
+      const now = Date.now();
+      for (const [, req] of pendingRequests) {
+        req.endTime = now;
+        req.error = 'Connection lost';
+        buffer.push(req);
+      }
+      pendingRequests.clear();
+    });
+
     ctx.registerTool('get_network_requests', {
       description: 'Get recent network requests from the React Native app.',
       parameters: z.object({
