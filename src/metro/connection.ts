@@ -77,9 +77,8 @@ export class CDPClient implements CDPConnection {
           // Ignore close events from a replaced socket — a new connection is already in progress
           if (this.ws !== socketForThisConnection) return;
 
-          const closeEvent = event as CloseEvent;
-          const code = closeEvent.code ?? 'unknown';
-          const reason = closeEvent.reason || 'no reason';
+          const code = (event as CloseEvent).code;
+          const reason = (event as CloseEvent).reason || 'no reason';
           logger.info(`WebSocket closed (code=${code}, reason="${reason}", wasConnected=${this._isConnected})`);
 
           this._isConnected = false;
@@ -90,7 +89,7 @@ export class CDPClient implements CDPConnection {
           }
         };
 
-        this.ws.onerror = (event) => {
+        this.ws.onerror = () => {
           logger.error(`WebSocket error (connected=${this._isConnected})`);
           if (!this._isConnected) {
             reject(new Error('Failed to connect to CDP target'));

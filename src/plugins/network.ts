@@ -6,9 +6,14 @@ import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('network');
 
-/** Maximum encoded body size (bytes) to eagerly cache. Responses larger than this
- *  will only be fetchable while the same CDP session is active. */
+/** Maximum *decoded* body size (bytes) to keep cached. */
 const MAX_BODY_CACHE_SIZE = 1024 * 1024; // 1 MB
+/** Maximum concurrent getResponseBody CDP calls to avoid flooding the pipeline. */
+const MAX_CONCURRENT_BODY_FETCHES = 4;
+
+function decodeResponseBody(raw: { body: string; base64Encoded: boolean }): string {
+  return raw.base64Encoded ? Buffer.from(raw.body, 'base64').toString('utf8') : raw.body;
+}
 
 interface NetworkRequest {
   id: string;
@@ -26,8 +31,6 @@ interface NetworkRequest {
   size?: number;
   /** Connection session this request belongs to. Incremented on each reconnect. */
   session: number;
-  /** Whether the response body was eagerly cached (available after reconnect). */
-  bodyCached: boolean;
 }
 
 export const networkPlugin = definePlugin({
@@ -43,6 +46,27 @@ export const networkPlugin = definePlugin({
      *  can tell which requests belong to the current CDP session vs a stale one. */
     let currentSession = 0;
 
+    /** Simple concurrency limiter for eager body fetches to avoid flooding CDP. */
+    let activeFetches = 0;
+
+    function fetchAndCacheBody(req: NetworkRequest): void {
+      if (activeFetches >= MAX_CONCURRENT_BODY_FETCHES) return;
+      activeFetches++;
+      ctx.cdp.send('Network.getResponseBody', { requestId: req.id })
+        .then((result) => {
+          const body = decodeResponseBody(result as { body: string; base64Encoded: boolean });
+          if (body.length <= MAX_BODY_CACHE_SIZE) {
+            req.responseBody = body;
+          }
+        })
+        .catch((err) => {
+          logger.debug(`Could not cache body for ${req.method} ${req.url}: ${err}`);
+        })
+        .finally(() => {
+          activeFetches--;
+        });
+    }
+
     // ── CDP Network domain ─────────────────────────────────────────────────────
 
     ctx.cdp.on('Network.requestWillBeSent', (params) => {
@@ -53,7 +77,6 @@ export const networkPlugin = definePlugin({
         requestHeaders: (params.request as Record<string, unknown>)?.headers as Record<string, string>,
         startTime: Date.now(),
         session: currentSession,
-        bodyCached: false,
       };
       pendingRequests.set(request.id, request);
     });
@@ -75,24 +98,7 @@ export const networkPlugin = definePlugin({
         req.size = params.encodedDataLength as number;
         pendingRequests.delete(req.id);
         buffer.push(req);
-
-        // Eagerly cache the response body so it survives reconnections.
-        // Only cache bodies within the size limit to avoid excessive memory use.
-        const encodedSize = req.size ?? 0;
-        if (encodedSize <= MAX_BODY_CACHE_SIZE) {
-          ctx.cdp.send('Network.getResponseBody', { requestId: req.id })
-            .then((result) => {
-              const r = result as { body: string; base64Encoded: boolean };
-              req.responseBody = r.base64Encoded
-                ? Buffer.from(r.body, 'base64').toString('utf8')
-                : r.body;
-              req.bodyCached = true;
-            })
-            .catch((err) => {
-              // Body not available from debugger – this is expected for some requests
-              logger.debug(`Could not cache body for ${req.method} ${req.url}: ${err}`);
-            });
-        }
+        fetchAndCacheBody(req);
       }
     });
 
@@ -194,8 +200,8 @@ export const networkPlugin = definePlugin({
         const req = index === -1 ? matches[matches.length - 1] : matches[index];
         if (!req) return `Request index ${index} out of range (${matches.length} matches)`;
 
-        // 1. Use eagerly cached body if available (survives reconnections)
-        if (req.bodyCached && req.responseBody !== undefined) {
+        // Use cached body if available (survives reconnections)
+        if (req.responseBody !== undefined) {
           try {
             return { url: req.url, status: req.status, body: JSON.parse(req.responseBody) };
           } catch {
@@ -203,22 +209,16 @@ export const networkPlugin = definePlugin({
           }
         }
 
-        // 2. Request is from a previous session and body wasn't cached — no way to fetch it
+        // Request is from a previous session and body wasn't cached — no way to fetch it
         if (req.session !== currentSession) {
-          return `Response body unavailable for "${req.url}": this request was captured in a previous CDP session (session ${req.session}, current ${currentSession}). The debugger cache was lost on reconnect and the body was too large to eagerly cache (${req.size ? formatBytes(req.size) : 'unknown size'}, limit ${formatBytes(MAX_BODY_CACHE_SIZE)}).`;
+          return `Response body unavailable for "${req.url}": this request was captured in a previous CDP session (session ${req.session}, current ${currentSession}). The debugger cache was lost on reconnect and the body was not cached (${req.size ? formatBytes(req.size) : 'unknown size'}, limit ${formatBytes(MAX_BODY_CACHE_SIZE)}).`;
         }
 
-        // 3. Try live fetch from current session
+        // Try live fetch from current session
         try {
           const result = await ctx.cdp.send('Network.getResponseBody', { requestId: req.id }) as { body: string; base64Encoded: boolean };
-          const body = result.base64Encoded
-            ? Buffer.from(result.body, 'base64').toString('utf8')
-            : result.body;
-
-          // Cache for future use
+          const body = decodeResponseBody(result);
           req.responseBody = body;
-          req.bodyCached = true;
-
           try {
             return { url: req.url, status: req.status, body: JSON.parse(body) };
           } catch {
