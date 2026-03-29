@@ -5,7 +5,7 @@ import type { CDPClient } from '../metro/connection.js';
 
 export const devicePlugin = definePlugin({
   name: 'device',
-  version: '0.1.0',
+
   description: 'Device and connection information',
 
   async setup(ctx) {

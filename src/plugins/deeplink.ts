@@ -3,7 +3,7 @@ import { definePlugin } from '../plugin.js';
 
 export const deeplinkPlugin = definePlugin({
   name: 'deeplink',
-  version: '0.1.0',
+
   description: 'Cross-platform deep link testing',
 
   async setup(ctx) {

@@ -6,6 +6,7 @@
 |----------|---------|-------------|
 | `METRO_HOST` | `localhost` | Metro bundler host |
 | `METRO_PORT` | `8081` | Metro bundler port |
+| `METRO_NETWORK_OVERRIDES` | — | Path to a network overrides `.json` file or folder to auto-load on startup |
 | `DEBUG` | — | Enable debug logging |
 
 ## CLI Arguments
@@ -15,6 +16,12 @@ npx -y metro-mcp --host 192.168.1.100 --port 19000
 # or
 bunx metro-mcp --host 192.168.1.100 --port 19000
 ```
+
+| Argument | Description |
+|----------|-------------|
+| `--host`, `-h` | Metro bundler host |
+| `--port`, `-p` | Metro bundler port |
+| `--network-overrides <path>` | Path to a network overrides `.json` file or folder |
 
 ## Config File
 
@@ -37,6 +44,7 @@ export default defineConfig({
   },
   network: {
     interceptFetch: false,  // Opt-in: inject JS to wrap fetch()
+    overridesFile: './network-overrides.json',  // Auto-load overrides on startup
   },
   profiler: {
     newArchitecture: true,  // Set to false for legacy bridge apps

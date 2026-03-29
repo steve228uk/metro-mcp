@@ -92,7 +92,7 @@ const WALK_FIBER_EXPR = `
 
 export const componentsPlugin = definePlugin({
   name: 'components',
-  version: '0.1.0',
+
   description: 'React component tree inspection via fiber tree walking',
 
   async setup(ctx) {

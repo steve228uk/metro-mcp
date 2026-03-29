@@ -4,7 +4,7 @@ import { escapeJsString } from '../utils/format.js';
 
 export const storagePlugin = definePlugin({
   name: 'storage',
-  version: '0.1.0',
+
   description: 'AsyncStorage reading via Runtime.evaluate',
 
   async setup(ctx) {

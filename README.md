@@ -15,6 +15,7 @@ Works with **Expo**, **bare React Native**, and any project using **Metro + Herm
 - [Requirements](#requirements)
 - [How It Works](#how-it-works)
 - [Features](#features)
+- [Network Overrides](#network-overrides)
 - [Test Recording](#test-recording)
 - [App Integration](#app-integration-optional)
 - [Configuration](#configuration)
@@ -94,7 +95,7 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 | Plugin | Tools | Description |
 |--------|-------|-------------|
 | **console** | 2 | Console log collection with filtering |
-| **network** | 3 | Network request tracking and search |
+| **network** | 13 | Network request tracking, overrides, and mocking |
 | **errors** | 2 | Exception collection with auto-symbolication |
 | **evaluate** | 1 | Execute JavaScript in the app runtime |
 | **device** | 3 | Device and connection management |
@@ -112,7 +113,70 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 | **profiler** | 5 | CPU profiling (Hermes CDP) + React render tracking |
 | **test-recorder** | 4 | Record interactions and generate Appium, Maestro, or Detox tests |
 
-**Total: 56 tools, 9 resources, 7 prompts** — see the [full tools reference](docs/tools.md).
+**Total: 66 tools, 9 resources, 7 prompts** — see the [full tools reference](docs/tools.md).
+
+---
+
+## Network Overrides
+
+Intercept any HTTP request made by your app — no app code changes required. Works like Chrome DevTools Local Overrides but via the CDP Fetch domain, so it works on device and in simulators.
+
+Three override types:
+
+- **response** — return a fake response; the real server is never called
+- **request** — modify headers, URL, method, or body and forward to the real server
+- **block** — fail the request with a network error
+
+### Quick example
+
+```
+# Fake an API response
+override_network_response  urlPattern="/api/users"  body='{"users":[]}'
+
+# Inject an auth header into all API calls
+override_network_request  urlPattern="/api/*"  headers={"Authorization":"Bearer test-token"}
+
+# Block analytics
+block_network_request  urlPattern="analytics.example.com"
+```
+
+### File-based overrides
+
+Save overrides to a JSON file and auto-load them on startup:
+
+```json
+{
+  "version": 1,
+  "overrides": [
+    {
+      "name": "Mock users list",
+      "urlPattern": "/api/users",
+      "response": { "statusCode": 200, "body": { "users": [] } }
+    },
+    {
+      "name": "Inject auth header",
+      "urlPattern": "/api/*",
+      "request": "./mocks/auth-request.json"
+    }
+  ]
+}
+```
+
+Configure the file path and overrides load automatically on startup:
+
+```bash
+METRO_NETWORK_OVERRIDES=./network-overrides.json npx metro-mcp
+```
+
+Or in `metro-mcp.config.ts`:
+
+```typescript
+export default defineConfig({
+  network: { overridesFile: './network-overrides.json' },
+});
+```
+
+→ See the [network overrides guide](docs/network.md) for the full file format, folder loading, and tool reference.
 
 ---
 

@@ -387,7 +387,7 @@ const CONSOLE_PROFILE_TITLE = 'metro-mcp';
 
 export const profilerPlugin = definePlugin({
   name: 'profiler',
-  version: '0.1.0',
+
   description: 'CPU profiling via React DevTools hook (primary) or CDP Profiler domain, plus React render tracking',
 
   async setup(ctx) {
@@ -645,6 +645,228 @@ export const profilerPlugin = definePlugin({
         } catch (err) {
           return `Failed to read render data: ${err instanceof Error ? err.message : String(err)}`;
         }
+      },
+    });
+
+    ctx.registerTool('get_memory_info', {
+      description:
+        'Get current JavaScript heap memory usage from the running app. ' +
+        'Returns used heap, total heap, and heap size limit (when available). ' +
+        'Call repeatedly to track memory growth over time or to detect leaks.',
+      parameters: z.object({}),
+      handler: async () => {
+        const result = (await ctx.evalInApp(`(function() {
+          try {
+            if (typeof performance !== 'undefined' && performance.memory) {
+              var m = performance.memory;
+              return { source: 'performance.memory', usedJSHeapSize: m.usedJSHeapSize, totalJSHeapSize: m.totalJSHeapSize, jsHeapSizeLimit: m.jsHeapSizeLimit };
+            }
+          } catch(e) {}
+          try {
+            if (typeof process !== 'undefined' && process.memoryUsage) {
+              var p = process.memoryUsage();
+              return { source: 'process.memoryUsage', usedJSHeapSize: p.heapUsed, totalJSHeapSize: p.heapTotal, jsHeapSizeLimit: null, rss: p.rss, external: p.external };
+            }
+          } catch(e) {}
+          return null;
+        })()`)) as Record<string, unknown> | null;
+
+        if (!result) {
+          return 'Memory info not available: neither performance.memory nor process.memoryUsage is accessible in this runtime.';
+        }
+
+        const fmt = (n: unknown) => typeof n === 'number' ? `${(n / 1024 / 1024).toFixed(2)} MB` : null;
+        return {
+          source: result.source,
+          usedHeap: fmt(result.usedJSHeapSize),
+          totalHeap: fmt(result.totalJSHeapSize),
+          heapLimit: fmt(result.jsHeapSizeLimit),
+          rss: fmt(result.rss),
+          ...(typeof result.usedJSHeapSize === 'number' && typeof result.totalJSHeapSize === 'number'
+            ? { usedPercent: `${((result.usedJSHeapSize as number) / (result.totalJSHeapSize as number) * 100).toFixed(1)}%` }
+            : {}),
+        };
+      },
+    });
+
+    ctx.registerTool('profile_action', {
+      description:
+        'Profile a specific JavaScript expression or code path in a single call. ' +
+        'Starts profiling, evaluates the expression, waits for it to complete (plus optional extra duration), ' +
+        'then stops and returns the top functions by self time. ' +
+        'Use instead of calling start_profiling / stop_profiling manually for focused measurements.',
+      parameters: z.object({
+        expression: z.string()
+          .describe('JavaScript expression to profile (can be an async IIFE)'),
+        extraMs: z.number().int().min(0).max(30000).default(0)
+          .describe('Additional milliseconds to wait after the expression resolves before stopping (default 0)'),
+        topN: z.number().int().min(1).max(50).default(15)
+          .describe('Number of top functions to return'),
+      }),
+      handler: async ({ expression, extraMs, topN }) => {
+        if (profilingMode !== null) {
+          return 'A profiling session is already active. Call stop_profiling first.';
+        }
+
+        // Start
+        let startedMode: ProfilingMode = null;
+        try {
+          const r = (await ctx.evalInApp(DEVTOOLS_START_EXPR)) as { ok?: boolean; method?: string } | null;
+          if (r?.ok) startedMode = 'devtools-hook';
+        } catch { /* try CDP fallback */ }
+
+        if (!startedMode && !shouldSkipCdpFallback()) {
+          try {
+            await ctx.cdp.send('Profiler.enable');
+            await ctx.cdp.send('Profiler.setSamplingInterval', { interval: 1000 });
+            await ctx.cdp.send('Profiler.start');
+            startedMode = 'cdp';
+          } catch { /* ignore */ }
+        }
+
+        if (!startedMode) {
+          return 'Could not start profiling: React DevTools hook not available and CDP Profiler domain not supported.';
+        }
+
+        profilingMode = startedMode;
+
+        // Evaluate expression
+        try {
+          await ctx.evalInApp(expression, { awaitPromise: true, timeout: 30000 });
+        } catch (err) {
+          // Don't abort — still stop and return profile even if expression errored
+          ctx.logger.debug(`profile_action expression error: ${err instanceof Error ? err.message : String(err)}`);
+        }
+
+        // Extra wait
+        if (extraMs > 0) {
+          await new Promise<void>((r) => setTimeout(r, extraMs));
+        }
+
+        // Stop — reuse stop_profiling logic inline
+        try {
+          if (profilingMode === 'devtools-hook') {
+            const raw = (await ctx.evalInApp(DEVTOOLS_STOP_EXPR)) as DevToolsProfile | null;
+            profilingMode = null;
+            if (!raw || raw.length === 0) {
+              return { mode: 'devtools-hook', commitCount: 0, message: 'No commits recorded — expression may have been too fast.' };
+            }
+            lastDevToolsProfile = raw;
+            const byName = new Map<string, { totalActual: number; commits: number }>();
+            for (const commit of raw) {
+              for (const comp of commit.components) {
+                const e = byName.get(comp.name) ?? { totalActual: 0, commits: 0 };
+                e.totalActual += comp.actualMs; e.commits++;
+                byName.set(comp.name, e);
+              }
+            }
+            const topComponents = [...byName.entries()]
+              .map(([name, s]) => ({ name, commits: s.commits, totalActualMs: parseFloat(s.totalActual.toFixed(2)), avgActualMs: parseFloat((s.totalActual / s.commits).toFixed(2)) }))
+              .sort((a, b) => b.totalActualMs - a.totalActualMs)
+              .slice(0, topN);
+            return { mode: 'devtools-hook', commitCount: raw.length, topComponents };
+          }
+
+          const result = (await ctx.cdp.send('Profiler.stop')) as { profile: CpuProfile };
+          await ctx.cdp.send('Profiler.disable').catch(() => {});
+          profilingMode = null;
+          lastCpuProfile = result.profile;
+          lastCpuAnalysis = analyzeCpuProfile(result.profile, topN, false);
+          const { durationMs, sampleCount, topFunctions } = lastCpuAnalysis;
+          return {
+            mode: 'cdp',
+            durationMs,
+            sampleCount,
+            topFunctions: topFunctions.map((f) => ({
+              functionName: f.functionName,
+              location: f.url ? `${f.url}:${f.lineNumber}` : '(unknown)',
+              selfTime: `${f.selfMs}ms (${f.selfPercent}%)`,
+              totalTime: `${f.totalMs}ms (${f.totalPercent}%)`,
+            })),
+          };
+        } catch (err) {
+          profilingMode = null;
+          return `Profiling stopped but analysis failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+    });
+
+    ctx.registerTool('start_heap_sampling', {
+      description:
+        'Start Hermes heap allocation sampling via CDP HeapProfiler. ' +
+        'Records memory allocation call stacks to identify where objects are being allocated. ' +
+        'Call stop_heap_sampling to retrieve the top allocation sites.',
+      parameters: z.object({
+        samplingInterval: z.number().int().min(128).max(1048576).default(32768)
+          .describe('Average bytes between samples (default 32768). Lower = more detail, higher overhead.'),
+      }),
+      handler: async ({ samplingInterval }) => {
+        try {
+          await ctx.cdp.send('HeapProfiler.enable').catch(() => {});
+          await ctx.cdp.send('HeapProfiler.startSampling', { samplingInterval });
+          return `Heap sampling started (interval: ${samplingInterval} bytes). Reproduce the memory-intensive operation, then call stop_heap_sampling.`;
+        } catch (err) {
+          return `Failed to start heap sampling: ${err instanceof Error ? err.message : String(err)}. HeapProfiler may not be supported by this Hermes version.`;
+        }
+      },
+    });
+
+    ctx.registerTool('stop_heap_sampling', {
+      description:
+        'Stop heap allocation sampling and return the top allocation sites. ' +
+        'Shows which functions are allocating the most memory, useful for diagnosing memory leaks. ' +
+        'Must call start_heap_sampling first.',
+      parameters: z.object({
+        topN: z.number().int().min(1).max(100).default(20)
+          .describe('Number of top allocation sites to return'),
+      }),
+      handler: async ({ topN }) => {
+        interface SamplingHeapProfileNode {
+          callFrame: { functionName: string; url: string; lineNumber: number };
+          selfSize: number;
+          children?: SamplingHeapProfileNode[];
+        }
+        interface SamplingHeapProfile {
+          head: SamplingHeapProfileNode;
+        }
+
+        let profile: SamplingHeapProfile;
+        try {
+          const result = (await ctx.cdp.send('HeapProfiler.stopSampling')) as { profile: SamplingHeapProfile };
+          await ctx.cdp.send('HeapProfiler.disable').catch(() => {});
+          profile = result.profile;
+        } catch (err) {
+          return `Failed to stop heap sampling: ${err instanceof Error ? err.message : String(err)}`;
+        }
+
+        // Flatten the tree and aggregate by function
+        const siteMap = new Map<string, { functionName: string; url: string; line: number; totalBytes: number }>();
+
+        function walkNode(node: SamplingHeapProfileNode): void {
+          if (node.selfSize > 0) {
+            const fnName = node.callFrame.functionName || '(anonymous)';
+            const url = node.callFrame.url ?? '';
+            const key = `${fnName}|${url}|${node.callFrame.lineNumber}`;
+            const existing = siteMap.get(key) ?? { functionName: fnName, url, line: node.callFrame.lineNumber + 1, totalBytes: 0 };
+            existing.totalBytes += node.selfSize;
+            siteMap.set(key, existing);
+          }
+          for (const child of node.children ?? []) walkNode(child);
+        }
+
+        walkNode(profile.head);
+
+        const sites = [...siteMap.values()]
+          .sort((a, b) => b.totalBytes - a.totalBytes)
+          .slice(0, topN)
+          .map((s) => ({
+            functionName: s.functionName,
+            location: s.url ? `${s.url}:${s.line}` : '(unknown)',
+            allocatedKB: parseFloat((s.totalBytes / 1024).toFixed(2)),
+          }));
+
+        const totalKB = [...siteMap.values()].reduce((sum, s) => sum + s.totalBytes, 0) / 1024;
+        return { totalSampledKB: parseFloat(totalKB.toFixed(2)), topAllocationSites: sites };
       },
     });
 

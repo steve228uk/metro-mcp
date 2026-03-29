@@ -3,7 +3,7 @@ import { definePlugin } from '../plugin.js';
 
 export const evaluatePlugin = definePlugin({
   name: 'evaluate',
-  version: '0.1.0',
+
   description: 'JavaScript expression evaluation in the app runtime',
 
   async setup(ctx) {

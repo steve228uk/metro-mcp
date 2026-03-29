@@ -1,4 +1,7 @@
 import { z } from 'zod';
+import { readdir, readFile, writeFile, mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { definePlugin } from '../plugin.js';
 import { GET_ROUTE_FUNC_JS, SWIPE_COORDS } from '../utils/fiber.js';
 
@@ -205,15 +208,18 @@ const START_RECORDING_JS = `
 
 // ── Recorded event shape (mirrors the JS-side object pushed to __METRO_MCP_REC_EVENTS__)
 interface RecordedEvent {
-  type: 'tap' | 'type' | 'long_press' | 'submit' | 'swipe' | 'navigate';
-  testID?:       string | null;
-  label?:        string | null;
+  type: 'tap' | 'type' | 'long_press' | 'submit' | 'swipe' | 'navigate' | 'annotation';
+  testID?:        string | null;
+  label?:         string | null;
   componentName?: string | null;
-  text?:         string;       // type events
-  direction?:    string;       // swipe events
-  route?:        string | null;
-  timestamp:     number;
+  text?:          string;       // type events
+  direction?:     string;       // swipe events
+  route?:         string | null;
+  note?:          string;       // annotation events
+  timestamp:      number;
 }
+
+const RECORDINGS_DIR = join(homedir(), '.metro-mcp', 'recordings');
 
 // ── Best WebdriverIO selector for an event
 function appiumSelector(ev: RecordedEvent): string | null {
@@ -286,7 +292,7 @@ let storedEvents: RecordedEvent[] | null = null;
 
 export const testRecorderPlugin = definePlugin({
   name: 'test-recorder',
-  version: '0.1.0',
+
   description: 'Unified mobile test recorder: captures taps, text entry, swipes and navigation via fiber patching; generates Appium, Maestro, and Detox tests',
 
   async setup(ctx) {
@@ -495,6 +501,145 @@ export const testRecorderPlugin = definePlugin({
         return lines.join('\n');
       },
     });
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // add_recording_annotation
+    // ────────────────────────────────────────────────────────────────────────────
+    ctx.registerTool('add_recording_annotation', {
+      description:
+        'Add a human-readable annotation (comment marker) to the current recording. ' +
+        'Useful for labelling major flow checkpoints like "reached checkout", "error appeared here", ' +
+        '"navigated to payment". Annotations appear as code comments in generated tests.',
+      parameters: z.object({
+        note: z.string().describe('Annotation text to embed in the recording'),
+      }),
+      handler: async ({ note }) => {
+        const ADD_ANNOTATION_JS = `(function() {
+          if (!globalThis.__METRO_MCP_REC_ACTIVE__) return false;
+          var nav = globalThis.__METRO_MCP_NAV_REF__;
+          var route = null;
+          try { if (nav && nav.getCurrentRoute) { var r = nav.getCurrentRoute(); route = r ? r.name : null; } } catch(e) {}
+          globalThis.__METRO_MCP_REC_EVENTS__.push({ type: 'annotation', note: ${JSON.stringify(note)}, route: route, timestamp: Date.now() });
+          return true;
+        })()`;
+        const ok = await ctx.evalInApp(ADD_ANNOTATION_JS);
+        if (!ok) return 'No active recording. Call start_test_recording first.';
+        return `Annotation added: "${note}"`;
+      },
+    });
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // save_test_recording
+    // ────────────────────────────────────────────────────────────────────────────
+    ctx.registerTool('save_test_recording', {
+      description:
+        'Save the current recording events to disk as JSON so they can be reloaded later. ' +
+        'Useful for regenerating the same flow in a different test format without re-recording. ' +
+        'Files are saved to ~/.metro-mcp/recordings/<filename>.json.',
+      parameters: z.object({
+        filename: z.string().describe('Name for the saved recording (without .json extension)'),
+      }),
+      handler: async ({ filename }) => {
+        const events = storedEvents;
+        if (!events || events.length === 0) {
+          return 'No recording to save. Call stop_test_recording first.';
+        }
+        const safe = filename.replace(/[^a-zA-Z0-9_-]/g, '_');
+        await mkdir(RECORDINGS_DIR, { recursive: true });
+        const filePath = join(RECORDINGS_DIR, `${safe}.json`);
+        await writeFile(filePath, JSON.stringify({ savedAt: new Date().toISOString(), events }, null, 2), 'utf8');
+        return { saved: filePath, eventCount: events.length };
+      },
+    });
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // load_test_recording
+    // ────────────────────────────────────────────────────────────────────────────
+    ctx.registerTool('load_test_recording', {
+      description:
+        'Load a previously saved recording from disk and make it available for test generation. ' +
+        'After loading, call generate_test_from_recording with any format to regenerate the test. ' +
+        'Use list_test_recordings to see available files.',
+      parameters: z.object({
+        filename: z.string().describe('Name of the saved recording (without .json extension)'),
+      }),
+      handler: async ({ filename }) => {
+        const safe = filename.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const filePath = join(RECORDINGS_DIR, `${safe}.json`);
+        let raw: string;
+        try {
+          raw = await readFile(filePath, 'utf8');
+        } catch {
+          return `Recording not found: ${filePath}. Call list_test_recordings to see available files.`;
+        }
+        const parsed = JSON.parse(raw) as { savedAt?: string; events: RecordedEvent[] };
+        storedEvents = parsed.events;
+        return {
+          loaded: filePath,
+          savedAt: parsed.savedAt ?? 'unknown',
+          eventCount: storedEvents.length,
+          eventTypes: storedEvents.reduce<Record<string, number>>((acc, e) => {
+            acc[e.type] = (acc[e.type] ?? 0) + 1;
+            return acc;
+          }, {}),
+        };
+      },
+    });
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // list_test_recordings
+    // ────────────────────────────────────────────────────────────────────────────
+    ctx.registerTool('list_test_recordings', {
+      description:
+        'List all previously saved test recordings in ~/.metro-mcp/recordings/. ' +
+        'Returns filenames and sizes. Use load_test_recording to load one for test generation.',
+      parameters: z.object({}),
+      handler: async () => {
+        let entries: { name: string }[];
+        try {
+          const files = await readdir(RECORDINGS_DIR);
+          entries = files
+            .filter((f) => f.endsWith('.json'))
+            .map((f) => ({ name: f.replace(/\.json$/, '') }));
+        } catch {
+          return 'No recordings found. Use save_test_recording after recording a flow.';
+        }
+        if (entries.length === 0) return 'No recordings found.';
+        return entries;
+      },
+    });
+
+    // ────────────────────────────────────────────────────────────────────────────
+    // metro://recording/status resource
+    // ────────────────────────────────────────────────────────────────────────────
+    ctx.registerResource('metro://recording/status', {
+      name: 'Recording Status',
+      description: 'Live test recording state: whether a recording is active and how many events have been captured',
+      handler: async () => {
+        let isRecording = false;
+        let eventCount = 0;
+        let lastEventType: string | null = null;
+        let lastEventTime: number | null = null;
+        try {
+          const status = (await ctx.evalInApp(`(function() {
+            return {
+              active: !!globalThis.__METRO_MCP_REC_ACTIVE__,
+              count: (globalThis.__METRO_MCP_REC_EVENTS__ || []).length,
+              last: (globalThis.__METRO_MCP_REC_EVENTS__ || []).slice(-1)[0] || null
+            };
+          })()`)) as { active: boolean; count: number; last: RecordedEvent | null } | null;
+          if (status) {
+            isRecording = status.active;
+            eventCount = status.count;
+            lastEventType = status.last?.type ?? null;
+            lastEventTime = status.last?.timestamp ?? null;
+          }
+        } catch {
+          // not connected
+        }
+        return JSON.stringify({ isRecording, eventCount, lastEventType, lastEventTime, storedEventCount: storedEvents?.length ?? 0 }, null, 2);
+      },
+    });
   },
 });
 
@@ -592,6 +737,10 @@ function generateAppium(
           : `    // TODO: assert screen loaded`);
         break;
       }
+
+      case 'annotation':
+        lines.push(`    // ${ev.note ?? ''}`);
+        break;
     }
   }
 
@@ -672,6 +821,10 @@ function generateMaestro(
         }
         break;
       }
+
+      case 'annotation':
+        lines.push(`# ${ev.note ?? ''}`);
+        break;
     }
     lines.push('');
   }
@@ -751,6 +904,10 @@ function generateDetox(
           : `    // TODO: assert screen loaded`);
         break;
       }
+
+      case 'annotation':
+        lines.push(`    // ${ev.note ?? ''}`);
+        break;
     }
   }
 

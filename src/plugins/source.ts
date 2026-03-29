@@ -3,7 +3,7 @@ import { definePlugin } from '../plugin.js';
 
 export const sourcePlugin = definePlugin({
   name: 'source',
-  version: '0.1.0',
+
   description: 'Stack trace symbolication via Metro',
 
   async setup(ctx) {

@@ -15,9 +15,6 @@ const DEFAULT_CONFIG: Required<MetroMCPConfig> = {
     network: 200,
     errors: 100,
   },
-  network: {
-    interceptFetch: false,
-  },
   profiler: {
     newArchitecture: true,
   },
@@ -52,8 +49,6 @@ export async function loadConfig(args: string[]): Promise<Required<MetroMCPConfi
         config.metro.port = port;
         config.metro.autoDiscover = false;
       }
-    } else if (arg === '--intercept-fetch') {
-      config.network.interceptFetch = true;
     }
   }
 
@@ -62,14 +57,11 @@ export async function loadConfig(args: string[]): Promise<Required<MetroMCPConfi
   for (const configPath of configPaths) {
     try {
       const fullPath = `${process.cwd()}/${configPath}`;
-      const file = Bun.file(fullPath);
-      if (await file.exists()) {
-        const mod = await import(fullPath);
-        const fileConfig: MetroMCPConfig = mod.default || mod;
-        mergeConfig(config, fileConfig);
-        logger.info(`Loaded config from ${configPath}`);
-        break;
-      }
+      const mod = await import(fullPath);
+      const fileConfig: MetroMCPConfig = mod.default || mod;
+      mergeConfig(config, fileConfig);
+      logger.info(`Loaded config from ${configPath}`);
+      break;
     } catch {
       // Config file not found or invalid, continue
     }
@@ -92,9 +84,6 @@ function mergeConfig(target: Required<MetroMCPConfig>, source: MetroMCPConfig): 
     if (source.bufferSizes.logs !== undefined) target.bufferSizes.logs = source.bufferSizes.logs;
     if (source.bufferSizes.network !== undefined) target.bufferSizes.network = source.bufferSizes.network;
     if (source.bufferSizes.errors !== undefined) target.bufferSizes.errors = source.bufferSizes.errors;
-  }
-  if (source.network) {
-    if (source.network.interceptFetch !== undefined) target.network.interceptFetch = source.network.interceptFetch;
   }
   if (source.profiler) {
     if (source.profiler.newArchitecture !== undefined) target.profiler.newArchitecture = source.profiler.newArchitecture;

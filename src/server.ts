@@ -15,6 +15,7 @@ import { scanMetroPorts, selectBestTarget, fetchTargets } from './metro/discover
 import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
 import { extractCDPExceptionMessage } from './utils/cdp.js';
+import { version } from './version.js';
 
 // Built-in plugins
 import { consolePlugin } from './plugins/console.js';
@@ -26,7 +27,6 @@ import { sourcePlugin } from './plugins/source.js';
 import { reduxPlugin } from './plugins/redux.js';
 import { componentsPlugin } from './plugins/components.js';
 import { storagePlugin } from './plugins/storage.js';
-import { bundlePlugin } from './plugins/bundle.js';
 import { simulatorPlugin } from './plugins/simulator.js';
 import { deeplinkPlugin } from './plugins/deeplink.js';
 import { uiInteractPlugin } from './plugins/ui-interact.js';
@@ -36,6 +36,7 @@ import { commandsPlugin } from './plugins/commands.js';
 import { testRecorderPlugin } from './plugins/test-recorder.js';
 import { profilerPlugin } from './plugins/profiler.js';
 import { promptsPlugin } from './plugins/prompts.js';
+import { automationPlugin } from './plugins/automation.js';
 
 const logger = createLogger('server');
 
@@ -49,7 +50,6 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   reduxPlugin,
   componentsPlugin,
   storagePlugin,
-  bundlePlugin,
   simulatorPlugin,
   deeplinkPlugin,
   uiInteractPlugin,
@@ -59,13 +59,14 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   testRecorderPlugin,
   profilerPlugin,
   promptsPlugin,
+  automationPlugin,
 ];
 
 export async function startServer(config: Required<MetroMCPConfig>): Promise<void> {
   const mcpServer = new McpServer(
     {
       name: 'metro-mcp',
-      version: '0.1.0',
+      version,
     },
     {
       instructions: `React Native runtime debugging MCP server. Connects to Metro bundler via Chrome DevTools Protocol to provide console logs, network requests, component tree inspection, state management debugging, device control, and more. Use list_devices to see connected targets, then use other tools to inspect and interact with the running app.`,

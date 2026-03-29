@@ -3,7 +3,7 @@ import { definePlugin } from '../plugin.js';
 
 export const reduxPlugin = definePlugin({
   name: 'redux',
-  version: '0.1.0',
+
   description: 'Redux state inspection via Runtime.evaluate',
 
   async setup(ctx) {

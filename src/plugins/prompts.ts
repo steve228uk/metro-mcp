@@ -2,7 +2,7 @@ import { definePlugin } from '../plugin.js';
 
 export const promptsPlugin = definePlugin({
   name: 'prompts',
-  version: '0.1.0',
+
   description: 'Guided debugging and testing workflows',
 
   async setup(ctx) {
@@ -17,8 +17,7 @@ export const promptsPlugin = definePlugin({
 3. Get recent console logs, focusing on warnings and errors (get_console_logs with level filter)
 4. Check for any uncaught exceptions (get_errors)
 5. Get network request overview (get_network_requests with summary=true)
-6. Check Metro bundle status (get_bundle_status)
-7. Summarize the app's current state and any issues found`,
+6. Summarize the app's current state and any issues found`,
         },
       ],
     });
@@ -115,20 +114,134 @@ export const promptsPlugin = definePlugin({
       arguments: [
         { name: 'flow', description: 'Flow to record (e.g. "guest user: tap Start Shopping on FirstVisitScreen, end on ShopTab")', required: true },
         { name: 'format', description: 'Output format: appium, maestro, or detox (default: appium)', required: false },
+        { name: 'platform', description: 'Target platform for Appium: ios, android, or both (default: ios)', required: false },
+        { name: 'bundleId', description: 'iOS bundle ID or Android app package (required for Appium)', required: false },
+      ],
+      handler: async (args) => {
+        const format = args.format || 'appium';
+        const platform = args.platform || 'ios';
+        const bundleIdNote = args.bundleId
+          ? `bundleId: "${args.bundleId}"`
+          : 'bundleId: not provided — you will need to add it manually to the generated test or pass it as a parameter';
+        return [
+          {
+            role: 'user',
+            content: `Record and generate an automated test for: "${args.flow}"
+Format: ${format}${format === 'appium' ? ` | Platform: ${platform} | ${bundleIdNote}` : ''}
+
+Please follow these steps exactly:
+1. Call start_test_recording to begin capturing interactions
+2. Call get_testable_elements to inspect the current screen and identify available selectors
+3. Navigate the app step by step using tap_element and type_text, following the described flow:
+   - After each tap that triggers navigation, call wait_for_element or wait_for_navigation (not get_testable_elements immediately) to confirm the next screen has loaded
+   - At major flow checkpoints (e.g. "reached cart screen", "payment form visible"), call add_recording_annotation with a descriptive note
+4. When the flow is complete, call stop_test_recording
+5. Call generate_test_from_recording with format="${format}"${args.bundleId ? `, bundleId="${args.bundleId}"` : ''}${format === 'appium' ? `, platform="${platform}"` : ''}
+6. Call save_test_recording with a descriptive filename (e.g. "${args.flow.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 40).toLowerCase()}")
+7. Return the complete test code`,
+          },
+        ];
+      },
+    });
+
+    ctx.registerPrompt('write-e2e-test', {
+      description: 'Write a complete E2E test by recording a flow with full setup: handles format-specific config, uses wait tools for reliability, and saves the recording',
+      arguments: [
+        { name: 'flow', description: 'User flow to test (e.g. "login with valid credentials and reach the home screen")', required: true },
+        { name: 'format', description: 'Test framework: appium, maestro, or detox', required: true },
+        { name: 'platform', description: 'Target platform: ios, android, or both (required for Appium)', required: false },
+        { name: 'bundleId', description: 'iOS bundle ID or Android package name (required for Appium)', required: false },
+      ],
+      handler: async (args) => {
+        const format = args.format ?? 'appium';
+        const platform = args.platform ?? 'ios';
+        const isAppium = format === 'appium';
+        return [
+          {
+            role: 'user',
+            content: `Write a complete ${format} E2E test for this flow: "${args.flow}"
+${isAppium ? `Platform: ${platform}${args.bundleId ? ` | bundleId: ${args.bundleId}` : ''}` : ''}
+
+Step-by-step instructions:
+
+1. **Setup check**: Call get_connection_status and list_devices to confirm the app is running
+2. **Start recording**: Call start_test_recording
+3. **Inspect starting screen**: Call get_testable_elements to see what's on screen
+4. **Execute the flow**:
+   - Use tap_element to tap buttons/links by testID or accessibilityLabel
+   - Use type_text to enter text into inputs
+   - After any action that triggers navigation, call wait_for_navigation or wait_for_element (not get_testable_elements immediately) to wait for the new screen
+   - Call add_recording_annotation at each major checkpoint (e.g. "tapped login", "reached dashboard")
+   - If an element isn't found, call get_testable_elements to refresh your understanding of the screen
+5. **Stop recording**: Call stop_test_recording
+6. **Generate test**: Call generate_test_from_recording with:
+   - format="${format}"${isAppium ? `\n   - platform="${platform}"` : ''}${args.bundleId ? `\n   - bundleId="${args.bundleId}"` : ''}
+   - includeSetup=true
+7. **Save recording**: Call save_test_recording with filename="${args.flow.replace(/[^a-zA-Z0-9]/g, '-').slice(0, 40).toLowerCase()}-${format}"
+${isAppium ? '8. **Generate config**: Call generate_wdio_config to produce the wdio.conf.ts\n9. **Return** both the test file and the wdio config' : '8. **Return** the complete test file with instructions to run it'}`,
+          },
+        ];
+      },
+    });
+
+    ctx.registerPrompt('investigate-memory-leak', {
+      description: 'Systematically investigate a memory leak: capture baseline, reproduce the leak, compare heap allocations',
+      arguments: [
+        { name: 'scenario', description: 'Description of the interaction that causes the leak (e.g. "navigate to UserList and back 5 times")', required: true },
       ],
       handler: async (args) => [
         {
           role: 'user',
-          content: `Record and generate an automated test for: "${args.flow}"
-Format: ${args.format || 'appium'}
+          content: `Investigate a memory leak triggered by: "${args.scenario}"
 
-Please:
-1. Call start_test_recording to begin capturing interactions
-2. Call get_testable_elements to inspect the current screen and identify available selectors
-3. Navigate the app step by step using tap_element, type_text, and swipe tools to follow the described flow
-4. When the flow is complete (or the end condition is reached), call stop_test_recording
-5. Call generate_test_from_recording with format="${args.format || 'appium'}" to produce the final test
-6. Return the complete test code with a brief comment on each step`,
+Please follow this systematic process:
+
+1. **Baseline**: Call get_memory_info to record current heap usage
+2. **Warm-up**: Navigate the scenario once to let caches fill (this is normal)
+3. **Post-warmup memory**: Call get_memory_info again
+4. **Start heap sampling**: Call start_heap_sampling (this records allocation call stacks)
+5. **Reproduce the leak**: Perform the scenario described: "${args.scenario}"
+   - Use tap_element, wait_for_navigation, and other automation tools to navigate the flow
+   - Repeat the critical part 3-5 times to amplify the leak signal
+6. **Capture allocations**: Call stop_heap_sampling to see which functions allocated the most memory
+7. **Final memory**: Call get_memory_info to measure total heap growth
+8. **Analysis**:
+   - Compare baseline vs final heap usage — how much did it grow?
+   - Which functions in the heap sampling report are allocating unexpectedly (look for non-GC-friendly objects)?
+   - Check if any components from the scenario appear in the top allocations
+   - Look for retained closures, large arrays, or repeated DOM/fiber allocations
+9. **Inspect components**: Call get_component_tree to see if expected components were unmounted
+10. **Summarise**: Identify the likely leak source with specific file and function references, and suggest fixes (e.g. missing useEffect cleanup, stale event listeners, uncancelled promises)`,
+        },
+      ],
+    });
+
+    ctx.registerPrompt('debug-crash', {
+      description: 'Systematically investigate a crash or fatal error: collect errors, symbolicate stack traces, capture context',
+      arguments: [
+        { name: 'description', description: 'Optional: describe what you were doing when the crash occurred', required: false },
+      ],
+      handler: async (args) => [
+        {
+          role: 'user',
+          content: `Investigate ${args.description ? `this crash: "${args.description}"` : 'the recent crash'} in my React Native app.
+
+Please follow these steps:
+
+1. **Collect errors**: Call get_errors to retrieve all recent exceptions with stack traces
+2. **Symbolicate**: For each error, call symbolicate with the stack trace to get readable file/line references
+3. **Check logs**: Call get_console_logs — look for warnings or errors immediately before the crash timestamp
+4. **Current state**:
+   - Call get_current_route to see what screen the app is on
+   - Call take_screenshot to capture the current visual state
+5. **Component context**: Call find_components with the name of any component mentioned in the stack trace
+6. **Network context**: Call search_network with errorsOnly=true to check for failed API calls around the crash time
+7. **Redux/state context** (if applicable): Call get_redux_state to inspect current state
+8. **Root cause analysis**:
+   - Identify the exact file and line where the crash originated
+   - Determine whether it's a null reference, async race condition, unhandled promise rejection, or render error
+   - Check if a missing null-guard, missing Error Boundary, or improper async handling is responsible
+9. **Recommended fix**: Provide the specific code change needed, with the file path and line number`,
         },
       ],
     });

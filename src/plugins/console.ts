@@ -31,7 +31,7 @@ function formatCDPArgs(args: unknown[]): string {
 
 export const consolePlugin = definePlugin({
   name: 'console',
-  version: '0.1.0',
+
   description: 'Console log collection and filtering',
 
   async setup(ctx) {

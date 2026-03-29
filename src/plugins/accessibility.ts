@@ -11,7 +11,7 @@ interface AccessibilityIssue {
 
 export const accessibilityPlugin = definePlugin({
   name: 'accessibility',
-  version: '0.1.0',
+
   description: 'Accessibility auditing via fiber tree inspection',
 
   async setup(ctx) {

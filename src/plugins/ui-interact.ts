@@ -9,7 +9,7 @@ const PLATFORM_TTL_MS = 5000;
 
 export const uiInteractPlugin = definePlugin({
   name: 'ui-interact',
-  version: '0.1.0',
+
   description: 'UI automation via fiber tree, simctl, adb, and IDB',
 
   async setup(ctx) {

@@ -3,7 +3,7 @@ import { definePlugin } from '../plugin.js';
 
 export const simulatorPlugin = definePlugin({
   name: 'simulator',
-  version: '0.1.0',
+
   description: 'Unified iOS simulator / Android emulator device control',
 
   async setup(ctx) {

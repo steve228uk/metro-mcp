@@ -13,7 +13,7 @@ let _cmdSeq = 0;
 
 export const commandsPlugin = definePlugin({
   name: 'commands',
-  version: '0.1.0',
+
   description: 'Custom app commands via global.__METRO_MCP__.commands',
 
   async setup(ctx) {

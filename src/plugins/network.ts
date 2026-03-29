@@ -21,12 +21,14 @@ interface NetworkRequest {
 
 export const networkPlugin = definePlugin({
   name: 'network',
-  version: '0.1.0',
+
   description: 'Network request tracking via CDP Network domain',
 
   async setup(ctx) {
     const buffer = new CircularBuffer<NetworkRequest>(200);
     const pendingRequests = new Map<string, NetworkRequest>();
+
+    // ── CDP Network domain ─────────────────────────────────────────────────────
 
     ctx.cdp.on('Network.requestWillBeSent', (params) => {
       const request: NetworkRequest = {
@@ -69,8 +71,6 @@ export const networkPlugin = definePlugin({
       }
     });
 
-    // When the CDP connection drops, flush any in-flight requests to the buffer so they
-    // are visible rather than silently lost.
     ctx.cdp.on('disconnected', () => {
       const now = Date.now();
       for (const [, req] of pendingRequests) {
@@ -80,6 +80,8 @@ export const networkPlugin = definePlugin({
       }
       pendingRequests.clear();
     });
+
+    // ── Request tracking tools ─────────────────────────────────────────────────
 
     ctx.registerTool('get_network_requests', {
       description: 'Get recent network requests from the React Native app.',
@@ -138,6 +140,37 @@ export const networkPlugin = definePlugin({
       },
     });
 
+    ctx.registerTool('get_response_body', {
+      description:
+        'Get the response body for a specific network request. ' +
+        'Bodies are fetched on demand via CDP and are not included in get_network_requests or search_network output.',
+      parameters: z.object({
+        url: z.string().describe('URL or partial URL to find the request'),
+        index: z.number().default(-1).describe('Index of the request if multiple match (-1 for last)'),
+      }),
+      handler: async ({ url, index }) => {
+        const matches = buffer.filter((r) => r.url.includes(url));
+        if (matches.length === 0) return `No requests found matching "${url}"`;
+        const req = index === -1 ? matches[matches.length - 1] : matches[index];
+        if (!req) return `Request index ${index} out of range (${matches.length} matches)`;
+
+        try {
+          const result = await ctx.cdp.send('Network.getResponseBody', { requestId: req.id }) as { body: string; base64Encoded: boolean };
+          const body = result.base64Encoded
+            ? Buffer.from(result.body, 'base64').toString('utf8')
+            : result.body;
+          // Try to pretty-print JSON bodies
+          try {
+            return { url: req.url, status: req.status, body: JSON.parse(body) };
+          } catch {
+            return { url: req.url, status: req.status, body };
+          }
+        } catch (err) {
+          return `Could not retrieve response body for "${req.url}": ${err instanceof Error ? err.message : String(err)}. The body may no longer be cached by the debugger.`;
+        }
+      },
+    });
+
     ctx.registerTool('search_network', {
       description: 'Search network requests by URL pattern, method, or status code.',
       parameters: z.object({
@@ -164,6 +197,8 @@ export const networkPlugin = definePlugin({
         }));
       },
     });
+
+    // ── Resource ───────────────────────────────────────────────────────────────
 
     ctx.registerResource('metro://network', {
       name: 'Network Requests',

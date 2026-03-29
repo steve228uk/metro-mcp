@@ -11,13 +11,54 @@ interface ErrorEntry {
   symbolicatedStack?: string;
 }
 
+interface BundleError {
+  timestamp: number;
+  type: string;
+  message: string;
+  file?: string;
+  lineNumber?: number;
+  column?: number;
+}
+
+const BUNDLE_ERROR_PATTERNS = [
+  /Unable to resolve module/,
+  /SyntaxError/,
+  /TransformError/,
+  /Error: Module not found/,
+  /Unexpected token/,
+];
+
 export const errorsPlugin = definePlugin({
   name: 'errors',
-  version: '0.1.0',
+
   description: 'Exception collection with auto-symbolication',
 
   async setup(ctx) {
     const buffer = new CircularBuffer<ErrorEntry>(100);
+    const bundleErrors = new CircularBuffer<BundleError>(100);
+
+    ctx.cdp.on('Runtime.consoleAPICalled', (params) => {
+      if (params.type === 'error') {
+        const args = (params.args as Array<Record<string, unknown>>) || [];
+        const message = args.map((a) => a.value || a.description || '').join(' ');
+        for (const pattern of BUNDLE_ERROR_PATTERNS) {
+          if (pattern.test(message)) {
+            const fileMatch = message.match(/(?:in |from )([^\s:]+(?:\.tsx?|\.jsx?|\.json))/);
+            const lineMatch = message.match(/(?:line |:)(\d+)/);
+            const colMatch = message.match(/:(\d+):(\d+)/);
+            bundleErrors.push({
+              timestamp: Date.now(),
+              type: pattern.source.replace(/[\\^$]/g, ''),
+              message,
+              file: fileMatch?.[1],
+              lineNumber: lineMatch ? parseInt(lineMatch[1]) : undefined,
+              column: colMatch ? parseInt(colMatch[2]) : undefined,
+            });
+            break;
+          }
+        }
+      }
+    });
 
     ctx.cdp.on('Runtime.exceptionThrown', async (params) => {
       const message = extractCDPExceptionMessage(
@@ -93,6 +134,25 @@ export const errorsPlugin = definePlugin({
       handler: async () => {
         buffer.clear();
         return 'Error buffer cleared.';
+      },
+    });
+
+    ctx.registerTool('get_bundle_errors', {
+      description: 'Get recent Metro compilation/transform errors.',
+      parameters: z.object({
+        limit: z.number().default(20).describe('Maximum errors to return'),
+      }),
+      handler: async ({ limit }) => {
+        const errs = bundleErrors.getAll().slice(-limit);
+        if (errs.length === 0) return 'No bundle errors detected.';
+        return errs.map((e) => ({
+          time: formatTimestamp(e.timestamp),
+          type: e.type,
+          message: ctx.format.truncate(e.message, 500),
+          file: e.file,
+          line: e.lineNumber,
+          column: e.column,
+        }));
       },
     });
 

@@ -7,9 +7,27 @@
 
 ## Network
 
+See the [network overrides guide](network.md) for full details on the override system.
+
+### Request Tracking
+
 - **`get_network_requests`** — Get buffered HTTP requests with method, URL, status, timing.
-- **`get_request_details`** — Get full headers and body for a specific request by URL.
+- **`get_request_details`** — Get full headers for a specific request by URL.
+- **`get_response_body`** — Fetch the response body for a specific request on demand (not included in list output to avoid noise).
 - **`search_network`** — Filter by URL pattern, method, status code, or errors only.
+
+### Network Overrides
+
+- **`override_network_response`** — Intercept all matching requests and return a fake response (every call, not just once). No app changes needed.
+- **`override_network_request`** — Modify outgoing requests (inject headers, redirect URL, change method/body) and forward to the real server.
+- **`block_network_request`** — Fail all matching requests with a network error.
+- **`remove_network_override`** — Remove a single override by URL pattern.
+- **`get_network_overrides`** — List all active overrides and interception state.
+- **`pause_network_overrides`** — Disable interception without removing override definitions.
+- **`resume_network_overrides`** — Re-enable interception after pausing.
+- **`clear_network_overrides`** — Remove all overrides and disable interception.
+- **`save_network_overrides`** — Save in-memory overrides to a JSON file for committing to the codebase.
+- **`load_network_overrides`** — Load overrides from a JSON file or folder. Supports inline config or file references (`"./mocks/response.json"`). Can load a single named override.
 
 ## Errors
 
