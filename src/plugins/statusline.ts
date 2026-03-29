@@ -27,9 +27,9 @@ HOST=$(jq -r '.host' "$STATUS_FILE" 2>/dev/null)
 PORT=$(jq -r '.port' "$STATUS_FILE" 2>/dev/null)
 
 if [ "$CONNECTED" = "true" ]; then
-  printf "\\033[32mMetro \\u2713 %s:%s\\033[0m\\n" "$HOST" "$PORT"
+  printf "\\033[32mMetro ✓ %s:%s\\033[0m\\n" "$HOST" "$PORT"
 else
-  printf "\\033[31mMetro \\u2717\\033[0m\\n"
+  printf "\\033[31mMetro ✗\\033[0m\\n"
 fi
 `;
 
@@ -91,8 +91,18 @@ export const statuslinePlugin = definePlugin({
           // file missing or invalid JSON — start fresh
         }
 
-        const alreadyConfigured =
-          (settings.statusLine as Record<string, unknown> | undefined)?.command === SCRIPT_PATH;
+        const existing = settings.statusLine as Record<string, unknown> | undefined;
+
+        if (existing && existing.command !== SCRIPT_PATH) {
+          return [
+            'A statusLine is already configured in ~/.claude/settings.json:',
+            `  ${JSON.stringify(existing)}`,
+            '',
+            'Remove it first if you want metro-mcp to manage it.',
+          ].join('\n');
+        }
+
+        const alreadyConfigured = existing?.command === SCRIPT_PATH;
 
         settings.statusLine = { type: 'command', command: SCRIPT_PATH };
         writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + '\n');
