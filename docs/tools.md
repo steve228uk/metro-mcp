@@ -12,7 +12,8 @@ See the [network overrides guide](network.md) for full details on the override s
 ### Request Tracking
 
 - **`get_network_requests`** — Get buffered HTTP requests with method, URL, status, timing.
-- **`get_request_details`** — Get full headers and body for a specific request by URL.
+- **`get_request_details`** — Get full headers for a specific request by URL.
+- **`get_response_body`** — Fetch the response body for a specific request on demand (not included in list output to avoid noise).
 - **`search_network`** — Filter by URL pattern, method, status code, or errors only.
 
 ### Network Overrides

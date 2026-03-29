@@ -210,6 +210,8 @@ export default defineConfig({
 
 When configured, overrides are **auto-loaded on startup** before the first request is processed.
 
+If no `overridesFile` is configured, `./network-overrides.json` is checked automatically — silently skipped if the file doesn't exist.
+
 ---
 
 ## Loading at runtime
@@ -293,7 +295,8 @@ Useful for quickly comparing real vs overridden responses.
 | Tool | Description |
 |------|-------------|
 | `get_network_requests` | Get recent HTTP requests with method, URL, status, timing. Params: `limit`, `summary`, `compact`. |
-| `get_request_details` | Full headers and body for a specific request. Params: `url`, `index`. |
+| `get_request_details` | Full headers for a specific request. Params: `url`, `index`. |
+| `get_response_body` | Fetch the response body on demand. Bodies are not included in list output to avoid noise. Params: `url`, `index`. |
 | `search_network` | Filter requests by URL pattern, method, status code, or errors only. |
 
 ### Network overrides

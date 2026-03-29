@@ -188,6 +188,37 @@ export const networkPlugin = definePlugin({
       },
     });
 
+    ctx.registerTool('get_response_body', {
+      description:
+        'Get the response body for a specific network request. ' +
+        'Bodies are fetched on demand via CDP and are not included in get_network_requests or search_network output.',
+      parameters: z.object({
+        url: z.string().describe('URL or partial URL to find the request'),
+        index: z.number().default(-1).describe('Index of the request if multiple match (-1 for last)'),
+      }),
+      handler: async ({ url, index }) => {
+        const matches = buffer.filter((r) => r.url.includes(url));
+        if (matches.length === 0) return `No requests found matching "${url}"`;
+        const req = index === -1 ? matches[matches.length - 1] : matches[index];
+        if (!req) return `Request index ${index} out of range (${matches.length} matches)`;
+
+        try {
+          const result = await ctx.cdp.send('Network.getResponseBody', { requestId: req.id }) as { body: string; base64Encoded: boolean };
+          const body = result.base64Encoded
+            ? Buffer.from(result.body, 'base64').toString('utf8')
+            : result.body;
+          // Try to pretty-print JSON bodies
+          try {
+            return { url: req.url, status: req.status, body: JSON.parse(body) };
+          } catch {
+            return { url: req.url, status: req.status, body };
+          }
+        } catch (err) {
+          return `Could not retrieve response body for "${req.url}": ${err instanceof Error ? err.message : String(err)}. The body may no longer be cached by the debugger.`;
+        }
+      },
+    });
+
     ctx.registerTool('search_network', {
       description: 'Search network requests by URL pattern, method, or status code.',
       parameters: z.object({
@@ -666,16 +697,24 @@ export const networkPlugin = definePlugin({
       },
     });
 
-    // ── Auto-load overrides on startup if configured ───────────────────────────
+    // ── Auto-load overrides on startup ────────────────────────────────────────
+    // Explicit config (env/CLI/config file) → warn on failure.
+    // Default fallback (./network-overrides.json) → silently skip if missing.
 
     const networkConfig = (ctx.config as Record<string, unknown>).network as { overridesFile?: string } | undefined;
-    if (networkConfig?.overridesFile) {
-      try {
-        const result = await loadOverridesFromPath(networkConfig.overridesFile, undefined, false, true);
-        ctx.logger.info(`Auto-loaded ${result.added} network override(s) from ${result.loaded}`);
-      } catch (err) {
-        ctx.logger.warn(`Failed to auto-load network overrides from "${networkConfig.overridesFile}": ${err instanceof Error ? err.message : String(err)}`);
+    const DEFAULT_OVERRIDES_FILE = './network-overrides.json';
+    const overridesFilePath = networkConfig?.overridesFile ?? DEFAULT_OVERRIDES_FILE;
+    const isExplicit = !!networkConfig?.overridesFile;
+
+    try {
+      await stat(resolve(overridesFilePath)); // throws if missing
+      const result = await loadOverridesFromPath(overridesFilePath, undefined, false, true);
+      ctx.logger.info(`Auto-loaded ${result.added} network override(s) from ${result.loaded}`);
+    } catch (err) {
+      if (isExplicit) {
+        ctx.logger.warn(`Failed to auto-load network overrides from "${overridesFilePath}": ${err instanceof Error ? err.message : String(err)}`);
       }
+      // else: default path not found — silent skip
     }
   },
 });
