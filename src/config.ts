@@ -15,9 +15,6 @@ const DEFAULT_CONFIG: Required<MetroMCPConfig> = {
     network: 200,
     errors: 100,
   },
-  network: {
-    interceptFetch: false,
-  },
   profiler: {
     newArchitecture: true,
   },
@@ -32,9 +29,6 @@ export async function loadConfig(args: string[]): Promise<Required<MetroMCPConfi
   // Environment variables
   if (process.env.METRO_HOST) {
     config.metro.host = process.env.METRO_HOST;
-  }
-  if (process.env.METRO_NETWORK_OVERRIDES) {
-    config.network.overridesFile = process.env.METRO_NETWORK_OVERRIDES;
   }
   if (process.env.METRO_PORT) {
     const port = parseInt(process.env.METRO_PORT, 10);
@@ -55,10 +49,6 @@ export async function loadConfig(args: string[]): Promise<Required<MetroMCPConfi
         config.metro.port = port;
         config.metro.autoDiscover = false;
       }
-    } else if (arg === '--intercept-fetch') {
-      config.network.interceptFetch = true;
-    } else if (arg === '--network-overrides' && args[i + 1]) {
-      config.network.overridesFile = args[++i];
     }
   }
 
@@ -97,10 +87,6 @@ function mergeConfig(target: Required<MetroMCPConfig>, source: MetroMCPConfig): 
     if (source.bufferSizes.logs !== undefined) target.bufferSizes.logs = source.bufferSizes.logs;
     if (source.bufferSizes.network !== undefined) target.bufferSizes.network = source.bufferSizes.network;
     if (source.bufferSizes.errors !== undefined) target.bufferSizes.errors = source.bufferSizes.errors;
-  }
-  if (source.network) {
-    if (source.network.interceptFetch !== undefined) target.network.interceptFetch = source.network.interceptFetch;
-    if (source.network.overridesFile !== undefined) target.network.overridesFile = source.network.overridesFile;
   }
   if (source.profiler) {
     if (source.profiler.newArchitecture !== undefined) target.profiler.newArchitecture = source.profiler.newArchitecture;
