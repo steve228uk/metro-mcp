@@ -1,3 +1,4 @@
+import WebSocket from 'ws';
 import type { CDPConnection } from '../plugin.js';
 import type { CDPRequest, CDPResponse, MetroTarget } from './types.js';
 import { createLogger } from '../utils/logger.js';
@@ -15,6 +16,10 @@ interface PendingRequest {
 /**
  * CDP WebSocket client that connects to a Hermes debugger target.
  * Implements the CDPConnection interface used by plugins.
+ *
+ * Uses the `ws` library (same as Metro's InspectorProxy) for native
+ * WebSocket ping/pong support. Metro sends pings every 5s and terminates
+ * connections after 60s of no pong — `ws` auto-responds to pings.
  */
 export class CDPClient implements CDPConnection {
   private ws: WebSocket | null = null;
@@ -26,6 +31,7 @@ export class CDPClient implements CDPConnection {
   private suppressReconnect = false;
   private _isConnected = false;
   private target: MetroTarget | null = null;
+  private pongReceived = false;
 
   private readonly requestTimeout = 10000;
   private readonly keepAliveInterval = 10000;
@@ -62,24 +68,23 @@ export class CDPClient implements CDPConnection {
         this.ws = new WebSocket(url);
         const socketForThisConnection = this.ws;
 
-        this.ws.onopen = () => {
+        this.ws.on('open', () => {
           this._isConnected = true;
+          this.pongReceived = true;
           this.startKeepAlive();
           logger.info(`Connected to ${this.target?.title || 'unknown'}`);
           resolve();
-        };
+        });
 
-        this.ws.onmessage = (event) => {
-          this.handleMessage(event.data as string);
-        };
+        this.ws.on('message', (data) => {
+          this.handleMessage(data.toString());
+        });
 
-        this.ws.onclose = (event) => {
+        this.ws.on('close', (code, reason) => {
           // Ignore close events from a replaced socket — a new connection is already in progress
           if (this.ws !== socketForThisConnection) return;
 
-          const code = (event as CloseEvent).code;
-          const reason = (event as CloseEvent).reason || 'no reason';
-          logger.info(`WebSocket closed (code=${code}, reason="${reason}", wasConnected=${this._isConnected})`);
+          logger.info(`WebSocket closed (code=${code}, reason="${reason.toString() || 'no reason'}", wasConnected=${this._isConnected})`);
 
           this._isConnected = false;
           this.stopKeepAlive();
@@ -87,14 +92,26 @@ export class CDPClient implements CDPConnection {
           if (!this.suppressReconnect) {
             this.emit('disconnected', {});
           }
-        };
+        });
 
-        this.ws.onerror = () => {
+        this.ws.on('error', () => {
           logger.error(`WebSocket error (connected=${this._isConnected})`);
           if (!this._isConnected) {
             reject(new Error('Failed to connect to CDP target'));
           }
-        };
+        });
+
+        // Metro's InspectorProxy sends pings every 5s — ws auto-responds with pong.
+        // Log for diagnostics.
+        this.ws.on('ping', () => {
+          logger.debug('Received ping from Metro');
+        });
+
+        // Track pong responses to our own pings (sent by startKeepAlive).
+        this.ws.on('pong', () => {
+          this.pongReceived = true;
+          logger.debug('Received pong from Metro');
+        });
       } catch (err) {
         reject(err);
       }
@@ -173,24 +190,21 @@ export class CDPClient implements CDPConnection {
     this.stopKeepAlive();
     let missedKeepAlives = 0;
     this.keepAliveTimer = setInterval(() => {
-      if (this._isConnected) {
-        // Re-enable Runtime domain as a lightweight keepalive — idempotent and always supported.
-        // Track consecutive failures to detect a silently dead connection.
-        this.send('Runtime.enable')
-          .then(() => {
-            missedKeepAlives = 0;
-          })
-          .catch(() => {
-            missedKeepAlives++;
-            if (missedKeepAlives >= 3) {
-              logger.warn(`${missedKeepAlives} consecutive keepalive failures — closing connection`);
-              // Force-close so the reconnect logic kicks in with a fresh target URL
-              if (this.ws) {
-                try { this.ws.close(); } catch {}
-              }
-            }
-          });
+      if (!this._isConnected || !this.ws) return;
+
+      if (!this.pongReceived) {
+        missedKeepAlives++;
+        if (missedKeepAlives >= 3) {
+          logger.warn(`${missedKeepAlives} consecutive pongs missed — closing connection`);
+          try { this.ws.close(); } catch {}
+          return;
+        }
+      } else {
+        missedKeepAlives = 0;
       }
+
+      this.pongReceived = false;
+      this.ws.ping();
     }, this.keepAliveInterval);
   }
 
