@@ -33,8 +33,7 @@ import { uiInteractPlugin } from './plugins/ui-interact.js';
 import { navigationPlugin } from './plugins/navigation.js';
 import { accessibilityPlugin } from './plugins/accessibility.js';
 import { commandsPlugin } from './plugins/commands.js';
-import { maestroPlugin } from './plugins/maestro.js';
-import { appiumPlugin } from './plugins/appium.js';
+import { testRecorderPlugin } from './plugins/test-recorder.js';
 import { profilerPlugin } from './plugins/profiler.js';
 import { promptsPlugin } from './plugins/prompts.js';
 
@@ -57,8 +56,7 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   navigationPlugin,
   accessibilityPlugin,
   commandsPlugin,
-  maestroPlugin,
-  appiumPlugin,
+  testRecorderPlugin,
   profilerPlugin,
   promptsPlugin,
 ];

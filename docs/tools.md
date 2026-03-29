@@ -124,15 +124,13 @@ See the [profiling guide](profiling.md) for a full explanation of CDP CPU profil
 | `metro://profiler/flamegraph` | CPU call tree with time bars + ranked self-time chart + React render chart (text) |
 | `metro://profiler/data` | Raw JSON: full CDP Profile object + React render records with memo savings |
 
-## Maestro
+## Test Recorder
 
-- **`generate_maestro_flow`** — Generate Maestro YAML from a test description.
-- **`record_interaction`** — Start/stop recording for Maestro flow generation.
+Records real user interactions via React fiber patching — no app code changes required. See the [testing guide](testing.md) for full details.
 
-## Appium
-
-- **`generate_appium_test`** — Generate a WebdriverIO + Jest test file from a plain-English description. Uses the live component tree to build accurate `~accessibility_id` selectors. Supports iOS, Android, or both.
-- **`record_appium_interactions`** — Snapshot-based recorder. Call `start`, perform an action, call `step` with a description, repeat, then `stop` to get a ready-to-run `it()` block. Reads live selectors after each action — no native event interception needed.
+- **`start_test_recording`** — Inject interaction interceptors into the running app. Captures taps, text entry, long presses, keyboard submits, and scroll/swipe gestures. Re-patches new fibers after each navigation so newly-loaded screens are always covered.
+- **`stop_test_recording`** — Stop recording and retrieve the captured event log. Deduplicates rapid-fire text input events (keeps the final value per field).
+- **`generate_test_from_recording`** — Convert the recording to a test file. Params: `format` (appium/maestro/detox), `testName`, `platform` (ios/android/both), `bundleId`, `includeSetup`.
 - **`generate_wdio_config`** — Generate a minimal `wdio.conf.ts` for Appium + React Native, including the install command for all required packages.
 
 ## Token-Efficient Output
@@ -170,5 +168,5 @@ All tools support modifiers to reduce context window usage:
 | `debug-performance` | Performance analysis |
 | `diagnose-network` | Network issue diagnosis |
 | `trace-action` | Trace user action through state + network |
-| `generate-tests` | Generate Maestro tests from current screen |
+| `record-test` | Record a user flow and generate an Appium, Maestro, or Detox test |
 | `audit-accessibility` | Accessibility audit with fixes |

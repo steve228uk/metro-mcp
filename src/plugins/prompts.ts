@@ -110,20 +110,25 @@ export const promptsPlugin = definePlugin({
       ],
     });
 
-    ctx.registerPrompt('generate-tests', {
-      description: 'Generate Maestro tests from the current screen',
+    ctx.registerPrompt('record-test', {
+      description: 'Record and generate an automated test (Appium, Maestro, or Detox) by navigating a user flow in the app',
       arguments: [
-        { name: 'scenario', description: 'Test scenario to generate (e.g., "login flow")', required: false },
+        { name: 'flow', description: 'Flow to record (e.g. "guest user: tap Start Shopping on FirstVisitScreen, end on ShopTab")', required: true },
+        { name: 'format', description: 'Output format: appium, maestro, or detox (default: appium)', required: false },
       ],
       handler: async (args) => [
         {
           role: 'user',
-          content: `I want to generate Maestro tests ${args.scenario ? `for the "${args.scenario}" scenario` : 'for the current screen'} in my React Native app. Please:
-1. Get all testable elements on the current screen (get_testable_elements)
-2. Get the component tree for structure (get_component_tree with structureOnly=true)
-3. Get the current navigation state to understand the screen (get_current_route)
-4. ${args.scenario ? `Generate a Maestro flow for: "${args.scenario}" (generate_maestro_flow)` : 'Identify the key user flows on this screen and generate Maestro flows for each'}
-5. Review the generated YAML and suggest any missing testIDs that would improve the tests`,
+          content: `Record and generate an automated test for: "${args.flow}"
+Format: ${args.format || 'appium'}
+
+Please:
+1. Call start_test_recording to begin capturing interactions
+2. Call get_testable_elements to inspect the current screen and identify available selectors
+3. Navigate the app step by step using tap_element, type_text, and swipe tools to follow the described flow
+4. When the flow is complete (or the end condition is reached), call stop_test_recording
+5. Call generate_test_from_recording with format="${args.format || 'appium'}" to produce the final test
+6. Return the complete test code with a brief comment on each step`,
         },
       ],
     });

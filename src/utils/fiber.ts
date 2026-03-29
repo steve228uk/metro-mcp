@@ -75,6 +75,29 @@ export const COLLECT_ELEMENTS_JS = `
   })()
 `;
 
+/**
+ * Swipe coordinates [startX, startY, endX, endY] — assumes ~1080×1920 viewport.
+ * Shared by test-recorder (test generation) and ui-interact (native fallback swipes).
+ */
+export const SWIPE_COORDS: Record<string, [number, number, number, number]> = {
+  up:    [500, 1500, 500,  500],
+  down:  [500,  500, 500, 1500],
+  left:  [800, 1000, 200, 1000],
+  right: [200, 1000, 800, 1000],
+};
+
+/**
+ * JS snippet that defines a `getRoute()` function reading from the nav ref set by the
+ * navigation plugin. Embed inside an IIFE that also calls `getRoute()`.
+ */
+export const GET_ROUTE_FUNC_JS = `function getRoute() {
+  try {
+    var n = globalThis.__METRO_MCP_NAV_REF__;
+    if (n && n.getCurrentRoute) { var r = n.getCurrentRoute(); return r ? r.name : null; }
+  } catch(e) {}
+  return null;
+}`;
+
 export interface TestableElement {
   name: string;
   testID?: string;

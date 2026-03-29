@@ -7,6 +7,22 @@ A plugin-based MCP server for React Native runtime debugging, inspection, and au
 
 Works with **Expo**, **bare React Native**, and any project using **Metro + Hermes**.
 
+---
+
+## Contents
+
+- [Quick Start](#quick-start)
+- [Requirements](#requirements)
+- [How It Works](#how-it-works)
+- [Features](#features)
+- [Test Recording](#test-recording)
+- [App Integration](#app-integration-optional)
+- [Configuration](#configuration)
+- [Custom Plugins](#custom-plugins)
+- [Compatibility](#compatibility)
+
+---
+
 ## Quick Start
 
 ### Claude Code
@@ -49,6 +65,8 @@ Or with Bun:
 claude mcp add metro-mcp -- npx -y metro-mcp --port 19000
 ```
 
+---
+
 ## Requirements
 
 - **Node.js** 18+ or **Bun** 1.0+
@@ -56,16 +74,20 @@ claude mcp add metro-mcp -- npx -y metro-mcp --port 19000
 - **Android**: Android SDK with `adb` on your PATH
 - **IDB** *(optional)*: Some iOS operations fall back to [IDB (idb-companion)](https://github.com/facebook/idb) — install with `brew install idb-companion`. Tools will tell you when IDB is needed.
 
+---
+
 ## How It Works
 
 metro-mcp connects to your running Metro dev server the same way Chrome DevTools does:
 
-1. Discovers Metro via port scanning (8081, 8082, 19000-19002)
+1. Discovers Metro via port scanning (8081, 8082, 19000–19002)
 2. Connects to Hermes via Chrome DevTools Protocol (CDP)
-3. Streams console logs, network requests, errors into buffers
+3. Streams console logs, network requests, and errors into buffers
 4. Exposes everything as MCP tools, resources, and prompts
 
 **No app modifications required** for core debugging features.
+
+---
 
 ## Features
 
@@ -74,7 +96,7 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 | **console** | 2 | Console log collection with filtering |
 | **network** | 3 | Network request tracking and search |
 | **errors** | 2 | Exception collection with auto-symbolication |
-| **evaluate** | 1 | Execute JavaScript in app runtime |
+| **evaluate** | 1 | Execute JavaScript in the app runtime |
 | **device** | 3 | Device and connection management |
 | **source** | 1 | Stack trace symbolication |
 | **redux** | 3 | Redux state inspection and action dispatch |
@@ -88,10 +110,38 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 | **accessibility** | 3 | Accessibility auditing |
 | **commands** | 2 | Custom app commands |
 | **profiler** | 5 | CPU profiling (Hermes CDP) + React render tracking |
-| **maestro** | 2 | Maestro test flow generation |
-| **appium** | 3 | Appium/WebdriverIO Jest test generation |
+| **test-recorder** | 4 | Record interactions and generate Appium, Maestro, or Detox tests |
 
-**Total: 55 tools, 9 resources, 7 prompts** — see the [full tools reference](docs/tools.md).
+**Total: 56 tools, 9 resources, 7 prompts** — see the [full tools reference](docs/tools.md).
+
+---
+
+## Test Recording
+
+Record real user interactions (taps, text entry, scrolls) and generate production-ready tests — no app code changes required.
+
+### AI-driven test generation
+
+Describe a flow and the AI navigates the app, then generates the test:
+
+> *"Write an Appium test for the guest checkout flow — start by tapping 'Start Shopping' on the welcome screen and end when the cart screen is visible."*
+
+The AI calls `start_test_recording`, navigates using `tap_element`/`type_text`/`swipe`, then generates a complete test with real selectors observed from the fiber tree.
+
+### Manual recording
+
+```
+start_test_recording   → inject interceptors
+(interact with the app)
+stop_test_recording    → retrieve event log
+generate_test_from_recording format=appium
+```
+
+Supports **Appium (WebdriverIO)**, **Maestro YAML**, and **Detox**.
+
+→ See the [testing guide](docs/testing.md) for full details, format examples, and tips.
+
+---
 
 ## App Integration (Optional)
 
@@ -124,13 +174,19 @@ Use `list_commands` and `run_command` to call these from the MCP client.
 
 For enhanced features like real-time Redux action tracking, navigation events, performance marks, and React render profiling, see the [optional client SDK](docs/sdk.md) and [profiling guide](docs/profiling.md).
 
+---
+
 ## Configuration
 
 See [configuration docs](docs/configuration.md) for environment variables, CLI arguments, and config file options.
 
+---
+
 ## Custom Plugins
 
 metro-mcp is fully extensible. See the [plugins guide](docs/plugins.md) to build your own tools and resources.
+
+---
 
 ## Compatibility
 
