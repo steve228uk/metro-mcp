@@ -60,7 +60,7 @@ export class CDPClient implements CDPConnection {
   private doConnect(url: string): Promise<void> {
     // Close existing socket before opening a new one
     if (this.ws) {
-      try { this.ws.close(); } catch {}
+      try { this.ws.removeAllListeners(); this.ws.close(); } catch {}
       this.ws = null;
     }
     return new Promise((resolve, reject) => {
@@ -77,7 +77,10 @@ export class CDPClient implements CDPConnection {
         });
 
         this.ws.on('message', (data) => {
-          this.handleMessage(data.toString());
+          const text = Array.isArray(data) ? Buffer.concat(data).toString()
+            : Buffer.isBuffer(data) ? data.toString()
+            : Buffer.from(data).toString();
+          this.handleMessage(text);
         });
 
         this.ws.on('close', (code, reason) => {
