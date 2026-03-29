@@ -37,6 +37,7 @@ import { testRecorderPlugin } from './plugins/test-recorder.js';
 import { profilerPlugin } from './plugins/profiler.js';
 import { promptsPlugin } from './plugins/prompts.js';
 import { automationPlugin } from './plugins/automation.js';
+import { statuslinePlugin } from './plugins/statusline.js';
 
 const logger = createLogger('server');
 
@@ -60,6 +61,7 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   profilerPlugin,
   promptsPlugin,
   automationPlugin,
+  statuslinePlugin,
 ];
 
 export async function startServer(config: Required<MetroMCPConfig>): Promise<void> {
