@@ -1,13 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-
-// ── Swipe coordinates [startX, startY, endX, endY] — assumes ~1080×1920 viewport.
-const SWIPE_COORDS: Record<string, [number, number, number, number]> = {
-  up:    [500, 1500, 500,  500],
-  down:  [500,  500, 500, 1500],
-  left:  [800, 1000, 200, 1000],
-  right: [200, 1000, 800, 1000],
-};
+import { GET_ROUTE_FUNC_JS, SWIPE_COORDS } from '../utils/fiber.js';
 
 // ── Resolve current navigation route from the nav ref set by the navigation plugin.
 const CURRENT_ROUTE_JS = `
@@ -33,13 +26,7 @@ const START_RECORDING_JS = `
   globalThis.__METRO_MCP_REC_ACTIVE__ = true;
   var patched = new WeakSet();
 
-  function getRoute() {
-    try {
-      var n = globalThis.__METRO_MCP_NAV_REF__;
-      if (n && n.getCurrentRoute) { var r = n.getCurrentRoute(); return r ? r.name : null; }
-    } catch(e) {}
-    return null;
-  }
+  ${GET_ROUTE_FUNC_JS}
 
   function patchFibers(rootFiber) {
     var stack = [{ f: rootFiber, d: 0 }];
@@ -536,8 +523,8 @@ function generateAppium(
         break;
 
       case 'type': {
-        const inputSel = sel ?? `'~TODO'`;
-        lines.push(`    await driver.$(${typeof sel === 'string' ? JSON.stringify(sel) : inputSel}).setValue(${JSON.stringify(ev.text ?? '')});`);
+        const inputSel = sel ?? '~TODO';
+        lines.push(`    await driver.$(${JSON.stringify(inputSel)}).setValue(${JSON.stringify(ev.text ?? '')});`);
         break;
       }
 

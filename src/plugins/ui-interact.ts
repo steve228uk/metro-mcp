@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { FIBER_ROOT_JS } from '../utils/fiber.js';
+import { FIBER_ROOT_JS, GET_ROUTE_FUNC_JS, SWIPE_COORDS } from '../utils/fiber.js';
 
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let idbAvailableCache: boolean | null = null;
@@ -427,13 +427,7 @@ export const uiInteractPlugin = definePlugin({
 
         if (!result) {
           // ── Native fallbacks (fixed midpoint coordinates) ───────────────────
-          const coords: Record<string, [number, number, number, number]> = {
-            up:    [500, 1500, 500,  500],
-            down:  [500,  500, 500, 1500],
-            left:  [800, 1000, 200, 1000],
-            right: [200, 1000, 800, 1000],
-          };
-          const [sx, sy, ex, ey] = coords[direction];
+          const [sx, sy, ex, ey] = SWIPE_COORDS[direction];
 
           if (p === 'android') {
             await ctx.exec(`adb shell input swipe ${sx} ${sy} ${ex} ${ey} 300`);
@@ -450,13 +444,7 @@ export const uiInteractPlugin = definePlugin({
         await ctx.evalInApp(`
           (function() {
             if (!globalThis.__METRO_MCP_REC_ACTIVE__) return;
-            var getRoute = function() {
-              try {
-                var n = globalThis.__METRO_MCP_NAV_REF__;
-                if (n && n.getCurrentRoute) { var r = n.getCurrentRoute(); return r ? r.name : null; }
-              } catch(e) {}
-              return null;
-            };
+            ${GET_ROUTE_FUNC_JS}
             globalThis.__METRO_MCP_REC_EVENTS__.push({
               type: 'swipe', direction: ${JSON.stringify(direction)},
               route: getRoute(), timestamp: Date.now()
