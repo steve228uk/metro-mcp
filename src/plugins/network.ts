@@ -77,39 +77,26 @@ export const networkPlugin = definePlugin({
 
     // ── CDP Network domain ─────────────────────────────────────────────────────
 
-    // Track recent requests by URL+method to deduplicate Hermes's paired
-    // CDP events (e.g. type "xhr" + type "json" for the same fetch).
-    const recentRequestKeys = new Map<string, number>();
-
     ctx.cdp.on('Network.requestWillBeSent', (params) => {
-      const url = (params.request as Record<string, unknown>)?.url as string;
-      const method = (params.request as Record<string, unknown>)?.method as string || 'GET';
+      // Hermes fires two requestWillBeSent events per fetch call:
+      //   1. JS XHR polyfill layer — UUID request ID, full JS call stack in initiator.stack
+      //   2. Native networking layer — numeric request ID, initiator has no call stack
+      // Drop the JS-layer event (identified by having a call stack) so each request
+      // appears exactly once, sourced from the native layer.
+      if ((params.initiator as Record<string, unknown> | undefined)?.stack) return;
+
+      const req = params.request as Record<string, unknown>;
+      const url = req?.url as string;
+      const method = req?.method as string || 'GET';
       const type = params.type as string | undefined;
-
-      // Hermes fires two requestWillBeSent for each fetch: one typed "XHR"
-      // and another typed "json"/"text"/etc. Keep only the first one.
-      const dedupeKey = `${method} ${url}`;
       const now = Date.now();
-      const lastSeen = recentRequestKeys.get(dedupeKey);
-      if (lastSeen !== undefined && now - lastSeen < 2000) {
-        // Duplicate within 2s window — skip this one
-        return;
-      }
-      recentRequestKeys.set(dedupeKey, now);
-
-      // Prune old dedup keys periodically
-      if (recentRequestKeys.size > 500) {
-        for (const [key, ts] of recentRequestKeys) {
-          if (now - ts > 5000) recentRequestKeys.delete(key);
-        }
-      }
 
       const request: NetworkRequest = {
         id: params.requestId as string,
         url,
         method,
         type,
-        requestHeaders: (params.request as Record<string, unknown>)?.headers as Record<string, string>,
+        requestHeaders: req?.headers as Record<string, string>,
         startTime: now,
         get timestamp() { return this.startTime; },
         session: currentSession,
