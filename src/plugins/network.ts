@@ -356,17 +356,24 @@ export const networkPlugin = definePlugin({
 
     let fetchWrapperInjected = false;
     let cdpNetworkActive = false;
+    let fetchWrapperTimer: ReturnType<typeof setTimeout> | null = null;
 
     ctx.cdp.on('Network.requestWillBeSent', () => {
       cdpNetworkActive = true;
     });
 
+    ctx.cdp.on('disconnected', () => {
+      if (fetchWrapperTimer) { clearTimeout(fetchWrapperTimer); fetchWrapperTimer = null; }
+    });
+
     ctx.cdp.on('reconnected', () => {
+      if (fetchWrapperTimer) { clearTimeout(fetchWrapperTimer); fetchWrapperTimer = null; }
       fetchWrapperInjected = false;
       cdpNetworkActive = false;
       // After a short delay, check if CDP Network is producing events.
       // If not, inject the fetch wrapper.
-      setTimeout(async () => {
+      fetchWrapperTimer = setTimeout(async () => {
+        fetchWrapperTimer = null;
         if (fetchWrapperInjected || cdpNetworkActive) return;
         try {
           await ctx.evalInApp(`(function() {
