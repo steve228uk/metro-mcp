@@ -96,6 +96,10 @@ export interface PluginContext {
   format: FormatUtils;
   /** Evaluate a JavaScript expression in the connected app runtime */
   evalInApp(expression: string, options?: EvalOptions): Promise<unknown>;
+  /** Returns the active device key (`${port}-${targetId}`), or null if not connected. */
+  getActiveDeviceKey(): string | null;
+  /** Returns a human-readable name for the active device, or null if not connected. */
+  getActiveDeviceName(): string | null;
 }
 
 // ── Logger ──
@@ -142,6 +146,12 @@ export interface MetroMCPConfig {
      * Set to false for legacy bridge apps that expose the CDP Profiler domain.
      */
     newArchitecture?: boolean;
+  };
+  proxy?: {
+    /** Enable the CDP proxy so Chrome DevTools can connect alongside the MCP. Defaults to true. */
+    enabled?: boolean;
+    /** Port for the proxy server. Use 0 for OS-assigned. Defaults to 0. */
+    port?: number;
   };
 }
 

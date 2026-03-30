@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { CircularBuffer } from '../utils/buffer.js';
+import { CircularBuffer, DeviceBufferManager } from '../utils/buffer.js';
 import { formatTimestamp } from '../utils/format.js';
 import { extractCDPExceptionMessage } from '../utils/cdp.js';
 
@@ -45,7 +45,8 @@ export const errorsPlugin = definePlugin({
   description: 'Exception collection with auto-symbolication',
 
   async setup(ctx) {
-    const buffer = new CircularBuffer<ErrorEntry>(100);
+    const buffers = new DeviceBufferManager<ErrorEntry>(100);
+    // Bundle errors are per-Metro-server, not per-device, so a single buffer is fine.
     const bundleErrors = new CircularBuffer<BundleError>(100);
 
     // CDP console errors are a fallback — the Metro /events path below
@@ -121,17 +122,23 @@ export const errorsPlugin = definePlugin({
         }
       }
 
-      buffer.push(entry);
+      const key = ctx.getActiveDeviceKey();
+      if (key) buffers.getOrCreate(key).push(entry);
     });
+
+    function getErrors(device?: string): ErrorEntry[] {
+      return buffers.resolve(device, ctx.getActiveDeviceKey());
+    }
 
     ctx.registerTool('get_errors', {
       description: 'Get recent uncaught exceptions and errors from the React Native app.',
       parameters: z.object({
         limit: z.number().default(20).describe('Maximum number of errors to return'),
         summary: z.boolean().default(false).describe('Return summary with counts'),
+        device: z.string().optional().describe('Device key or "all" for aggregated errors. Defaults to current device.'),
       }),
-      handler: async ({ limit, summary }) => {
-        const errors = buffer.getAll();
+      handler: async ({ limit, summary, device }) => {
+        const errors = getErrors(device);
         if (summary) {
           return ctx.format.summarize(
             errors.map((e) => e.message),
@@ -148,9 +155,15 @@ export const errorsPlugin = definePlugin({
 
     ctx.registerTool('clear_errors', {
       description: 'Clear the error buffer.',
-      parameters: z.object({}),
-      handler: async () => {
-        buffer.clear();
+      parameters: z.object({
+        device: z.string().optional().describe('Device key to clear, or omit for current device. Use "all" to clear all.'),
+      }),
+      handler: async ({ device }) => {
+        if (device === 'all') {
+          buffers.clear();
+          return 'Error buffer cleared for all devices.';
+        }
+        buffers.clear(device || ctx.getActiveDeviceKey() || undefined);
         return 'Error buffer cleared.';
       },
     });
@@ -178,7 +191,8 @@ export const errorsPlugin = definePlugin({
       name: 'Errors',
       description: 'Recent uncaught exceptions from the React Native app',
       handler: async () => {
-        const errors = buffer.getLast(10);
+        const all = getErrors();
+        const errors = all.slice(-10);
         return JSON.stringify(
           errors.map((e) => ({
             time: formatTimestamp(e.timestamp),

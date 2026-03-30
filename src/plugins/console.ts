@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { CircularBuffer } from '../utils/buffer.js';
+import { DeviceBufferManager } from '../utils/buffer.js';
 import { formatTimestamp } from '../utils/format.js';
 
 interface LogEntry {
@@ -35,11 +35,13 @@ export const consolePlugin = definePlugin({
   description: 'Console log collection and filtering',
 
   async setup(ctx) {
-    const buffer = new CircularBuffer<LogEntry>(500);
+    const buffers = new DeviceBufferManager<LogEntry>(500);
 
     ctx.cdp.on('Runtime.consoleAPICalled', (params) => {
+      const key = ctx.getActiveDeviceKey();
+      if (!key) return;
       const args = (params.args as unknown[]) || [];
-      buffer.push({
+      buffers.getOrCreate(key).push({
         timestamp: Date.now(),
         level: params.type as string,
         message: formatCDPArgs(args),
@@ -52,7 +54,9 @@ export const consolePlugin = definePlugin({
     // Mark when Metro starts rebuilding — a reload is imminent.
     ctx.events.on('bundle_transform_progressed', (event) => {
       if (event.transformedFileCount === 1) {
-        buffer.push({
+        const key = ctx.getActiveDeviceKey();
+        if (!key) return;
+        buffers.getOrCreate(key).push({
           timestamp: Date.now(),
           level: 'info',
           message: '── Metro rebuilding ── (file change detected)',
@@ -63,7 +67,9 @@ export const consolePlugin = definePlugin({
     // Insert a visible boundary marker when the CDP connection is re-established,
     // so it's clear where a gap in logs may have occurred.
     ctx.cdp.on('reconnected', () => {
-      buffer.push({
+      const key = ctx.getActiveDeviceKey();
+      if (!key) return;
+      buffers.getOrCreate(key).push({
         timestamp: Date.now(),
         level: 'info',
         message: '── CDP reconnected ── (logs during the disconnection gap may be missing)',
@@ -78,9 +84,10 @@ export const consolePlugin = definePlugin({
         limit: z.number().default(50).describe('Maximum number of logs to return'),
         summary: z.boolean().default(false).describe('Return summary with counts + last few entries'),
         compact: z.boolean().default(false).describe('Return compact single-line format'),
+        device: z.string().optional().describe('Device key or "all" for aggregated logs. Defaults to current device.'),
       }),
-      handler: async ({ level, search, limit, summary, compact: isCompact }) => {
-        let logs = buffer.getAll();
+      handler: async ({ level, search, limit, summary, compact: isCompact, device }) => {
+        let logs = buffers.resolve(device, ctx.getActiveDeviceKey());
         if (level) logs = logs.filter((l) => l.level === level);
         if (search) logs = logs.filter((l) => l.message.toLowerCase().includes(search.toLowerCase()));
 
@@ -106,9 +113,15 @@ export const consolePlugin = definePlugin({
 
     ctx.registerTool('clear_console_logs', {
       description: 'Clear the console log buffer.',
-      parameters: z.object({}),
-      handler: async () => {
-        buffer.clear();
+      parameters: z.object({
+        device: z.string().optional().describe('Device key to clear, or omit for current device. Use "all" to clear all.'),
+      }),
+      handler: async ({ device }) => {
+        if (device === 'all') {
+          buffers.clear();
+          return 'Console logs cleared for all devices.';
+        }
+        buffers.clear(device || ctx.getActiveDeviceKey() || undefined);
         return 'Console logs cleared.';
       },
     });
@@ -117,7 +130,7 @@ export const consolePlugin = definePlugin({
       name: 'Console Logs',
       description: 'Recent console output from the React Native app',
       handler: async () => {
-        const logs = buffer.getLast(20);
+        const logs = buffers.resolve(undefined, ctx.getActiveDeviceKey()).slice(-20);
         return JSON.stringify(
           logs.map((l) => ({
             time: formatTimestamp(l.timestamp),

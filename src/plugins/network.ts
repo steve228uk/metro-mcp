@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { CircularBuffer } from '../utils/buffer.js';
+import { DeviceBufferManager } from '../utils/buffer.js';
 import { formatTimestamp, formatBytes } from '../utils/format.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -19,12 +19,15 @@ interface NetworkRequest {
   id: string;
   url: string;
   method: string;
+  type?: string;
   status?: number;
   statusText?: string;
   requestHeaders?: Record<string, string>;
   responseHeaders?: Record<string, string>;
   requestBody?: string;
   responseBody?: string;
+  /** Alias for startTime — required by DeviceBufferManager constraint. */
+  timestamp: number;
   startTime: number;
   endTime?: number;
   error?: string;
@@ -39,7 +42,7 @@ export const networkPlugin = definePlugin({
   description: 'Network request tracking via CDP Network domain',
 
   async setup(ctx) {
-    const buffer = new CircularBuffer<NetworkRequest>(200);
+    const buffers = new DeviceBufferManager<NetworkRequest>(200);
     const pendingRequests = new Map<string, NetworkRequest>();
 
     /** Monotonically increasing session counter – bumped on every reconnect so we
@@ -48,6 +51,11 @@ export const networkPlugin = definePlugin({
 
     /** Simple concurrency limiter for eager body fetches to avoid flooding CDP. */
     let activeFetches = 0;
+
+    function getDeviceBuffer(): ReturnType<DeviceBufferManager<NetworkRequest>['getOrCreate']> | null {
+      const key = ctx.getActiveDeviceKey();
+      return key ? buffers.getOrCreate(key) : null;
+    }
 
     function fetchAndCacheBody(req: NetworkRequest): void {
       if (activeFetches >= MAX_CONCURRENT_BODY_FETCHES) return;
@@ -69,13 +77,41 @@ export const networkPlugin = definePlugin({
 
     // ── CDP Network domain ─────────────────────────────────────────────────────
 
+    // Track recent requests by URL+method to deduplicate Hermes's paired
+    // CDP events (e.g. type "xhr" + type "json" for the same fetch).
+    const recentRequestKeys = new Map<string, number>();
+
     ctx.cdp.on('Network.requestWillBeSent', (params) => {
+      const url = (params.request as Record<string, unknown>)?.url as string;
+      const method = (params.request as Record<string, unknown>)?.method as string || 'GET';
+      const type = params.type as string | undefined;
+
+      // Hermes fires two requestWillBeSent for each fetch: one typed "XHR"
+      // and another typed "json"/"text"/etc. Keep only the first one.
+      const dedupeKey = `${method} ${url}`;
+      const now = Date.now();
+      const lastSeen = recentRequestKeys.get(dedupeKey);
+      if (lastSeen !== undefined && now - lastSeen < 2000) {
+        // Duplicate within 2s window — skip this one
+        return;
+      }
+      recentRequestKeys.set(dedupeKey, now);
+
+      // Prune old dedup keys periodically
+      if (recentRequestKeys.size > 500) {
+        for (const [key, ts] of recentRequestKeys) {
+          if (now - ts > 5000) recentRequestKeys.delete(key);
+        }
+      }
+
       const request: NetworkRequest = {
         id: params.requestId as string,
-        url: (params.request as Record<string, unknown>)?.url as string,
-        method: (params.request as Record<string, unknown>)?.method as string || 'GET',
+        url,
+        method,
+        type,
         requestHeaders: (params.request as Record<string, unknown>)?.headers as Record<string, string>,
-        startTime: Date.now(),
+        startTime: now,
+        get timestamp() { return this.startTime; },
         session: currentSession,
       };
       pendingRequests.set(request.id, request);
@@ -97,7 +133,7 @@ export const networkPlugin = definePlugin({
         req.endTime = Date.now();
         req.size = params.encodedDataLength as number;
         pendingRequests.delete(req.id);
-        buffer.push(req);
+        getDeviceBuffer()?.push(req);
         fetchAndCacheBody(req);
       }
     });
@@ -108,16 +144,17 @@ export const networkPlugin = definePlugin({
         req.endTime = Date.now();
         req.error = params.errorText as string;
         pendingRequests.delete(req.id);
-        buffer.push(req);
+        getDeviceBuffer()?.push(req);
       }
     });
 
     ctx.cdp.on('disconnected', () => {
       const now = Date.now();
+      const buf = getDeviceBuffer();
       for (const [, req] of pendingRequests) {
         req.endTime = now;
         req.error = 'Connection lost';
-        buffer.push(req);
+        buf?.push(req);
       }
       pendingRequests.clear();
     });
@@ -128,15 +165,20 @@ export const networkPlugin = definePlugin({
 
     // ── Request tracking tools ─────────────────────────────────────────────────
 
+    function getRequests(device?: string): NetworkRequest[] {
+      return buffers.resolve(device, ctx.getActiveDeviceKey());
+    }
+
     ctx.registerTool('get_network_requests', {
       description: 'Get recent network requests from the React Native app.',
       parameters: z.object({
         limit: z.number().default(50).describe('Maximum number of requests to return'),
         summary: z.boolean().default(false).describe('Return summary with counts'),
         compact: z.boolean().default(false).describe('Return compact single-line format'),
+        device: z.string().optional().describe('Device key or "all" for aggregated requests. Defaults to current device.'),
       }),
-      handler: async ({ limit, summary, compact: isCompact }) => {
-        const requests = buffer.getAll();
+      handler: async ({ limit, summary, compact: isCompact, device }) => {
+        const requests = getRequests(device);
 
         if (summary) {
           const total = requests.length;
@@ -175,9 +217,10 @@ export const networkPlugin = definePlugin({
       parameters: z.object({
         url: z.string().describe('URL or partial URL to find the request'),
         index: z.number().default(-1).describe('Index of the request if multiple match (-1 for last)'),
+        device: z.string().optional().describe('Device key or "all". Defaults to current device.'),
       }),
-      handler: async ({ url, index }) => {
-        const matches = buffer.filter((r) => r.url.includes(url));
+      handler: async ({ url, index, device }) => {
+        const matches = getRequests(device).filter((r) => r.url.includes(url));
         if (matches.length === 0) return `No requests found matching "${url}"`;
         const req = index === -1 ? matches[matches.length - 1] : matches[index];
         if (!req) return `Request index ${index} out of range (${matches.length} matches)`;
@@ -193,9 +236,10 @@ export const networkPlugin = definePlugin({
       parameters: z.object({
         url: z.string().describe('URL or partial URL to find the request'),
         index: z.number().default(-1).describe('Index of the request if multiple match (-1 for last)'),
+        device: z.string().optional().describe('Device key or "all". Defaults to current device.'),
       }),
-      handler: async ({ url, index }) => {
-        const matches = buffer.filter((r) => r.url.includes(url));
+      handler: async ({ url, index, device }) => {
+        const matches = getRequests(device).filter((r) => r.url.includes(url));
         if (matches.length === 0) return `No requests found matching "${url}"`;
         const req = index === -1 ? matches[matches.length - 1] : matches[index];
         if (!req) return `Request index ${index} out of range (${matches.length} matches)`;
@@ -237,9 +281,10 @@ export const networkPlugin = definePlugin({
         method: z.string().optional().describe('HTTP method filter'),
         statusCode: z.number().optional().describe('HTTP status code filter'),
         errorsOnly: z.boolean().default(false).describe('Show only failed requests'),
+        device: z.string().optional().describe('Device key or "all". Defaults to current device.'),
       }),
-      handler: async ({ urlPattern, method, statusCode, errorsOnly }) => {
-        let results = buffer.getAll();
+      handler: async ({ urlPattern, method, statusCode, errorsOnly, device }) => {
+        let results = getRequests(device);
         if (urlPattern) {
           const regex = new RegExp(urlPattern, 'i');
           results = results.filter((r) => regex.test(r.url));
@@ -259,13 +304,143 @@ export const networkPlugin = definePlugin({
 
     ctx.registerTool('clear_network_requests', {
       description: 'Clear the network request buffer. Useful after a reload or when old requests are no longer relevant.',
-      parameters: z.object({}),
-      handler: async () => {
-        const count = buffer.size;
-        buffer.clear();
+      parameters: z.object({
+        device: z.string().optional().describe('Device key to clear, or omit for current device. Use "all" to clear all.'),
+      }),
+      handler: async ({ device }) => {
+        const count = buffers.size;
+        if (device === 'all') {
+          buffers.clear();
+        } else {
+          buffers.clear(device || ctx.getActiveDeviceKey() || undefined);
+        }
         pendingRequests.clear();
         return `Cleared ${count} network requests.`;
       },
+    });
+
+    ctx.registerTool('get_network_stats', {
+      description: 'Get aggregated network statistics: breakdown by domain, status code, and response times.',
+      parameters: z.object({
+        device: z.string().optional().describe('Device key or "all". Defaults to current device.'),
+      }),
+      handler: async ({ device }) => {
+        const requests = getRequests(device);
+        if (requests.length === 0) return 'No network requests recorded.';
+
+        const completed = requests.filter((r) => r.endTime);
+        const durations = completed.map((r) => r.endTime! - r.startTime).sort((a, b) => a - b);
+        const errors = requests.filter((r) => r.error || (r.status && r.status >= 400));
+
+        // By domain
+        const byDomain: Record<string, number> = {};
+        for (const r of requests) {
+          try {
+            const domain = new URL(r.url).hostname;
+            byDomain[domain] = (byDomain[domain] || 0) + 1;
+          } catch {
+            byDomain['(invalid url)'] = (byDomain['(invalid url)'] || 0) + 1;
+          }
+        }
+
+        // By status code range
+        const byStatus: Record<string, number> = { '2xx': 0, '3xx': 0, '4xx': 0, '5xx': 0, 'error': 0, 'pending': 0 };
+        for (const r of requests) {
+          if (r.error) byStatus['error']++;
+          else if (!r.status) byStatus['pending']++;
+          else if (r.status < 300) byStatus['2xx']++;
+          else if (r.status < 400) byStatus['3xx']++;
+          else if (r.status < 500) byStatus['4xx']++;
+          else byStatus['5xx']++;
+        }
+
+        // Percentiles
+        const p = (pct: number) => durations.length > 0 ? durations[Math.min(Math.floor(durations.length * pct / 100), durations.length - 1)] : 0;
+        const totalBytes = requests.reduce((sum, r) => sum + (r.size || 0), 0);
+
+        // Slowest endpoints
+        const slowest = [...completed]
+          .sort((a, b) => (b.endTime! - b.startTime) - (a.endTime! - a.startTime))
+          .slice(0, 5)
+          .map((r) => ({ method: r.method, url: r.url, duration: `${r.endTime! - r.startTime}ms` }));
+
+        return {
+          total: requests.length,
+          errors: errors.length,
+          totalTransferred: formatBytes(totalBytes),
+          responseTimes: {
+            avg: `${Math.round(durations.reduce((a, b) => a + b, 0) / (durations.length || 1))}ms`,
+            p50: `${p(50)}ms`,
+            p95: `${p(95)}ms`,
+            p99: `${p(99)}ms`,
+          },
+          byDomain,
+          byStatus,
+          slowest,
+        };
+      },
+    });
+
+    // ── Fetch wrapper fallback ────────────────────────────────────────────────
+    // When the CDP Network domain doesn't produce events (some Hermes builds),
+    // inject a fetch wrapper into the app to capture requests as a fallback.
+
+    let fetchWrapperInjected = false;
+    let cdpNetworkActive = false;
+    let fetchWrapperTimer: ReturnType<typeof setTimeout> | null = null;
+
+    ctx.cdp.on('Network.requestWillBeSent', () => {
+      cdpNetworkActive = true;
+    });
+
+    ctx.cdp.on('disconnected', () => {
+      if (fetchWrapperTimer) { clearTimeout(fetchWrapperTimer); fetchWrapperTimer = null; }
+    });
+
+    ctx.cdp.on('reconnected', () => {
+      if (fetchWrapperTimer) { clearTimeout(fetchWrapperTimer); fetchWrapperTimer = null; }
+      fetchWrapperInjected = false;
+      cdpNetworkActive = false;
+      // After a short delay, check if CDP Network is producing events.
+      // If not, inject the fetch wrapper.
+      fetchWrapperTimer = setTimeout(async () => {
+        fetchWrapperTimer = null;
+        if (fetchWrapperInjected || cdpNetworkActive) return;
+        try {
+          await ctx.evalInApp(`(function() {
+            if (globalThis.__METRO_MCP_FETCH_WRAPPED__) return 'already';
+            globalThis.__METRO_MCP_FETCH_WRAPPED__ = true;
+            globalThis.__METRO_MCP_NETWORK__ = [];
+            var origFetch = globalThis.fetch;
+            if (!origFetch) return 'no-fetch';
+            globalThis.fetch = function(input, init) {
+              var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
+              var method = (init && init.method) || 'GET';
+              var entry = { url: url, method: method, startTime: Date.now() };
+              return origFetch.apply(this, arguments).then(function(resp) {
+                entry.status = resp.status;
+                entry.endTime = Date.now();
+                var arr = globalThis.__METRO_MCP_NETWORK__;
+                if (arr.length > 500) arr.splice(0, arr.length - 400);
+                arr.push(entry);
+                return resp;
+              }).catch(function(err) {
+                entry.error = err.message || String(err);
+                entry.endTime = Date.now();
+                var arr = globalThis.__METRO_MCP_NETWORK__;
+                if (arr.length > 500) arr.splice(0, arr.length - 400);
+                arr.push(entry);
+                throw err;
+              });
+            };
+            return 'injected';
+          })()`);
+          fetchWrapperInjected = true;
+          logger.debug('Fetch wrapper fallback injected');
+        } catch {
+          logger.debug('Could not inject fetch wrapper fallback');
+        }
+      }, 3000);
     });
 
     // ── Resource ───────────────────────────────────────────────────────────────
@@ -274,7 +449,8 @@ export const networkPlugin = definePlugin({
       name: 'Network Requests',
       description: 'Recent network requests from the React Native app',
       handler: async () => {
-        const requests = buffer.getLast(20);
+        const all = getRequests();
+        const requests = all.slice(-20);
         return JSON.stringify(
           requests.map((r) => ({
             method: r.method,
