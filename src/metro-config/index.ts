@@ -19,8 +19,8 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'http';
+import { readFileSync } from 'fs';
 
-/** The file metro-mcp writes its proxy port to so the middleware can discover it. */
 const PROXY_PORT_ENV = 'METRO_MCP_PROXY_PORT';
 const PROXY_PORT_FILE = '.metro-mcp-proxy-port';
 
@@ -42,30 +42,37 @@ type MiddlewareFn = (
 ) => void;
 
 /**
- * Discover the proxy port. Checks (in order):
- * 1. METRO_MCP_PROXY_PORT env var (set by the MCP server on startup)
- * 2. .metro-mcp-proxy-port file in cwd (written by the MCP server)
+ * Discover and cache the proxy port. The port is invariant for the lifetime
+ * of the Metro process, so we read it once and cache the result.
  */
+let cachedProxyPort: number | null | undefined;
+
 function discoverProxyPort(): number | null {
-  // Env var — set by the MCP server or the user
+  if (cachedProxyPort !== undefined) return cachedProxyPort;
+
   const envPort = process.env[PROXY_PORT_ENV];
   if (envPort) {
     const port = parseInt(envPort, 10);
-    if (!isNaN(port) && port > 0) return port;
+    if (!isNaN(port) && port > 0) {
+      cachedProxyPort = port;
+      return port;
+    }
   }
 
-  // Port file — written by the MCP server on startup
   try {
-    // Use require('fs') to avoid top-level await issues in CJS metro configs
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('fs');
-    const content = fs.readFileSync(PROXY_PORT_FILE, 'utf8').trim();
+    const content = readFileSync(PROXY_PORT_FILE, 'utf8').trim();
     const port = parseInt(content, 10);
-    if (!isNaN(port) && port > 0) return port;
+    if (!isNaN(port) && port > 0) {
+      cachedProxyPort = port;
+      return port;
+    }
   } catch {
-    // File doesn't exist yet — MCP server may not be running
+    // File doesn't exist yet — MCP server may not be running.
+    // Return null but don't cache so we retry on next request.
+    return null;
   }
 
+  cachedProxyPort = null;
   return null;
 }
 
@@ -120,14 +127,16 @@ function createMcpMiddleware(existingMiddleware: MiddlewareFn): MiddlewareFn {
         const originalEnd = res.end.bind(res);
         const chunks: Buffer[] = [];
 
-        res.write = function (chunk: unknown, ...args: unknown[]): boolean {
+        // Buffer the response so we can rewrite it before sending.
+        // Safe because /json responses are tiny (<10KB).
+        res.write = function (chunk: unknown): boolean {
           if (chunk) {
             chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
           }
           return true;
         } as typeof res.write;
 
-        res.end = function (chunk?: unknown, ...args: unknown[]): ServerResponse {
+        res.end = function (chunk?: unknown): ServerResponse {
           if (chunk) {
             chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
           }
@@ -135,7 +144,6 @@ function createMcpMiddleware(existingMiddleware: MiddlewareFn): MiddlewareFn {
           const body = Buffer.concat(chunks).toString('utf8');
           const rewritten = rewriteTargetList(body, proxyPort);
 
-          // Update content-length and write the rewritten response
           res.setHeader('Content-Length', Buffer.byteLength(rewritten));
           originalWrite(rewritten);
           return originalEnd();
