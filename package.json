@@ -5,7 +5,7 @@
   "homepage": "https://github.com/steve228uk/metro-mcp",
   "repository": {
     "type": "git",
-    "url": "https://github.com/steve228uk/metro-mcp.git"
+    "url": "git+https://github.com/steve228uk/metro-mcp.git"
   },
   "bugs": {
     "url": "https://github.com/steve228uk/metro-mcp/issues"
