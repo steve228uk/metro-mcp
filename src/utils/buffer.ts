@@ -70,9 +70,12 @@ export class DeviceBufferManager<T extends { timestamp: number }> {
     let buffer = this.buffers.get(deviceKey);
     if (!buffer) {
       // Evict oldest device if at capacity
-      if (this.buffers.size >= this.maxDevices) {
-        const oldest = this.insertionOrder.shift();
-        if (oldest) this.buffers.delete(oldest);
+      while (this.buffers.size >= this.maxDevices && this.insertionOrder.length > 0) {
+        const oldest = this.insertionOrder.shift()!;
+        if (this.buffers.has(oldest)) {
+          this.buffers.delete(oldest);
+          break;
+        }
       }
       buffer = new CircularBuffer<T>(this.capacityPerDevice);
       this.buffers.set(deviceKey, buffer);
@@ -89,6 +92,15 @@ export class DeviceBufferManager<T extends { timestamp: number }> {
   /** Get all entries from a specific device. */
   getAllForDevice(deviceKey: string): T[] {
     return this.buffers.get(deviceKey)?.getAll() ?? [];
+  }
+
+  /**
+   * Resolve a device query: "all" aggregates, a specific key queries that device,
+   * or falls back to the active key. Returns entries from the resolved device.
+   */
+  resolve(device: string | undefined, activeKey: string | null): T[] {
+    if (device === 'all') return this.getAll();
+    return this.getAllForDevice(device || activeKey || '');
   }
 
   /** Aggregate entries across all devices, sorted by timestamp. */
