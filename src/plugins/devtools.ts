@@ -28,11 +28,14 @@ export const devtoolsPlugin = definePlugin({
 
         if (open) {
           try {
-            // Try macOS first
-            await ctx.exec(`open "${proxyUrl}"`);
+            // Launch Chrome with the DevTools URL using open -a on macOS.
+            // The chrome-devtools:// scheme requires Chrome to handle it directly.
+            await ctx.exec(
+              `/usr/bin/open -a "Google Chrome" "${proxyUrl}"`
+            );
             return { opened: true, url: proxyUrl, port: proxyPort };
           } catch {
-            // Not macOS or Chrome not available — just return the URL
+            // Not macOS or Chrome not installed — fall through to manual instructions
           }
         }
 

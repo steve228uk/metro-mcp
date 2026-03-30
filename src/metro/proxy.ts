@@ -129,11 +129,11 @@ export class CDPProxy {
   }
 
   /**
-   * Get the Chrome DevTools URL for this proxy.
+   * Get the Chrome DevTools frontend URL for this proxy.
    */
   getDevToolsUrl(): string | null {
     if (!this._port) return null;
-    return `devtools://devtools/bundled/js_app.html?experiments=true&v8only=true&ws=localhost:${this._port}`;
+    return `chrome-devtools://devtools/bundled/js_app.html?experiments=true&v8only=true&ws=127.0.0.1:${this._port}`;
   }
 
   // ── HTTP handler (serves /json for Chrome auto-discovery) ─────────────────
