@@ -49,6 +49,27 @@ export const consolePlugin = definePlugin({
       });
     });
 
+    // Mark when Metro starts rebuilding — a reload is imminent.
+    ctx.events.on('bundle_transform_progressed', (event) => {
+      if (event.transformedFileCount === 1) {
+        buffer.push({
+          timestamp: Date.now(),
+          level: 'info',
+          message: '── Metro rebuilding ── (file change detected)',
+        });
+      }
+    });
+
+    // Insert a visible boundary marker when the CDP connection is re-established,
+    // so it's clear where a gap in logs may have occurred.
+    ctx.cdp.on('reconnected', () => {
+      buffer.push({
+        timestamp: Date.now(),
+        level: 'info',
+        message: '── CDP reconnected ── (logs during the disconnection gap may be missing)',
+      });
+    });
+
     ctx.registerTool('get_console_logs', {
       description: 'Get recent console output from the React Native app. Filter by log level and search text.',
       parameters: z.object({

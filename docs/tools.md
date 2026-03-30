@@ -11,8 +11,9 @@
 
 - **`get_network_requests`** — Get buffered HTTP requests with method, URL, status, timing.
 - **`get_request_details`** — Get full headers for a specific request by URL.
-- **`get_response_body`** — Fetch the response body for a specific request on demand (not included in list output to avoid noise).
+- **`get_response_body`** — Get the response body for a specific request. Bodies under 1 MB are eagerly cached and survive reconnections; larger bodies are fetched on demand from the current CDP session.
 - **`search_network`** — Filter by URL pattern, method, status code, or errors only.
+- **`clear_network_requests`** — Clear the network request buffer.
 
 ## Errors
 

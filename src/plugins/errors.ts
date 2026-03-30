@@ -28,6 +28,17 @@ const BUNDLE_ERROR_PATTERNS = [
   /Unexpected token/,
 ];
 
+function parseErrorLocation(message: string): { file?: string; lineNumber?: number; column?: number } {
+  const fileMatch = message.match(/(?:in |from )([^\s:]+(?:\.tsx?|\.jsx?|\.json))/);
+  const lineMatch = message.match(/(?:line |:)(\d+)/);
+  const colMatch = message.match(/:(\d+):(\d+)/);
+  return {
+    file: fileMatch?.[1],
+    lineNumber: lineMatch ? parseInt(lineMatch[1]) : undefined,
+    column: colMatch ? parseInt(colMatch[2]) : undefined,
+  };
+}
+
 export const errorsPlugin = definePlugin({
   name: 'errors',
 
@@ -37,27 +48,34 @@ export const errorsPlugin = definePlugin({
     const buffer = new CircularBuffer<ErrorEntry>(100);
     const bundleErrors = new CircularBuffer<BundleError>(100);
 
+    // CDP console errors are a fallback — the Metro /events path below
+    // is more reliable but may not be connected yet during startup.
     ctx.cdp.on('Runtime.consoleAPICalled', (params) => {
       if (params.type === 'error') {
         const args = (params.args as Array<Record<string, unknown>>) || [];
         const message = args.map((a) => a.value || a.description || '').join(' ');
         for (const pattern of BUNDLE_ERROR_PATTERNS) {
           if (pattern.test(message)) {
-            const fileMatch = message.match(/(?:in |from )([^\s:]+(?:\.tsx?|\.jsx?|\.json))/);
-            const lineMatch = message.match(/(?:line |:)(\d+)/);
-            const colMatch = message.match(/:(\d+):(\d+)/);
             bundleErrors.push({
               timestamp: Date.now(),
               type: pattern.source.replace(/[\\^$]/g, ''),
               message,
-              file: fileMatch?.[1],
-              lineNumber: lineMatch ? parseInt(lineMatch[1]) : undefined,
-              column: colMatch ? parseInt(colMatch[2]) : undefined,
+              ...parseErrorLocation(message),
             });
             break;
           }
         }
       }
+    });
+
+    ctx.events.on('bundling_error', (event) => {
+      const message = (event.message as string) || 'Unknown bundling error';
+      bundleErrors.push({
+        timestamp: Date.now(),
+        type: 'BundlingError',
+        message,
+        ...parseErrorLocation(message),
+      });
     });
 
     ctx.cdp.on('Runtime.exceptionThrown', async (params) => {

@@ -2,6 +2,18 @@ import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { CircularBuffer } from '../utils/buffer.js';
 import { formatTimestamp, formatBytes } from '../utils/format.js';
+import { createLogger } from '../utils/logger.js';
+
+const logger = createLogger('network');
+
+/** Maximum *decoded* body size (bytes) to keep cached. */
+const MAX_BODY_CACHE_SIZE = 1024 * 1024; // 1 MB
+/** Maximum concurrent getResponseBody CDP calls to avoid flooding the pipeline. */
+const MAX_CONCURRENT_BODY_FETCHES = 4;
+
+function decodeResponseBody(raw: { body: string; base64Encoded: boolean }): string {
+  return raw.base64Encoded ? Buffer.from(raw.body, 'base64').toString('utf8') : raw.body;
+}
 
 interface NetworkRequest {
   id: string;
@@ -17,6 +29,8 @@ interface NetworkRequest {
   endTime?: number;
   error?: string;
   size?: number;
+  /** Connection session this request belongs to. Incremented on each reconnect. */
+  session: number;
 }
 
 export const networkPlugin = definePlugin({
@@ -28,6 +42,31 @@ export const networkPlugin = definePlugin({
     const buffer = new CircularBuffer<NetworkRequest>(200);
     const pendingRequests = new Map<string, NetworkRequest>();
 
+    /** Monotonically increasing session counter – bumped on every reconnect so we
+     *  can tell which requests belong to the current CDP session vs a stale one. */
+    let currentSession = 0;
+
+    /** Simple concurrency limiter for eager body fetches to avoid flooding CDP. */
+    let activeFetches = 0;
+
+    function fetchAndCacheBody(req: NetworkRequest): void {
+      if (activeFetches >= MAX_CONCURRENT_BODY_FETCHES) return;
+      activeFetches++;
+      ctx.cdp.send('Network.getResponseBody', { requestId: req.id })
+        .then((result) => {
+          const body = decodeResponseBody(result as { body: string; base64Encoded: boolean });
+          if (body.length <= MAX_BODY_CACHE_SIZE) {
+            req.responseBody = body;
+          }
+        })
+        .catch((err) => {
+          logger.debug(`Could not cache body for ${req.method} ${req.url}: ${err}`);
+        })
+        .finally(() => {
+          activeFetches--;
+        });
+    }
+
     // ── CDP Network domain ─────────────────────────────────────────────────────
 
     ctx.cdp.on('Network.requestWillBeSent', (params) => {
@@ -37,6 +76,7 @@ export const networkPlugin = definePlugin({
         method: (params.request as Record<string, unknown>)?.method as string || 'GET',
         requestHeaders: (params.request as Record<string, unknown>)?.headers as Record<string, string>,
         startTime: Date.now(),
+        session: currentSession,
       };
       pendingRequests.set(request.id, request);
     });
@@ -58,6 +98,7 @@ export const networkPlugin = definePlugin({
         req.size = params.encodedDataLength as number;
         pendingRequests.delete(req.id);
         buffer.push(req);
+        fetchAndCacheBody(req);
       }
     });
 
@@ -79,6 +120,10 @@ export const networkPlugin = definePlugin({
         buffer.push(req);
       }
       pendingRequests.clear();
+    });
+
+    ctx.cdp.on('reconnected', () => {
+      currentSession++;
     });
 
     // ── Request tracking tools ─────────────────────────────────────────────────
@@ -143,7 +188,8 @@ export const networkPlugin = definePlugin({
     ctx.registerTool('get_response_body', {
       description:
         'Get the response body for a specific network request. ' +
-        'Bodies are fetched on demand via CDP and are not included in get_network_requests or search_network output.',
+        'Bodies are eagerly cached when small enough, so they survive reconnections. ' +
+        'Larger bodies are fetched on demand and only available in the current CDP session.',
       parameters: z.object({
         url: z.string().describe('URL or partial URL to find the request'),
         index: z.number().default(-1).describe('Index of the request if multiple match (-1 for last)'),
@@ -154,12 +200,25 @@ export const networkPlugin = definePlugin({
         const req = index === -1 ? matches[matches.length - 1] : matches[index];
         if (!req) return `Request index ${index} out of range (${matches.length} matches)`;
 
+        // Use cached body if available (survives reconnections)
+        if (req.responseBody !== undefined) {
+          try {
+            return { url: req.url, status: req.status, body: JSON.parse(req.responseBody) };
+          } catch {
+            return { url: req.url, status: req.status, body: req.responseBody };
+          }
+        }
+
+        // Request is from a previous session and body wasn't cached — no way to fetch it
+        if (req.session !== currentSession) {
+          return `Response body unavailable for "${req.url}": this request was captured in a previous CDP session (session ${req.session}, current ${currentSession}). The debugger cache was lost on reconnect and the body was not cached (${req.size ? formatBytes(req.size) : 'unknown size'}, limit ${formatBytes(MAX_BODY_CACHE_SIZE)}).`;
+        }
+
+        // Try live fetch from current session
         try {
           const result = await ctx.cdp.send('Network.getResponseBody', { requestId: req.id }) as { body: string; base64Encoded: boolean };
-          const body = result.base64Encoded
-            ? Buffer.from(result.body, 'base64').toString('utf8')
-            : result.body;
-          // Try to pretty-print JSON bodies
+          const body = decodeResponseBody(result);
+          req.responseBody = body;
           try {
             return { url: req.url, status: req.status, body: JSON.parse(body) };
           } catch {
@@ -195,6 +254,17 @@ export const networkPlugin = definePlugin({
           error: r.error,
           duration: r.endTime ? `${r.endTime - r.startTime}ms` : 'pending',
         }));
+      },
+    });
+
+    ctx.registerTool('clear_network_requests', {
+      description: 'Clear the network request buffer. Useful after a reload or when old requests are no longer relevant.',
+      parameters: z.object({}),
+      handler: async () => {
+        const count = buffer.size;
+        buffer.clear();
+        pendingRequests.clear();
+        return `Cleared ${count} network requests.`;
       },
     });
 
