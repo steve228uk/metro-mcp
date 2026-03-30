@@ -1,5 +1,9 @@
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+
+const execAsync = promisify(exec);
 import { z } from 'zod';
 import type {
   MetroMCPConfig,
@@ -241,16 +245,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
         },
       },
       exec: async (command: string) => {
-        const proc = Bun.spawn(['sh', '-c', command], {
-          stdout: 'pipe',
-          stderr: 'pipe',
-        });
-        const stdout = await new Response(proc.stdout).text();
-        const stderr = await new Response(proc.stderr).text();
-        await proc.exited;
-        if (proc.exitCode !== 0) {
-          throw new Error(stderr || `Command failed with exit code ${proc.exitCode}`);
-        }
+        const { stdout } = await execAsync(command);
         return stdout;
       },
       format: formatUtils,

@@ -1,3 +1,4 @@
+import { readFile } from 'fs/promises';
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { FIBER_ROOT_JS, GET_ROUTE_FUNC_JS, SWIPE_COORDS } from '../utils/fiber.js';
@@ -187,7 +188,7 @@ export const uiInteractPlugin = definePlugin({
             await ctx.exec(
               `adb shell uiautomator dump /sdcard/uidump.xml && adb pull /sdcard/uidump.xml ${tmpFile} 2>/dev/null`
             );
-            content = await Bun.file(tmpFile).text();
+            content = await readFile(tmpFile, 'utf8');
           } finally {
             await ctx.exec(`rm -f ${tmpFile}`).catch(() => {});
           }

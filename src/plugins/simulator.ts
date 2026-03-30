@@ -1,3 +1,5 @@
+import { readFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 
@@ -37,10 +39,9 @@ export const simulatorPlugin = definePlugin({
         }
 
         // Read file and return as base64
-        const file = Bun.file(tmpFile);
-        if (await file.exists()) {
-          const buffer = await file.arrayBuffer();
-          const base64 = Buffer.from(buffer).toString('base64');
+        if (existsSync(tmpFile)) {
+          const buffer = await readFile(tmpFile);
+          const base64 = buffer.toString('base64');
           await ctx.exec(`rm -f "${tmpFile}"`);
           return {
             type: 'image',

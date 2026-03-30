@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 import { loadConfig } from './config.js';
 import { startServer } from './server.js';
 import { createLogger } from './utils/logger.js';
