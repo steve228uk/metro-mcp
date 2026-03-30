@@ -87,9 +87,7 @@ export const consolePlugin = definePlugin({
         device: z.string().optional().describe('Device key or "all" for aggregated logs. Defaults to current device.'),
       }),
       handler: async ({ level, search, limit, summary, compact: isCompact, device }) => {
-        let logs = device === 'all'
-          ? buffers.getAll()
-          : buffers.getAllForDevice(device || ctx.getActiveDeviceKey() || '');
+        let logs = buffers.resolve(device, ctx.getActiveDeviceKey());
         if (level) logs = logs.filter((l) => l.level === level);
         if (search) logs = logs.filter((l) => l.message.toLowerCase().includes(search.toLowerCase()));
 
@@ -132,9 +130,7 @@ export const consolePlugin = definePlugin({
       name: 'Console Logs',
       description: 'Recent console output from the React Native app',
       handler: async () => {
-        const key = ctx.getActiveDeviceKey();
-        const all = key ? buffers.getAllForDevice(key) : buffers.getAll();
-        const logs = all.slice(-20);
+        const logs = buffers.resolve(undefined, ctx.getActiveDeviceKey()).slice(-20);
         return JSON.stringify(
           logs.map((l) => ({
             time: formatTimestamp(l.timestamp),

@@ -135,9 +135,7 @@ export const networkPlugin = definePlugin({
     // ── Request tracking tools ─────────────────────────────────────────────────
 
     function getRequests(device?: string): NetworkRequest[] {
-      if (device === 'all') return buffers.getAll();
-      const key = device || ctx.getActiveDeviceKey() || '';
-      return buffers.getAllForDevice(key);
+      return buffers.resolve(device, ctx.getActiveDeviceKey());
     }
 
     ctx.registerTool('get_network_requests', {
