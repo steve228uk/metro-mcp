@@ -84,7 +84,7 @@ export const inspectPointPlugin = definePlugin({
 
             // Recurse into children
             if (fiber.child) walkFiber(fiber.child, depth + 1);
-            if (fiber.sibling) walkFiber(fiber.sibling, depth + 1);
+            if (fiber.sibling) walkFiber(fiber.sibling, depth);
           }
 
           walkFiber(root.current, 0);

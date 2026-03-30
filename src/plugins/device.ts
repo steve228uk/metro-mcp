@@ -100,7 +100,7 @@ export const devicePlugin = definePlugin({
 
         // Fallback: evaluate DevSettings.reload() in the app
         try {
-          await ctx.evalInApp(
+          const result = await ctx.evalInApp(
             `(function() {
               try {
                 var DevSettings = require('react-native/Libraries/Utilities/DevSettings');
@@ -113,6 +113,9 @@ export const devicePlugin = definePlugin({
               return 'no reload method found';
             })()`
           );
+          if (result === 'no reload method found') {
+            return 'Could not find a reload method. The app may not support programmatic reload.';
+          }
           return 'App reload triggered.';
         } catch (err) {
           return `Could not reload app: ${err instanceof Error ? err.message : String(err)}`;

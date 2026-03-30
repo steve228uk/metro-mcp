@@ -355,13 +355,19 @@ export const networkPlugin = definePlugin({
     // inject a fetch wrapper into the app to capture requests as a fallback.
 
     let fetchWrapperInjected = false;
+    let cdpNetworkActive = false;
+
+    ctx.cdp.on('Network.requestWillBeSent', () => {
+      cdpNetworkActive = true;
+    });
 
     ctx.cdp.on('reconnected', () => {
       fetchWrapperInjected = false;
+      cdpNetworkActive = false;
       // After a short delay, check if CDP Network is producing events.
       // If not, inject the fetch wrapper.
       setTimeout(async () => {
-        if (fetchWrapperInjected) return;
+        if (fetchWrapperInjected || cdpNetworkActive) return;
         try {
           await ctx.evalInApp(`(function() {
             if (globalThis.__METRO_MCP_FETCH_WRAPPED__) return 'already';
