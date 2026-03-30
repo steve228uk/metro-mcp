@@ -43,6 +43,8 @@ import { profilerPlugin } from './plugins/profiler.js';
 import { promptsPlugin } from './plugins/prompts.js';
 import { automationPlugin } from './plugins/automation.js';
 import { statuslinePlugin } from './plugins/statusline.js';
+import { debugGlobalsPlugin } from './plugins/debug-globals.js';
+import { inspectPointPlugin } from './plugins/inspect-point.js';
 
 const logger = createLogger('server');
 
@@ -67,6 +69,8 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   promptsPlugin,
   automationPlugin,
   statuslinePlugin,
+  debugGlobalsPlugin,
+  inspectPointPlugin,
 ];
 
 export async function startServer(config: Required<MetroMCPConfig>): Promise<void> {

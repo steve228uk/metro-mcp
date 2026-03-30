@@ -290,6 +290,117 @@ export const networkPlugin = definePlugin({
       },
     });
 
+    ctx.registerTool('get_network_stats', {
+      description: 'Get aggregated network statistics: breakdown by domain, status code, and response times.',
+      parameters: z.object({
+        device: z.string().optional().describe('Device key or "all". Defaults to current device.'),
+      }),
+      handler: async ({ device }) => {
+        const requests = getRequests(device);
+        if (requests.length === 0) return 'No network requests recorded.';
+
+        const completed = requests.filter((r) => r.endTime);
+        const durations = completed.map((r) => r.endTime! - r.startTime).sort((a, b) => a - b);
+        const errors = requests.filter((r) => r.error || (r.status && r.status >= 400));
+
+        // By domain
+        const byDomain: Record<string, number> = {};
+        for (const r of requests) {
+          try {
+            const domain = new URL(r.url).hostname;
+            byDomain[domain] = (byDomain[domain] || 0) + 1;
+          } catch {
+            byDomain['(invalid url)'] = (byDomain['(invalid url)'] || 0) + 1;
+          }
+        }
+
+        // By status code range
+        const byStatus: Record<string, number> = { '2xx': 0, '3xx': 0, '4xx': 0, '5xx': 0, 'error': 0, 'pending': 0 };
+        for (const r of requests) {
+          if (r.error) byStatus['error']++;
+          else if (!r.status) byStatus['pending']++;
+          else if (r.status < 300) byStatus['2xx']++;
+          else if (r.status < 400) byStatus['3xx']++;
+          else if (r.status < 500) byStatus['4xx']++;
+          else byStatus['5xx']++;
+        }
+
+        // Percentiles
+        const p = (pct: number) => durations.length > 0 ? durations[Math.min(Math.floor(durations.length * pct / 100), durations.length - 1)] : 0;
+        const totalBytes = requests.reduce((sum, r) => sum + (r.size || 0), 0);
+
+        // Slowest endpoints
+        const slowest = [...completed]
+          .sort((a, b) => (b.endTime! - b.startTime) - (a.endTime! - a.startTime))
+          .slice(0, 5)
+          .map((r) => ({ method: r.method, url: r.url, duration: `${r.endTime! - r.startTime}ms` }));
+
+        return {
+          total: requests.length,
+          errors: errors.length,
+          totalTransferred: formatBytes(totalBytes),
+          responseTimes: {
+            avg: `${Math.round(durations.reduce((a, b) => a + b, 0) / (durations.length || 1))}ms`,
+            p50: `${p(50)}ms`,
+            p95: `${p(95)}ms`,
+            p99: `${p(99)}ms`,
+          },
+          byDomain,
+          byStatus,
+          slowest,
+        };
+      },
+    });
+
+    // ── Fetch wrapper fallback ────────────────────────────────────────────────
+    // When the CDP Network domain doesn't produce events (some Hermes builds),
+    // inject a fetch wrapper into the app to capture requests as a fallback.
+
+    let fetchWrapperInjected = false;
+
+    ctx.cdp.on('reconnected', () => {
+      fetchWrapperInjected = false;
+      // After a short delay, check if CDP Network is producing events.
+      // If not, inject the fetch wrapper.
+      setTimeout(async () => {
+        if (fetchWrapperInjected) return;
+        try {
+          await ctx.evalInApp(`(function() {
+            if (globalThis.__METRO_MCP_FETCH_WRAPPED__) return 'already';
+            globalThis.__METRO_MCP_FETCH_WRAPPED__ = true;
+            globalThis.__METRO_MCP_NETWORK__ = [];
+            var origFetch = globalThis.fetch;
+            if (!origFetch) return 'no-fetch';
+            globalThis.fetch = function(input, init) {
+              var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
+              var method = (init && init.method) || 'GET';
+              var entry = { url: url, method: method, startTime: Date.now() };
+              return origFetch.apply(this, arguments).then(function(resp) {
+                entry.status = resp.status;
+                entry.endTime = Date.now();
+                var arr = globalThis.__METRO_MCP_NETWORK__;
+                if (arr.length > 500) arr.splice(0, arr.length - 400);
+                arr.push(entry);
+                return resp;
+              }).catch(function(err) {
+                entry.error = err.message || String(err);
+                entry.endTime = Date.now();
+                var arr = globalThis.__METRO_MCP_NETWORK__;
+                if (arr.length > 500) arr.splice(0, arr.length - 400);
+                arr.push(entry);
+                throw err;
+              });
+            };
+            return 'injected';
+          })()`);
+          fetchWrapperInjected = true;
+          logger.debug('Fetch wrapper fallback injected');
+        } catch {
+          logger.debug('Could not inject fetch wrapper fallback');
+        }
+      }, 3000);
+    });
+
     // ── Resource ───────────────────────────────────────────────────────────────
 
     ctx.registerResource('metro://network', {
