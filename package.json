@@ -30,6 +30,11 @@
       "types": "./dist/plugin.d.ts",
       "require": "./dist/plugin.cjs",
       "import": "./dist/plugin.js"
+    },
+    "./metro": {
+      "types": "./dist/metro-config/index.d.ts",
+      "require": "./dist/metro-config/index.cjs",
+      "import": "./dist/metro-config/index.js"
     }
   },
   "files": [
@@ -40,7 +45,7 @@
     "dev": "bun run --watch src/index.ts",
     "clean": "rm -rf dist",
     "build": "bun run clean && bun run build:js && bun run build:bin && bun run build:types",
-    "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external zod --external ws && bun build src/client/index.ts --outfile dist/client/index.js --target browser --external @modelcontextprotocol/sdk --external zod && bun build src/client/index.ts --outfile dist/client/index.cjs --target browser --format cjs --external @modelcontextprotocol/sdk --external zod && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/sdk --external zod",
+    "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external zod --external ws && bun build src/client/index.ts --outfile dist/client/index.js --target browser --external @modelcontextprotocol/sdk --external zod && bun build src/client/index.ts --outfile dist/client/index.cjs --target browser --format cjs --external @modelcontextprotocol/sdk --external zod && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/sdk --external zod && bun build src/metro-config/index.ts --outfile dist/metro-config/index.js --target node && bun build src/metro-config/index.ts --outfile dist/metro-config/index.cjs --target node --format cjs",
     "build:bin": "bun build bin/metro-mcp.ts --outfile dist/bin/metro-mcp.js --target node --external @modelcontextprotocol/sdk --external zod --external ws && chmod +x dist/bin/metro-mcp.js",
     "build:types": "bunx tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit"

@@ -49,6 +49,45 @@ export default defineConfig({
 });
 ```
 
+## Metro Middleware (Optional)
+
+Add the `withMetroMcp` wrapper to your Metro config to make pressing **"j"** and **"Open Debugger"** work alongside the MCP. Without it, those actions steal the CDP connection and disconnect the MCP. With it, they route through the MCP's proxy automatically.
+
+```js
+// metro.config.js
+const { getDefaultConfig } = require('expo/metro-config');
+const { withMetroMcp } = require('metro-mcp/metro');
+
+module.exports = withMetroMcp(getDefaultConfig(__dirname));
+```
+
+Or for bare React Native:
+
+```js
+// metro.config.js
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
+const { withMetroMcp } = require('metro-mcp/metro');
+
+module.exports = withMetroMcp(mergeConfig(getDefaultConfig(__dirname), {}));
+```
+
+### How it works
+
+The middleware intercepts Metro's `/json` and `/json/list` responses — the standard CDP target discovery endpoints — and rewrites `webSocketDebuggerUrl` to point at the MCP's CDP proxy. Any tool that uses standard CDP discovery (Metro's "j" handler, the dev menu, Flipper, custom scripts) will connect through the proxy instead of directly to Hermes.
+
+The middleware discovers the proxy port via the `METRO_MCP_PROXY_PORT` environment variable or a `.metro-mcp-proxy-port` file that the MCP server writes on startup. If the MCP server isn't running, the middleware is a no-op — all requests pass through unchanged.
+
+### What if I don't add the middleware?
+
+Everything still works. The only difference is:
+
+| Action | Without middleware | With middleware |
+|--------|-------------------|----------------|
+| MCP tools | Work normally | Work normally |
+| `open_devtools` MCP tool | Opens DevTools via proxy | Opens DevTools via proxy |
+| Press "j" in Metro | Disconnects MCP | Works alongside MCP |
+| "Open Debugger" in dev menu | Disconnects MCP | Works alongside MCP |
+
 ## Profiler Options
 
 | Option | Default | Description |

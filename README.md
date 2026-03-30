@@ -15,6 +15,7 @@ Works with **Expo**, **bare React Native**, and any project using **Metro + Herm
 - [Requirements](#requirements)
 - [How It Works](#how-it-works)
 - [Features](#features)
+- [Chrome DevTools](#chrome-devtools)
 - [Claude Code Status Bar](#claude-code-status-bar)
 - [Test Recording](#test-recording)
 - [App Integration](#app-integration-optional)
@@ -115,6 +116,33 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 | **statusline** | 1 | Claude Code status bar integration |
 
 → See the [full tools reference](docs/tools.md).
+
+---
+
+## Chrome DevTools
+
+Hermes (the React Native JavaScript engine) only allows a **single CDP debugger connection** at a time. Since metro-mcp uses that connection, pressing **"j" in Metro** or tapping **"Open Debugger"** in the dev menu will steal the connection and disconnect the MCP.
+
+metro-mcp solves this with a built-in **CDP proxy** that multiplexes the single Hermes connection, allowing Chrome DevTools and the MCP to work simultaneously.
+
+### Opening DevTools
+
+Use the `open_devtools` MCP tool instead of the usual methods. It opens the same React Native DevTools frontend (rn_fusebox) that Metro uses, but routes the WebSocket connection through the proxy so both can coexist.
+
+### Making "j" and "Open Debugger" work
+
+Add the optional Metro middleware to make **all** debugger entry points work alongside the MCP:
+
+```js
+// metro.config.js
+const { withMetroMcp } = require('metro-mcp/metro');
+
+module.exports = withMetroMcp(getDefaultConfig(__dirname));
+```
+
+This rewrites CDP target discovery so that pressing "j", tapping "Open Debugger", or any other tool using standard CDP discovery will connect through the proxy. See the [configuration docs](docs/configuration.md#metro-middleware-optional) for details.
+
+Without the middleware, use `open_devtools` from your MCP client instead.
 
 ---
 
