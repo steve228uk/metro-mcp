@@ -25,6 +25,8 @@ interface NetworkRequest {
   responseHeaders?: Record<string, string>;
   requestBody?: string;
   responseBody?: string;
+  /** Alias for startTime — required by DeviceBufferManager constraint. */
+  timestamp: number;
   startTime: number;
   endTime?: number;
   error?: string;
@@ -81,6 +83,7 @@ export const networkPlugin = definePlugin({
         method: (params.request as Record<string, unknown>)?.method as string || 'GET',
         requestHeaders: (params.request as Record<string, unknown>)?.headers as Record<string, string>,
         startTime: Date.now(),
+        get timestamp() { return this.startTime; },
         session: currentSession,
       };
       pendingRequests.set(request.id, request);
