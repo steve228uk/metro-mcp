@@ -57,7 +57,7 @@ export default defineConfig({
 
 ## CDP Proxy Options
 
-The CDP proxy allows Chrome DevTools to connect alongside the MCP, working around Hermes's single-connection limitation. See the [Chrome DevTools](../README.md#chrome-devtools) section in the README for details.
+The CDP proxy allows Chrome DevTools to connect alongside the MCP, working around Hermes's single-connection limitation. See the [Chrome DevTools](/guide/getting-started#chrome-devtools) section for details.
 
 | Option | Default | Description |
 |--------|---------|-------------|
