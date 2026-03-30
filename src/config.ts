@@ -18,6 +18,10 @@ const DEFAULT_CONFIG: Required<MetroMCPConfig> = {
   profiler: {
     newArchitecture: true,
   },
+  proxy: {
+    enabled: true,
+    port: 0,
+  },
 };
 
 /**
@@ -36,6 +40,14 @@ export async function loadConfig(args: string[]): Promise<Required<MetroMCPConfi
       config.metro.port = port;
       config.metro.autoDiscover = false;
     }
+  }
+
+  if (process.env.METRO_MCP_PROXY_PORT) {
+    const port = parseInt(process.env.METRO_MCP_PROXY_PORT, 10);
+    if (!isNaN(port)) config.proxy.port = port;
+  }
+  if (process.env.METRO_MCP_PROXY_ENABLED === 'false') {
+    config.proxy.enabled = false;
   }
 
   // CLI args
@@ -87,5 +99,9 @@ function mergeConfig(target: Required<MetroMCPConfig>, source: MetroMCPConfig): 
   }
   if (source.profiler) {
     if (source.profiler.newArchitecture !== undefined) target.profiler.newArchitecture = source.profiler.newArchitecture;
+  }
+  if (source.proxy) {
+    if (source.proxy.enabled !== undefined) target.proxy.enabled = source.proxy.enabled;
+    if (source.proxy.port !== undefined) target.proxy.port = source.proxy.port;
   }
 }

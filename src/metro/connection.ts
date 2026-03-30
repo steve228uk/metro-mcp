@@ -34,6 +34,15 @@ export class CDPClient implements CDPConnection {
   private target: MetroTarget | null = null;
   private lastPingAt = 0;
 
+  /**
+   * Optional interceptor for parsed incoming CDP messages.
+   * If set and returns true, the message is consumed by the interceptor
+   * and won't be processed by CDPClient's own handleMessage logic.
+   * Used by CDPProxy to route responses to external clients.
+   * Receives both the parsed message and the raw string to avoid double parsing.
+   */
+  messageInterceptor: ((parsed: CDPResponse, raw: string) => boolean) | null = null;
+
   private readonly requestTimeout = 10000;
   private readonly keepAliveInterval = 10000;
 
@@ -203,6 +212,17 @@ export class CDPClient implements CDPConnection {
     }
   }
 
+  /**
+   * Send a raw string message to the upstream Hermes WebSocket.
+   * Used by CDPProxy to forward requests from external clients.
+   */
+  sendRaw(data: string): void {
+    if (!this.ws || !this._isConnected) {
+      throw new Error('Not connected to CDP target');
+    }
+    this.ws.send(data);
+  }
+
   private handleMessage(data: string): void {
     let message: CDPResponse;
     try {
@@ -211,6 +231,9 @@ export class CDPClient implements CDPConnection {
       logger.warn('Failed to parse CDP message');
       return;
     }
+
+    // Let the interceptor handle the message first (used by CDPProxy)
+    if (this.messageInterceptor?.(message, data)) return;
 
     // Response to a request
     if (message.id !== undefined) {

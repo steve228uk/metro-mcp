@@ -43,6 +43,10 @@ import { profilerPlugin } from './plugins/profiler.js';
 import { promptsPlugin } from './plugins/prompts.js';
 import { automationPlugin } from './plugins/automation.js';
 import { statuslinePlugin } from './plugins/statusline.js';
+import { debugGlobalsPlugin } from './plugins/debug-globals.js';
+import { inspectPointPlugin } from './plugins/inspect-point.js';
+import { devtoolsPlugin } from './plugins/devtools.js';
+import { CDPProxy } from './metro/proxy.js';
 
 const logger = createLogger('server');
 
@@ -67,6 +71,9 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   promptsPlugin,
   automationPlugin,
   statuslinePlugin,
+  debugGlobalsPlugin,
+  inspectPointPlugin,
+  devtoolsPlugin,
 ];
 
 export async function startServer(config: Required<MetroMCPConfig>): Promise<void> {
@@ -357,10 +364,36 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     }, delay);
   }
 
+  // Start CDP proxy for Chrome DevTools coexistence
+  let cdpProxy: CDPProxy | null = null;
+  if (config.proxy?.enabled !== false) {
+    cdpProxy = new CDPProxy(cdpClient);
+    try {
+      const proxyPort = await cdpProxy.start(config.proxy?.port ?? 0);
+      const devtoolsUrl = cdpProxy.getDevToolsUrl();
+      logger.info(`CDP proxy started on port ${proxyPort}`);
+      if (devtoolsUrl) {
+        logger.info(`Chrome DevTools URL: ${devtoolsUrl}`);
+      }
+      // Make proxy info available to plugins via config
+      (config as Record<string, unknown>).proxy = {
+        ...config.proxy,
+        port: proxyPort,
+        url: devtoolsUrl,
+      };
+    } catch (err) {
+      logger.warn('Could not start CDP proxy:', err);
+    }
+  }
+
   // Start MCP transport
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
   logger.info('MCP server started');
+
+  // Clean up on shutdown
+  process.on('SIGINT', () => { cdpProxy?.stop(); process.exit(0); });
+  process.on('SIGTERM', () => { cdpProxy?.stop(); process.exit(0); });
 
   // Try connecting to Metro (non-blocking — server works without connection)
   void connectToMetro();

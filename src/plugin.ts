@@ -147,6 +147,12 @@ export interface MetroMCPConfig {
      */
     newArchitecture?: boolean;
   };
+  proxy?: {
+    /** Enable the CDP proxy so Chrome DevTools can connect alongside the MCP. Defaults to true. */
+    enabled?: boolean;
+    /** Port for the proxy server. Use 0 for OS-assigned. Defaults to 0. */
+    port?: number;
+  };
 }
 
 export function defineConfig(config: MetroMCPConfig): MetroMCPConfig {

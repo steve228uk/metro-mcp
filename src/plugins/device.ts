@@ -86,6 +86,43 @@ export const devicePlugin = definePlugin({
       },
     });
 
+    ctx.registerTool('reload_app', {
+      description: 'Reload the React Native app. Tries the Metro HTTP endpoint first, falls back to CDP evaluation.',
+      parameters: z.object({}),
+      handler: async () => {
+        // Try Metro HTTP reload endpoint first (most reliable)
+        try {
+          const response = await ctx.metro.fetch('/reload');
+          if (response.ok) return 'App reloaded via Metro.';
+        } catch {
+          // Metro endpoint not available, try CDP fallback
+        }
+
+        // Fallback: evaluate DevSettings.reload() in the app
+        try {
+          const result = await ctx.evalInApp(
+            `(function() {
+              try {
+                var DevSettings = require('react-native/Libraries/Utilities/DevSettings');
+                if (DevSettings && DevSettings.reload) { DevSettings.reload(); return 'ok'; }
+              } catch(e) {}
+              try {
+                var NativeModules = require('react-native').NativeModules;
+                if (NativeModules.DevSettings) { NativeModules.DevSettings.reload(); return 'ok'; }
+              } catch(e) {}
+              return 'no reload method found';
+            })()`
+          );
+          if (result === 'no reload method found') {
+            return 'Could not find a reload method. The app may not support programmatic reload.';
+          }
+          return 'App reload triggered.';
+        } catch (err) {
+          return `Could not reload app: ${err instanceof Error ? err.message : String(err)}`;
+        }
+      },
+    });
+
     ctx.registerResource('metro://status', {
       name: 'Connection Status',
       description: 'Current connection status to Metro bundler',
