@@ -1,10 +1,12 @@
 ---
 layout: home
+title: metro-mcp — The MCP server for React Native & Expo
+titleTemplate: ':title'
 
 hero:
   name: metro-mcp
-  text: Debug React Native with AI
-  tagline: Connect Claude, Cursor, or any MCP client to your running app. Inspect components, track network requests, record tests, and more — no app code changes needed.
+  text: The MCP server for React Native & Expo
+  tagline: Connect Claude, Cursor, or any AI agent to your running app. Inspect components, track network requests, record tests, and more — no app code changes needed.
   actions:
     - theme: brand
       text: Get Started

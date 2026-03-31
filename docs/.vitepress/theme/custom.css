@@ -1,3 +1,47 @@
+/* Hide VitePress's image container on mobile — we use mobile-hero-demo instead */
+.VPHero .image {
+  display: none;
+}
+
+@media (min-width: 960px) {
+  .VPHero .image {
+    display: block;
+  }
+}
+
+/* PromptDemo: desktop (hero image slot) — hidden on mobile, flex-end aligned */
+.hero-image-demo {
+  display: none;
+}
+
+@media (min-width: 960px) {
+  /* Override VitePress's centred/translated image container */
+  .VPHero .image-container {
+    justify-content: flex-end !important;
+    align-items: flex-end !important;
+    transform: none !important;
+    padding: 0 0 56px 64px;
+  }
+
+  .hero-image-demo {
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    width: 100%;
+  }
+}
+
+/* PromptDemo: mobile (hero-after slot) — hidden on desktop */
+.mobile-hero-demo {
+  padding: 0 0 40px;
+}
+
+@media (min-width: 960px) {
+  .mobile-hero-demo {
+    display: none;
+  }
+}
+
 :root {
   --vp-c-brand-1: #cc5500;
   --vp-c-brand-2: #b34a00;
@@ -10,4 +54,8 @@
   --vp-c-brand-2: #cc5500;
   --vp-c-brand-3: #b34a00;
   --vp-c-brand-soft: rgba(204, 85, 0, 0.16);
+}
+
+.github-stars {
+  margin-left: 15px;
 }
