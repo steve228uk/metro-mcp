@@ -81,32 +81,24 @@ export const navigationPlugin = definePlugin({
       },
     });
 
+    function getFocusedRoute(s: Record<string, unknown>): Record<string, unknown> | null {
+      const routes = s.routes as Array<Record<string, unknown>>;
+      if (!routes) return null;
+      const idx = s.index !== undefined ? (s.index as number) : routes.length - 1;
+      const route = routes[idx];
+      if (route.state && typeof route.state === 'object') {
+        return getFocusedRoute(route.state as Record<string, unknown>);
+      }
+      return { name: route.name, params: route.params || {}, key: route.key };
+    }
+
     ctx.registerTool('get_current_route', {
       description: 'Get the currently focused route name and params.',
       parameters: z.object({}),
       handler: async () => {
-        const expr = `
-          (function() {
-            var state = ${GET_NAV_STATE_EXPR.replace('(function()', 'function getState()')
-              .replace(/\n\s*\}\)\(\)/, '\n      }\n      return getState()')};
-
-            if (!state) return null;
-
-            // Walk to the deepest focused route
-            function getFocusedRoute(s) {
-              if (!s || !s.routes) return null;
-              var idx = s.index !== undefined ? s.index : s.routes.length - 1;
-              var route = s.routes[idx];
-              if (route.state && route.state.routes) {
-                return getFocusedRoute(route.state);
-              }
-              return { name: route.name, params: route.params || {}, key: route.key };
-            }
-
-            return getFocusedRoute(state);
-          })()
-        `;
-        const result = await ctx.evalInApp(expr, { awaitPromise: true });
+        const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
+        if (!state || typeof state !== 'object') return 'No focused route found.';
+        const result = getFocusedRoute(state as Record<string, unknown>);
         if (!result) return 'No focused route found.';
         return result;
       },
