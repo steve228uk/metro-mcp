@@ -87,8 +87,8 @@ export const navigationPlugin = definePlugin({
       handler: async () => {
         const expr = `
           (function() {
-            var state = ${GET_NAV_STATE_EXPR.replace('(function()', 'function getState()')
-              .replace(/\n\s*\}\)\(\)/, '\n      }\n      return getState()')};
+            ${GET_NAV_STATE_EXPR.replace('(function()', 'function getState()')
+              .replace(/\n\s*\}\)\(\)/, '\n      }\n      var state = getState()')};
 
             if (!state) return null;
 
