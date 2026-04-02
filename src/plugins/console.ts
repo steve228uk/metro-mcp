@@ -10,23 +10,111 @@ interface LogEntry {
   stackTrace?: string;
 }
 
+interface CDPRemoteObject {
+  type?: string;
+  subtype?: string;
+  className?: string;
+  description?: string;
+  objectId?: string;
+  value?: unknown;
+  preview?: CDPObjectPreview;
+}
+
+interface CDPObjectPreview {
+  type?: string;
+  subtype?: string;
+  description?: string;
+  overflow?: boolean;
+  properties?: CDPPropertyPreview[];
+}
+
+interface CDPPropertyPreview {
+  name: string;
+  type: string;
+  value?: string;
+  valuePreview?: CDPObjectPreview;
+}
+
+function formatPreview(preview: CDPObjectPreview): string | null {
+  if (!preview.properties) return null;
+
+  const props = preview.properties.map((p) => {
+    if (p.type === 'object' && p.valuePreview) {
+      const nested = formatPreview(p.valuePreview);
+      return `${p.name}: ${nested || p.value || '[object]'}`;
+    }
+    return `${p.name}: ${p.value}`;
+  });
+
+  const overflow = preview.overflow ? ', ...' : '';
+  if (preview.subtype === 'array') return `[${props.join(', ')}${overflow}]`;
+  return `{${props.join(', ')}${overflow}}`;
+}
+
+/**
+ * Synchronously format a CDP RemoteObject using its value, preview, or description.
+ * Used as the immediate fallback before async deep resolution completes.
+ */
+function formatRemoteObject(obj: CDPRemoteObject): string {
+  if (obj.type === 'string') return obj.value as string;
+  if (obj.type === 'number') return String(obj.value);
+  if (obj.type === 'boolean') return String(obj.value);
+  if (obj.type === 'undefined') return 'undefined';
+  if (obj.subtype === 'null') return 'null';
+  if (obj.preview) {
+    const formatted = formatPreview(obj.preview);
+    if (formatted) return formatted;
+  }
+  if (obj.description) return obj.description;
+  if (obj.value !== undefined) return JSON.stringify(obj.value);
+  return (obj.className as string) || (obj.type as string) || '[object]';
+}
+
 function formatCDPArgs(args: unknown[]): string {
   return args
     .map((arg) => {
       if (typeof arg === 'object' && arg !== null) {
-        const remoteObj = arg as Record<string, unknown>;
-        if (remoteObj.type === 'string') return remoteObj.value as string;
-        if (remoteObj.type === 'number') return String(remoteObj.value);
-        if (remoteObj.type === 'boolean') return String(remoteObj.value);
-        if (remoteObj.type === 'undefined') return 'undefined';
-        if (remoteObj.subtype === 'null') return 'null';
-        if (remoteObj.description) return remoteObj.description as string;
-        if (remoteObj.value !== undefined) return JSON.stringify(remoteObj.value);
-        return remoteObj.className || remoteObj.type || '[object]';
+        return formatRemoteObject(arg as CDPRemoteObject);
       }
       return String(arg);
     })
     .join(' ');
+}
+
+async function resolveRemoteObject(
+  cdpSend: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
+  objectId: string,
+): Promise<string | null> {
+  try {
+    const result = (await cdpSend('Runtime.callFunctionOn', {
+      objectId,
+      functionDeclaration:
+        'function() { try { return JSON.stringify(this, null, 2); } catch(e) { return "[unserializable]"; } }',
+      returnByValue: true,
+    })) as Record<string, unknown>;
+    const inner = result.result as Record<string, unknown> | undefined;
+    return inner?.value ? (inner.value as string) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function formatCDPArgsDeep(
+  cdpSend: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
+  args: unknown[],
+): Promise<string> {
+  const parts = await Promise.all(
+    args.map(async (arg) => {
+      if (typeof arg !== 'object' || arg === null) return String(arg);
+      const remoteObj = arg as CDPRemoteObject;
+      if (remoteObj.objectId && remoteObj.type === 'object') {
+        const deep = await resolveRemoteObject(cdpSend, remoteObj.objectId);
+        if (deep) return deep;
+      }
+      return formatRemoteObject(remoteObj);
+    }),
+  );
+  return parts.join(' ');
 }
 
 export const consolePlugin = definePlugin({
@@ -36,19 +124,34 @@ export const consolePlugin = definePlugin({
 
   async setup(ctx) {
     const buffers = new DeviceBufferManager<LogEntry>(500);
+    const cdpSend = ctx.cdp.send.bind(ctx.cdp);
 
     ctx.cdp.on('Runtime.consoleAPICalled', (params) => {
       const key = ctx.getActiveDeviceKey();
       if (!key) return;
       const args = (params.args as unknown[]) || [];
-      buffers.getOrCreate(key).push({
+
+      const entry: LogEntry = {
         timestamp: Date.now(),
         level: params.type as string,
         message: formatCDPArgs(args),
         stackTrace: params.stackTrace
           ? JSON.stringify((params.stackTrace as Record<string, unknown>).callFrames)
           : undefined,
-      });
+      };
+      buffers.getOrCreate(key).push(entry);
+
+      // ObjectIds are short-lived, so resolve promptly after the log event.
+      const hasResolvable = args.some(
+        (arg) => typeof arg === 'object' && arg !== null && (arg as CDPRemoteObject).objectId,
+      );
+      if (hasResolvable) {
+        formatCDPArgsDeep(cdpSend, args)
+          .then((deep) => {
+            if (deep !== entry.message) entry.message = deep;
+          })
+          .catch(() => {});
+      }
     });
 
     // Mark when Metro starts rebuilding — a reload is imminent.
