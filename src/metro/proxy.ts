@@ -77,22 +77,36 @@ export class CDPProxy {
    * Start the proxy's HTTP + WebSocket server.
    */
   async start(port = 0): Promise<number> {
-    return new Promise((resolve, reject) => {
-      this.httpServer = http.createServer((req, res) => {
-        this.handleHttpRequest(req, res);
+    const tryPort = (p: number): Promise<number> => new Promise((resolve, reject) => {
+      const httpServer = http.createServer((req, res) => this.handleHttpRequest(req, res));
+      httpServer.on('error', (err) => {
+        httpServer.close();
+        reject(err);
       });
-
-      this.wss = new WebSocketServer({ server: this.httpServer });
-      this.wss.on('connection', (ws) => this.handleNewClient(ws));
-
-      this.httpServer.on('error', reject);
-      this.httpServer.listen(port, () => {
-        const addr = this.httpServer!.address();
-        this._port = typeof addr === 'object' && addr ? addr.port : port;
-        logger.info(`CDP proxy listening on port ${this._port}`);
-        resolve(this._port);
+      httpServer.listen(p, () => {
+        const addr = httpServer.address();
+        const actualPort = typeof addr === 'object' && addr ? addr.port : p;
+        // Only attach WSS after successful bind — creating it before listen() would
+        // cause it to emit an unhandled error event if the port is already in use.
+        const wss = new WebSocketServer({ server: httpServer });
+        wss.on('connection', (ws) => this.handleNewClient(ws));
+        this.httpServer = httpServer;
+        this.wss = wss;
+        this._port = actualPort;
+        logger.info(`CDP proxy listening on port ${actualPort}`);
+        resolve(actualPort);
       });
     });
+
+    if (port !== 0) {
+      try {
+        return await tryPort(port);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
+        logger.debug(`Preferred proxy port ${port} in use, falling back to auto-assign`);
+      }
+    }
+    return tryPort(0);
   }
 
   /**
