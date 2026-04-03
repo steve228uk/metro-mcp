@@ -1,5 +1,6 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import fs from 'fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 
@@ -17,6 +18,7 @@ import type {
 import { CDPClient } from './metro/connection.js';
 import { MetroEventsClient } from './metro/events.js';
 import { scanMetroPorts, selectBestTarget, fetchTargets } from './metro/discovery.js';
+import type { MetroTarget } from './metro/types.js';
 import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
 import { extractCDPExceptionMessage } from './utils/cdp.js';
@@ -293,6 +295,75 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     }
   }
 
+  // Singleton proxy lock — prevents multiple metro-mcp instances from competing
+  // for Metro's single CDP WebSocket, which causes a connect/disconnect spam loop.
+  // The first instance connects directly to Metro and writes its CDP proxy port to
+  // a lock file. Subsequent instances detect the lock and connect through the
+  // existing proxy instead.
+  const PROXY_LOCK_FILE = '/tmp/metro-mcp-proxy.json';
+  let isPrimaryInstance = false;
+
+  async function tryConnectViaProxy(): Promise<boolean> {
+    try {
+      const lockData = JSON.parse(fs.readFileSync(PROXY_LOCK_FILE, 'utf8'));
+      if (lockData.pid && lockData.port) {
+        // Check if the owning process is still alive
+        try { process.kill(lockData.pid, 0); } catch { return false; }
+        const resp = await fetch(`http://127.0.0.1:${lockData.port}/json`, {
+          signal: AbortSignal.timeout(2000),
+        });
+        if (!resp.ok) return false;
+        const targets = await resp.json() as Array<{ id?: string; title?: string; webSocketDebuggerUrl?: string }>;
+        if (targets.length > 0 && targets[0].webSocketDebuggerUrl) {
+          logger.info(
+            `Found existing metro-mcp proxy (PID ${lockData.pid}, port ${lockData.port}) — connecting as secondary`
+          );
+          await cdpClient.connect(targets[0] as unknown as MetroTarget);
+          if (lockData.metroPort) {
+            eventsClient.connect(config.metro.host!, lockData.metroPort);
+            config.metro.port = lockData.metroPort;
+          }
+          // Point devtools plugin at the primary's proxy so open_devtools uses the right port
+          (config as Record<string, unknown>).proxy = {
+            ...config.proxy,
+            port: lockData.port,
+          };
+          activeDeviceKey = targets[0].id ? `${lockData.port}-${targets[0].id}` : null;
+          activeDeviceName = targets[0].title || targets[0].id || 'secondary';
+          return true;
+        }
+      }
+    } catch {
+      // Lock file missing, stale, or unreadable — fall through to direct connect
+    }
+    return false;
+  }
+
+  function writeProxyLock(proxyPort: number, metroPort: number): void {
+    try {
+      fs.writeFileSync(
+        PROXY_LOCK_FILE,
+        JSON.stringify({ pid: process.pid, port: proxyPort, metroPort })
+      );
+      isPrimaryInstance = true;
+      logger.info(`Wrote proxy lock (port ${proxyPort})`);
+    } catch (err) {
+      logger.warn('Failed to write proxy lock:', err);
+    }
+  }
+
+  function cleanProxyLock(): void {
+    if (!isPrimaryInstance) return;
+    try {
+      const lockData = JSON.parse(fs.readFileSync(PROXY_LOCK_FILE, 'utf8'));
+      if (lockData.pid === process.pid) {
+        fs.unlinkSync(PROXY_LOCK_FILE);
+      }
+    } catch {
+      // Already cleaned or another instance took over
+    }
+  }
+
   // Connect to Metro — always re-discovers targets to get a fresh webSocketDebuggerUrl.
   // Idempotent: concurrent callers wait for the in-flight attempt to finish.
   async function connectToMetro(): Promise<boolean> {
@@ -302,6 +373,11 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     }
     isReconnecting = true;
     try {
+      // If another metro-mcp instance is already connected, piggyback on its proxy
+      if (await tryConnectViaProxy()) {
+        return true;
+      }
+
       let servers;
       if (config.metro.autoDiscover) {
         servers = await scanMetroPorts(config.metro.host!);
@@ -330,6 +406,12 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
       // Track active device for per-device buffers
       activeDeviceKey = `${server.port}-${target.id}`;
       activeDeviceName = target.title || target.deviceName || target.id;
+
+      // Write lock so other instances connect through our proxy
+      const proxyPort = (config as Record<string, unknown>).proxy as { port?: number } | undefined;
+      if (proxyPort?.port) {
+        writeProxyLock(proxyPort.port, server.port);
+      }
 
       return true;
     } catch (err) {
@@ -392,8 +474,9 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
   logger.info('MCP server started');
 
   // Clean up on shutdown
-  process.on('SIGINT', () => { cdpProxy?.stop(); process.exit(0); });
-  process.on('SIGTERM', () => { cdpProxy?.stop(); process.exit(0); });
+  process.on('SIGINT', () => { cleanProxyLock(); cdpProxy?.stop(); process.exit(0); });
+  process.on('SIGTERM', () => { cleanProxyLock(); cdpProxy?.stop(); process.exit(0); });
+  process.on('exit', () => { cleanProxyLock(); });
 
   // Try connecting to Metro (non-blocking — server works without connection)
   void connectToMetro();
