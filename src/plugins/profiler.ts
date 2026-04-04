@@ -366,12 +366,12 @@ const DEVTOOLS_STOP_EXPR = `(function() {
 })()`;
 
 const READ_RENDERS_EXPR = `(function() {
-  var mcp = globalThis.__METRO_MCP__;
+  var mcp = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
   return (mcp && Array.isArray(mcp.renders)) ? mcp.renders.slice() : null;
 })()`;
 
 const READ_AND_CLEAR_EXPR = `(function() {
-  var mcp = globalThis.__METRO_MCP__;
+  var mcp = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
   if (!mcp || !Array.isArray(mcp.renders)) return null;
   var data = mcp.renders.slice();
   if (typeof mcp.clearRenders === 'function') mcp.clearRenders();
@@ -379,7 +379,7 @@ const READ_AND_CLEAR_EXPR = `(function() {
 })()`;
 
 const NOT_SETUP_MSG =
-  'No render data available. Add <Profiler id="..." onRender={trackRender}> to your app and import trackRender from metro-mcp/client.';
+  'No render data available. Add <Profiler id="..." onRender={trackRender}> to your app and import trackRender from metro-bridge/client.';
 
 const CONSOLE_PROFILE_TITLE = 'metro-mcp';
 

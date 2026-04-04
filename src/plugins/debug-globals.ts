@@ -2,7 +2,8 @@ import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 
 const KNOWN_GLOBALS = [
-  { path: '__METRO_MCP__', name: 'Metro MCP Client SDK', description: 'Custom commands, Redux, navigation, performance tracking' },
+  { path: '__METRO_BRIDGE__', name: 'Metro Bridge Client SDK', description: 'Custom commands, Redux, navigation, performance tracking (metro-bridge/client)' },
+  { path: '__METRO_MCP__', name: 'Metro MCP Client SDK (deprecated)', description: 'Legacy global — migrate to metro-bridge/client' },
   { path: '__REDUX_DEVTOOLS_EXTENSION__', name: 'Redux DevTools Extension', description: 'Redux DevTools browser extension hook' },
   { path: '__REACT_DEVTOOLS_GLOBAL_HOOK__', name: 'React DevTools Hook', description: 'React DevTools fiber inspection hook' },
   { path: '__EXPO_ROUTER_STATE__', name: 'Expo Router State', description: 'Expo Router navigation state' },

@@ -4,7 +4,9 @@ import { escapeJsString } from '../utils/format.js';
 
 // Shared JS snippet: resolves the commands source from either global convention.
 const METRO_MCP_SRC_JS = `
-  var src = (globalThis.__METRO_MCP__ && globalThis.__METRO_MCP__.commands)
+  var src = (globalThis.__METRO_BRIDGE__ && globalThis.__METRO_BRIDGE__.commands)
+    || (globalThis.__METRO_MCP__ && globalThis.__METRO_MCP__.commands)
+    || globalThis.__METRO_BRIDGE_COMMANDS__
     || globalThis.__METRO_MCP_COMMANDS__
     || null;
 `;
@@ -14,12 +16,12 @@ let _cmdSeq = 0;
 export const commandsPlugin = definePlugin({
   name: 'commands',
 
-  description: 'Custom app commands via global.__METRO_MCP__.commands',
+  description: 'Custom app commands via global.__METRO_BRIDGE__.commands',
 
   async setup(ctx) {
     ctx.registerTool('list_commands', {
       description:
-        'List all custom commands registered by the app. Commands are registered on global.__METRO_MCP__.commands or global.__METRO_MCP_COMMANDS__.',
+        'List all custom commands registered by the app. Commands are registered on global.__METRO_BRIDGE__.commands or global.__METRO_BRIDGE_COMMANDS__.',
       parameters: z.object({}),
       handler: async () => {
         const result = await ctx.evalInApp(`

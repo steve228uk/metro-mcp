@@ -73,23 +73,23 @@ stop_profiling
 
 ## React `<Profiler>`
 
-React's built-in [`<Profiler>`](https://react.dev/reference/react/Profiler) component measures how long component subtrees take to render. metro-mcp collects this data via a single `trackRender` callback from the client SDK.
+React's built-in [`<Profiler>`](https://react.dev/reference/react/Profiler) component measures how long component subtrees take to render. metro-mcp collects this data via a single `trackRender` callback from the `metro-bridge` client SDK.
 
 ### Setup
 
-Install metro-mcp as a dev dependency in your app:
+Install `metro-bridge` as a dev dependency in your app:
 
 ```bash
-npm install --save-dev metro-mcp
+npm install --save-dev metro-bridge
 # or
-bun add -d metro-mcp
+bun add -d metro-bridge
 ```
 
 Import `trackRender` and pass it to any `<Profiler>` component:
 
 ```tsx
 import { Profiler } from 'react';
-import { trackRender } from 'metro-mcp/client';
+import { trackRender } from 'metro-bridge/client';
 
 // Wrap a specific subtree you want to measure
 <Profiler id="sidebar" onRender={trackRender}>

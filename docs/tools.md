@@ -123,7 +123,7 @@ See the [profiling guide](profiling.md) for a full explanation of CDP CPU profil
 - **`stop_profiling`** — Stop profiling and return top functions ranked by self time and total time. Params: `topN` (default 20), `includeNative` (default false).
 - **`get_profile_status`** — Check whether profiling is active and whether a previous profile is available.
 - **`get_flamegraph`** — Return the current profiling results as a human-readable text flamegraph: CPU call tree + ranked chart + React render chart.
-- **`get_react_renders`** — Read render timings from `<Profiler onRender={trackRender}>` components. Returns renders sorted by `actualDuration` with `memoSavingsPercent`. Requires `trackRender` from `metro-mcp/client`. Param: `clear` (bool).
+- **`get_react_renders`** — Read render timings from `<Profiler onRender={trackRender}>` components. Returns renders sorted by `actualDuration` with `memoSavingsPercent`. Requires `trackRender` from `metro-bridge/client`. Param: `clear` (bool).
 
 ### Profiler Resources
 

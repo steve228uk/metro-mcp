@@ -209,7 +209,7 @@ Register custom commands and expose state to the MCP server — no package neede
 
 ```typescript
 if (__DEV__) {
-  globalThis.__METRO_MCP__ = {
+  globalThis.__METRO_BRIDGE__ = {
     commands: {
       // Run custom actions from the MCP client
       login: async ({ email, password }) => {
@@ -232,7 +232,7 @@ if (__DEV__) {
 
 Use `list_commands` and `run_command` to call these from the MCP client.
 
-For enhanced features like real-time Redux action tracking, navigation events, performance marks, and React render profiling, see the [optional client SDK](docs/sdk.md) and [profiling guide](docs/profiling.md).
+For enhanced features like real-time Redux action tracking, navigation events, performance marks, and React render profiling, install [`metro-bridge`](https://www.npmjs.com/package/metro-bridge) — see the [client SDK docs](docs/sdk.md) and [profiling guide](docs/profiling.md).
 
 ---
 

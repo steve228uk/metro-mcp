@@ -2,6 +2,10 @@
 
 The client SDK is an **optional** dev dependency for enhanced features like real-time Redux action tracking, navigation events, and performance marks. Most metro-mcp features work without it.
 
+::: tip SDK moved to metro-bridge
+The app-side SDK is now published as part of [`metro-bridge`](https://www.npmjs.com/package/metro-bridge). Install `metro-bridge` in your React Native app instead of `metro-mcp`.
+:::
+
 ## Without the SDK
 
 You can register commands and expose custom state directly on a global — no package needed:
@@ -9,7 +13,7 @@ You can register commands and expose custom state directly on a global — no pa
 ```typescript
 // In your app entry point (dev only)
 if (__DEV__) {
-  globalThis.__METRO_MCP__ = {
+  globalThis.__METRO_BRIDGE__ = {
     commands: {
       login: async ({ email, password }) => {
         return await authService.login(email, password);
@@ -33,18 +37,18 @@ if (__DEV__) {
 Install as a dev dependency:
 
 ```bash
-npm install --save-dev metro-mcp
+npm install --save-dev metro-bridge
 # or
-yarn add --dev metro-mcp
+yarn add --dev metro-bridge
 # or
-bun add -d metro-mcp
+bun add -d metro-bridge
 ```
 
 ```typescript
-import { MetroMCPClient } from 'metro-mcp/client';
+import { MetroBridgeClient } from 'metro-bridge/client';
 
 if (__DEV__) {
-  const mcp = new MetroMCPClient();
+  const mcp = new MetroBridgeClient();
 
   // Custom commands
   mcp.registerCommand('login', async ({ email, password }) => {
@@ -79,7 +83,7 @@ if (__DEV__) {
 If you only need custom commands without the full SDK:
 
 ```typescript
-import { registerCommand } from 'metro-mcp/client';
+import { registerCommand } from 'metro-bridge/client';
 
 if (__DEV__) {
   registerCommand('login', async ({ email, password }) => {

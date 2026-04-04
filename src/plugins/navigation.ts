@@ -10,8 +10,9 @@ export const navigationPlugin = definePlugin({
     const GET_NAV_STATE_EXPR = `
       (function() {
         // Try client SDK first
-        if (globalThis.__METRO_MCP__?.navigation?.getState) {
-          return globalThis.__METRO_MCP__.navigation.getState();
+        var _b = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
+        if (_b?.navigation?.getState) {
+          return _b.navigation.getState();
         }
 
         // Walk fiber tree to find NavigationContainer

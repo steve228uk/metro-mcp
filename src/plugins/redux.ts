@@ -19,8 +19,9 @@ export const reduxPlugin = definePlugin({
         const getStateExpr = `
           (function() {
             // Client SDK
-            if (globalThis.__METRO_MCP__?.redux?.getState) {
-              return globalThis.__METRO_MCP__.redux.getState();
+            var _b = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
+            if (_b?.redux?.getState) {
+              return _b.redux.getState();
             }
             // Redux DevTools
             if (globalThis.__REDUX_DEVTOOLS_EXTENSION__) {
@@ -70,7 +71,8 @@ export const reduxPlugin = definePlugin({
         const expr = `
           (function() {
             var action = ${action};
-            if (globalThis.__METRO_MCP__?.redux?.dispatch) return globalThis.__METRO_MCP__.redux.dispatch(action);
+            var _b = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
+            if (_b?.redux?.dispatch) return _b.redux.dispatch(action);
             if (globalThis.__REDUX_STORE__?.dispatch) return globalThis.__REDUX_STORE__.dispatch(action);
             if (globalThis.store?.dispatch) return globalThis.store.dispatch(action);
             return '__REDUX_NOT_FOUND__';
@@ -90,8 +92,9 @@ export const reduxPlugin = definePlugin({
       handler: async ({ limit }) => {
         const expr = `
           (function() {
-            if (globalThis.__METRO_MCP__?.redux?.actions) {
-              var actions = globalThis.__METRO_MCP__.redux.actions;
+            var _b = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
+            if (_b?.redux?.actions) {
+              var actions = _b.redux.actions;
               if (typeof actions.getAll === 'function') return actions.getAll();
               if (Array.isArray(actions)) return actions;
             }
@@ -100,7 +103,7 @@ export const reduxPlugin = definePlugin({
         `;
         const result = await ctx.evalInApp(expr, { awaitPromise: true });
         if (result === '__NO_ACTIONS__') {
-          return 'Action history not available. Install the metro-mcp client SDK to track Redux actions in real-time.';
+          return 'Action history not available. Install the metro-bridge client SDK to track Redux actions in real-time.';
         }
         if (Array.isArray(result)) return result.slice(-limit);
         return result;
@@ -114,7 +117,8 @@ export const reduxPlugin = definePlugin({
         try {
           const expr = `
             (function() {
-              if (globalThis.__METRO_MCP__?.redux?.getState) return globalThis.__METRO_MCP__.redux.getState();
+              var _b = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
+              if (_b?.redux?.getState) return _b.redux.getState();
               if (globalThis.__REDUX_STORE__?.getState) return globalThis.__REDUX_STORE__.getState();
               if (globalThis.store?.getState) return globalThis.store.getState();
               return null;
