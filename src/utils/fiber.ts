@@ -87,6 +87,44 @@ export const SWIPE_COORDS: Record<string, [number, number, number, number]> = {
 };
 
 /**
+ * JS snippet defining `findAndInvoke(needle, handlerName)`.
+ * Requires `rootFiber` to be set (embed after FIBER_ROOT_JS).
+ * Finds the fiber matching needle by accessibilityLabel, aria-label, or testID,
+ * then walks up to the nearest ancestor that has `handlerName` and calls it.
+ */
+export const FIND_AND_INVOKE_JS = `
+  function findAndInvoke(needle, handlerName) {
+    var target = null;
+    var stack = [rootFiber];
+    while (stack.length && !target) {
+      var fiber = stack.pop();
+      if (!fiber) continue;
+      var props = fiber.memoizedProps || {};
+      if (props.accessibilityLabel === needle ||
+          props['aria-label'] === needle ||
+          props.testID === needle) {
+        target = fiber;
+      } else {
+        if (fiber.sibling) stack.push(fiber.sibling);
+        if (fiber.child) stack.push(fiber.child);
+      }
+    }
+    if (!target) return false;
+    var f = target;
+    var depth = 0;
+    while (f && depth < 50) {
+      if (f.memoizedProps && f.memoizedProps[handlerName]) {
+        f.memoizedProps[handlerName]({ nativeEvent: {} });
+        return true;
+      }
+      f = f.return;
+      depth++;
+    }
+    return false;
+  }
+`;
+
+/**
  * JS snippet that defines a `getRoute()` function reading from the nav ref set by the
  * navigation plugin. Embed inside an IIFE that also calls `getRoute()`.
  */
