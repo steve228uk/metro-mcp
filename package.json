@@ -61,7 +61,7 @@
     "@modelcontextprotocol/sdk": "^1.12.1",
     "chrome-launcher": "^1.2.1",
     "chromium-edge-launcher": "^0.3.0",
-    "metro-bridge": "^0.1.2",
+    "metro-bridge": "^0.2.0",
     "ws": "^8.20.0",
     "zod": "^3.24.4"
   },

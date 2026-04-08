@@ -15,7 +15,7 @@ import type {
   PromptConfig,
   EvalOptions,
 } from './plugin.js';
-import { CDPSession, CDPMultiplexer, scanMetroPorts, selectBestTarget, fetchTargets } from 'metro-bridge';
+import { CDPSession, CDPMultiplexer, scanMetroPorts, selectBestTarget, fetchTargets, supportsMultipleDebuggers } from 'metro-bridge';
 import type { MetroTarget } from 'metro-bridge';
 import { MetroEventsClient } from './metro/events.js';
 import { createLogger } from './utils/logger.js';
@@ -405,10 +405,36 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
       activeDeviceKey = `${server.port}-${target.id}`;
       activeDeviceName = target.title || target.deviceName || target.id;
 
-      // Write lock so other instances connect through our proxy
-      const proxyPort = (config as Record<string, unknown>).proxy as { port?: number } | undefined;
-      if (proxyPort?.port) {
-        writeProxyLock(proxyPort.port, server.port);
+      if (supportsMultipleDebuggers(target)) {
+        // RN 0.85+: Metro handles multiple concurrent debugger sessions natively.
+        // No CDPMultiplexer or singleton proxy lock needed — other tools (Chrome
+        // DevTools, other metro-mcp instances) can connect to Metro directly.
+        logger.info('Target supports multiple debuggers (RN 0.85+) — skipping CDP proxy');
+      } else {
+        // RN <0.85: only one debugger at a time. Start the proxy once and write the
+        // singleton lock so other metro-mcp instances piggyback on it.
+        if (!proxyStarted && config.proxy?.enabled !== false) {
+          cdpMultiplexer = new CDPMultiplexer(cdpSession, { protectedDomains: ['Runtime', 'Network'] });
+          try {
+            const startedPort = await cdpMultiplexer.start(preferredProxyPort);
+            const devtoolsUrl = cdpMultiplexer.getDevToolsUrl();
+            logger.info(`CDP proxy started on port ${startedPort}`);
+            if (devtoolsUrl) logger.info(`Chrome DevTools URL: ${devtoolsUrl}`);
+            (config as Record<string, unknown>).proxy = {
+              ...config.proxy,
+              port: startedPort,
+              url: devtoolsUrl,
+            };
+            proxyStarted = true;
+          } catch (err) {
+            logger.warn('Could not start CDP proxy:', err);
+          }
+        }
+
+        const proxyConfig = (config as Record<string, unknown>).proxy as { port?: number } | undefined;
+        if (proxyConfig?.port) {
+          writeProxyLock(proxyConfig.port, server.port);
+        }
       }
 
       return true;
@@ -444,33 +470,18 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     }, delay);
   }
 
-  // Start CDP proxy for Chrome DevTools coexistence
+  // CDP proxy for Chrome DevTools coexistence — started lazily on first connect
+  // only when the target does not support multiple debuggers natively (RN <0.85).
   let cdpMultiplexer: CDPMultiplexer | null = null;
-  if (config.proxy?.enabled !== false) {
-    cdpMultiplexer = new CDPMultiplexer(cdpSession, { protectedDomains: ['Runtime', 'Network'] });
+  let proxyStarted = false;
+
+  // Read preferred proxy port once at startup (stale lock reuse / explicit config).
+  let preferredProxyPort = config.proxy?.port ?? 0;
+  if (preferredProxyPort === 0) {
     try {
-      let preferredProxyPort = config.proxy?.port ?? 0;
-      if (preferredProxyPort === 0) {
-        try {
-          const stale = JSON.parse(fs.readFileSync(PROXY_LOCK_FILE, 'utf8'));
-          if (stale.port) preferredProxyPort = stale.port;
-        } catch { /* no stale lock */ }
-      }
-      const proxyPort = await cdpMultiplexer.start(preferredProxyPort);
-      const devtoolsUrl = cdpMultiplexer.getDevToolsUrl();
-      logger.info(`CDP proxy started on port ${proxyPort}`);
-      if (devtoolsUrl) {
-        logger.info(`Chrome DevTools URL: ${devtoolsUrl}`);
-      }
-      // Make proxy info available to plugins via config
-      (config as Record<string, unknown>).proxy = {
-        ...config.proxy,
-        port: proxyPort,
-        url: devtoolsUrl,
-      };
-    } catch (err) {
-      logger.warn('Could not start CDP proxy:', err);
-    }
+      const stale = JSON.parse(fs.readFileSync(PROXY_LOCK_FILE, 'utf8'));
+      if (stale.port) preferredProxyPort = stale.port;
+    } catch { /* no stale lock */ }
   }
 
   // Start MCP transport

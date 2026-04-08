@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { z } from 'zod';
+import { supportsMultipleDebuggers, openDevTools } from 'metro-bridge';
 import { definePlugin } from '../plugin.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -78,12 +79,44 @@ export const devtoolsPlugin = definePlugin({
     ctx.registerTool('open_devtools', {
       description:
         'Open the React Native DevTools debugger panel in Chrome. ' +
-        'Uses Metro\'s bundled DevTools frontend but connects through our CDP proxy ' +
-        'so both DevTools and the MCP can share the single Hermes connection.',
+        'On RN 0.85+ connects directly to Metro (no proxy needed). ' +
+        'On older RN versions connects through the CDP proxy so both ' +
+        'DevTools and the MCP can share the single Hermes connection.',
       parameters: z.object({
         open: z.boolean().default(true).describe('Attempt to open the browser automatically'),
       }),
       handler: async ({ open }) => {
+        const target = ctx.cdp.getTarget();
+        if (!target) {
+          return 'Not connected to Metro. Start your React Native app and try again.';
+        }
+
+        if (supportsMultipleDebuggers(target)) {
+          // RN 0.85+: Metro supports concurrent debugger sessions natively.
+          // Point DevTools directly at Metro's own WebSocket — no proxy needed.
+          const wsHost = new URL(target.webSocketDebuggerUrl).host;
+          const frontendUrl =
+            `http://${ctx.metro.host}:${ctx.metro.port}/debugger-frontend/rn_fusebox.html` +
+            `?ws=${wsHost}&sources.hide_add_folder=true`;
+
+          if (open) {
+            try {
+              const result = await openDevTools(frontendUrl);
+              return { opened: result.opened, url: frontendUrl };
+            } catch (err) {
+              logger.debug('Failed to open DevTools:', err);
+            }
+          }
+
+          return {
+            opened: false,
+            url: frontendUrl,
+            instructions: 'Open this URL in Chrome or Edge: ' + frontendUrl,
+          };
+        }
+
+        // RN <0.85: proxy-based path — DevTools connects through the CDPMultiplexer
+        // so both it and the MCP can share the single Hermes connection.
         const config = ctx.config as Record<string, unknown>;
         const proxyConfig = config.proxy as { port?: number } | undefined;
         const proxyPort = proxyConfig?.port;
@@ -92,10 +125,6 @@ export const devtoolsPlugin = definePlugin({
           return 'CDP proxy is not running. Set proxy.enabled to true in your metro-mcp config.';
         }
 
-        // Build a URL using Metro's own DevTools frontend, but pointing the
-        // WebSocket connection at our proxy instead of Metro's inspector.
-        // This is the same frontend Metro uses when you press "j", served
-        // from the @react-native/debugger-frontend package.
         const frontendUrl = `http://${ctx.metro.host}:${ctx.metro.port}/debugger-frontend/rn_fusebox.html`
           + `?ws=127.0.0.1:${proxyPort}`
           + `&sources.hide_add_folder=true`;
