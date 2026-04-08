@@ -8,7 +8,7 @@
         "@modelcontextprotocol/sdk": "^1.12.1",
         "chrome-launcher": "^1.2.1",
         "chromium-edge-launcher": "^0.3.0",
-        "metro-bridge": "^0.1.1",
+        "metro-bridge": "^0.2.0",
         "ws": "^8.20.0",
         "zod": "^3.24.4",
       },
@@ -419,7 +419,7 @@
 
     "merge-descriptors": ["merge-descriptors@2.0.0", "", {}, "sha512-Snk314V5ayFLhp3fkUREub6WtjBfPdCPY1Ln8/8munuLuiYhsABgBVWsozAG+MWMbVEvcdcpbi9R7ww22l9Q3g=="],
 
-    "metro-bridge": ["metro-bridge@0.1.1", "", { "dependencies": { "ws": "^8.20.0" }, "optionalDependencies": { "chrome-launcher": "^1.2.1", "chromium-edge-launcher": "^0.3.0" }, "peerDependencies": { "react-native": ">=0.70.0" }, "optionalPeers": ["react-native"] }, "sha512-W0dkUDzXZ6R//E4/jXXykV7qEL9kaBkLMM5W/LSC8gA3wrOwkGR/niyDS10zQ4XL7F/c14DFCfjJrQnKOeksfg=="],
+    "metro-bridge": ["metro-bridge@0.2.0", "", { "dependencies": { "ws": "^8.20.0" }, "optionalDependencies": { "chrome-launcher": "^1.2.1", "chromium-edge-launcher": "^0.3.0" }, "peerDependencies": { "react-native": ">=0.70.0" }, "optionalPeers": ["react-native"] }, "sha512-KVF/N6DyD5vqD5CMaKLHPjb2Sr8/ecN6IUKPrM4aikoELd53z24Ggib9VQe3ysaOVxCHuVqup9Ihvd3PQJ0pbA=="],
 
     "micromark-util-character": ["micromark-util-character@2.1.1", "", { "dependencies": { "micromark-util-symbol": "^2.0.0", "micromark-util-types": "^2.0.0" } }, "sha512-wv8tdUTJ3thSFFFJKtpYKOYiGP2+v96Hvk4Tu8KpCAsTMs6yi+nVmGh1syvSCsaxz45J6Jbw+9DD6g97+NV67Q=="],
 
