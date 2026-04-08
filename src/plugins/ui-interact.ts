@@ -158,15 +158,16 @@ export const uiInteractPlugin = definePlugin({
           (function() {
             ${FIBER_ROOT_JS}
             var needle = ${jsLabel};
+            // Step 1: find fiber by testID/label (onPress not required here)
             var target = null;
             var stack = [rootFiber];
             while (stack.length && !target) {
               var fiber = stack.pop();
               if (!fiber) continue;
               var props = fiber.memoizedProps || {};
-              if ((props.accessibilityLabel === needle ||
-                   props['aria-label'] === needle ||
-                   props.testID === needle) && props.onPress) {
+              if (props.accessibilityLabel === needle ||
+                  props['aria-label'] === needle ||
+                  props.testID === needle) {
                 target = fiber;
               } else {
                 if (fiber.sibling) stack.push(fiber.sibling);
@@ -174,7 +175,20 @@ export const uiInteractPlugin = definePlugin({
               }
             }
             if (!target) return false;
-            target.memoizedProps.onPress({ nativeEvent: {} });
+            // Step 2: use matched fiber if it has onPress, otherwise walk up to nearest ancestor
+            var pressable = (target.memoizedProps && target.memoizedProps.onPress) ? target : null;
+            if (!pressable) {
+              var ancestor = target.return;
+              while (ancestor) {
+                if (ancestor.memoizedProps && ancestor.memoizedProps.onPress) {
+                  pressable = ancestor;
+                  break;
+                }
+                ancestor = ancestor.return;
+              }
+            }
+            if (!pressable) return false;
+            pressable.memoizedProps.onPress({ nativeEvent: {} });
             return true;
           })()
         `).catch(() => false);
@@ -324,15 +338,16 @@ export const uiInteractPlugin = definePlugin({
             (function() {
               ${FIBER_ROOT_JS}
               var needle = ${jsLabel};
+              // Step 1: find fiber by testID/label (onLongPress not required here)
               var target = null;
               var stack = [rootFiber];
               while (stack.length && !target) {
                 var fiber = stack.pop();
                 if (!fiber) continue;
                 var props = fiber.memoizedProps || {};
-                if ((props.accessibilityLabel === needle ||
-                     props['aria-label'] === needle ||
-                     props.testID === needle) && props.onLongPress) {
+                if (props.accessibilityLabel === needle ||
+                    props['aria-label'] === needle ||
+                    props.testID === needle) {
                   target = fiber;
                 } else {
                   if (fiber.sibling) stack.push(fiber.sibling);
@@ -340,7 +355,20 @@ export const uiInteractPlugin = definePlugin({
                 }
               }
               if (!target) return false;
-              target.memoizedProps.onLongPress({ nativeEvent: {} });
+              // Step 2: use matched fiber if it has onLongPress, otherwise walk up to nearest ancestor
+              var pressable = (target.memoizedProps && target.memoizedProps.onLongPress) ? target : null;
+              if (!pressable) {
+                var ancestor = target.return;
+                while (ancestor) {
+                  if (ancestor.memoizedProps && ancestor.memoizedProps.onLongPress) {
+                    pressable = ancestor;
+                    break;
+                  }
+                  ancestor = ancestor.return;
+                }
+              }
+              if (!pressable) return false;
+              pressable.memoizedProps.onLongPress({ nativeEvent: {} });
               return true;
             })()
           `).catch(() => false);
