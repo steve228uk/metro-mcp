@@ -406,18 +406,13 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
       activeDeviceName = target.title || target.deviceName || target.id;
 
       if (supportsMultipleDebuggers(target)) {
-        // RN 0.85+: Metro handles multiple concurrent debugger sessions natively.
-        // No CDPMultiplexer or singleton proxy lock needed — other tools (Chrome
-        // DevTools, other metro-mcp instances) can connect to Metro directly.
         logger.info('Target supports multiple debuggers (RN 0.85+) — skipping CDP proxy');
       } else {
-        // RN <0.85: only one debugger at a time. Start the proxy once and write the
-        // singleton lock so other metro-mcp instances piggyback on it.
-        if (!proxyStarted && config.proxy?.enabled !== false) {
-          cdpMultiplexer = new CDPMultiplexer(cdpSession, { protectedDomains: ['Runtime', 'Network'] });
+        if (!cdpMultiplexer && config.proxy?.enabled !== false) {
+          const mux = new CDPMultiplexer(cdpSession, { protectedDomains: ['Runtime', 'Network'] });
           try {
-            const startedPort = await cdpMultiplexer.start(preferredProxyPort);
-            const devtoolsUrl = cdpMultiplexer.getDevToolsUrl();
+            const startedPort = await mux.start(preferredProxyPort);
+            const devtoolsUrl = mux.getDevToolsUrl();
             logger.info(`CDP proxy started on port ${startedPort}`);
             if (devtoolsUrl) logger.info(`Chrome DevTools URL: ${devtoolsUrl}`);
             (config as Record<string, unknown>).proxy = {
@@ -425,7 +420,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
               port: startedPort,
               url: devtoolsUrl,
             };
-            proxyStarted = true;
+            cdpMultiplexer = mux;
           } catch (err) {
             logger.warn('Could not start CDP proxy:', err);
           }
@@ -473,7 +468,6 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
   // CDP proxy for Chrome DevTools coexistence — started lazily on first connect
   // only when the target does not support multiple debuggers natively (RN <0.85).
   let cdpMultiplexer: CDPMultiplexer | null = null;
-  let proxyStarted = false;
 
   // Read preferred proxy port once at startup (stale lock reuse / explicit config).
   let preferredProxyPort = config.proxy?.port ?? 0;

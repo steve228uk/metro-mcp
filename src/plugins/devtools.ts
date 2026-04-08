@@ -7,6 +7,10 @@ import { createLogger } from '../utils/logger.js';
 const logger = createLogger('devtools');
 const DEVTOOLS_STATE_FILE = '/tmp/metro-mcp-devtools.json';
 
+function buildFrontendUrl(metroHost: string, metroPort: number, wsEndpoint: string): string {
+  return `http://${metroHost}:${metroPort}/debugger-frontend/rn_fusebox.html?ws=${wsEndpoint}&sources.hide_add_folder=true`;
+}
+
 /**
  * Find a Chrome/Edge binary path using the same strategy as Metro's
  * DefaultToolLauncher: try chrome-launcher first, fall back to
@@ -92,12 +96,13 @@ export const devtoolsPlugin = definePlugin({
         }
 
         if (supportsMultipleDebuggers(target)) {
-          // RN 0.85+: Metro supports concurrent debugger sessions natively.
-          // Point DevTools directly at Metro's own WebSocket — no proxy needed.
-          const wsHost = new URL(target.webSocketDebuggerUrl).host;
-          const frontendUrl =
-            `http://${ctx.metro.host}:${ctx.metro.port}/debugger-frontend/rn_fusebox.html` +
-            `?ws=${wsHost}&sources.hide_add_folder=true`;
+          let wsHost: string;
+          try {
+            wsHost = new URL(target.webSocketDebuggerUrl).host;
+          } catch {
+            return 'Could not parse Metro WebSocket URL. Try reconnecting.';
+          }
+          const frontendUrl = buildFrontendUrl(ctx.metro.host, ctx.metro.port, wsHost);
 
           if (open) {
             try {
@@ -115,8 +120,8 @@ export const devtoolsPlugin = definePlugin({
           };
         }
 
-        // RN <0.85: proxy-based path — DevTools connects through the CDPMultiplexer
-        // so both it and the MCP can share the single Hermes connection.
+        // RN <0.85: only one debugger can hold the connection at a time, so the
+        // CDPMultiplexer proxy shares it between DevTools and the MCP.
         const config = ctx.config as Record<string, unknown>;
         const proxyConfig = config.proxy as { port?: number } | undefined;
         const proxyPort = proxyConfig?.port;
@@ -125,9 +130,7 @@ export const devtoolsPlugin = definePlugin({
           return 'CDP proxy is not running. Set proxy.enabled to true in your metro-mcp config.';
         }
 
-        const frontendUrl = `http://${ctx.metro.host}:${ctx.metro.port}/debugger-frontend/rn_fusebox.html`
-          + `?ws=127.0.0.1:${proxyPort}`
-          + `&sources.hide_add_folder=true`;
+        const frontendUrl = buildFrontendUrl(ctx.metro.host, ctx.metro.port, `127.0.0.1:${proxyPort}`);
 
         if (open) {
           const browserPath = await findBrowserPath();
