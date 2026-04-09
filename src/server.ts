@@ -361,18 +361,20 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
           logger.info(
             `Found existing metro-mcp proxy (PID ${lockData.pid}, port ${lockData.port}) — connecting as secondary`
           );
-          await cdpSession.connectToTarget(targets[0] as unknown as MetroTarget);
-          if (lockData.metroPort) {
-            eventsClient.connect(config.metro.host!, lockData.metroPort);
-            config.metro.port = lockData.metroPort;
-          }
+          // Set active device key BEFORE connecting so plugin event handlers
+          // that fire on the 'reconnected' event can store events immediately.
+          activeDeviceKey = targets[0].id ? `${lockData.port}-${targets[0].id}` : null;
+          activeDeviceName = targets[0].title || targets[0].id || 'secondary';
           // Point devtools plugin at the primary's proxy so open_devtools uses the right port
           (config as Record<string, unknown>).proxy = {
             ...config.proxy,
             port: lockData.port,
           };
-          activeDeviceKey = targets[0].id ? `${lockData.port}-${targets[0].id}` : null;
-          activeDeviceName = targets[0].title || targets[0].id || 'secondary';
+          await cdpSession.connectToTarget(targets[0] as unknown as MetroTarget);
+          if (lockData.metroPort) {
+            eventsClient.connect(config.metro.host!, lockData.metroPort);
+            config.metro.port = lockData.metroPort;
+          }
           return true;
         }
       }
@@ -443,12 +445,13 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
         return false;
       }
 
-      await cdpSession.connectToTarget(target);
-      eventsClient.connect(server.host, server.port);
-
-      // Track active device for per-device buffers
+      // Set active device key BEFORE connecting so plugin event handlers
+      // that fire on the 'reconnected' event can store events immediately.
       activeDeviceKey = `${server.port}-${target.id}`;
       activeDeviceName = target.title || target.deviceName || target.id;
+
+      await cdpSession.connectToTarget(target);
+      eventsClient.connect(server.host, server.port);
 
       if (supportsMultipleDebuggers(target)) {
         logger.info('Target supports multiple debuggers (RN 0.85+) — skipping CDP proxy');
