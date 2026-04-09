@@ -3,7 +3,7 @@
   "name": "io.github.steve228uk/metro-mcp",
   "title": "Metro MCP",
   "description": "MCP server for React Native/Expo runtime debugging, inspection, and automation via Metro/CDP",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "repository": {
     "url": "https://github.com/steve228uk/metro-mcp",
     "source": "github"
@@ -12,7 +12,7 @@
     {
       "registryType": "npm",
       "identifier": "metro-mcp",
-      "version": "0.8.1",
+      "version": "0.8.2",
       "transport": {
         "type": "stdio"
       }

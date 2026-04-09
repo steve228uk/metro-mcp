@@ -250,6 +250,9 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
               // A reconnect is already in flight — wait for it rather than starting another
               await waitForReconnect();
             } else {
+              // Reset the attempt counter so the background scheduler can resume
+              // after this tool-triggered reconnect, rather than staying capped out.
+              reconnectAttempts = 0;
               const connected = await cdpSession.waitForConnection();
               if (!connected) await connectToMetro();
             }
@@ -279,6 +282,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
             if (isReconnecting) {
               await waitForReconnect();
             } else {
+              reconnectAttempts = 0;
               await connectToMetro();
             }
             return await tryEval();
