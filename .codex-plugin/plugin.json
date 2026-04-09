@@ -1,6 +1,6 @@
 {
   "name": "metro-mcp",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Plugin-based MCP server for React Native/Expo runtime debugging, inspection, and automation via Metro/CDP",
   "author": {
     "name": "Stephen Radford",

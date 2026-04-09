@@ -123,7 +123,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
   // Start with a very short delay (500ms) to recover quickly from brief disconnects
   // like hot reloads, then ramp up for longer outages.
   const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000, 16000];
-  const MAX_RECONNECT_ATTEMPTS = 15;
+  const MAX_BURST_ATTEMPTS = 15; // fast retries; after this, switch to slow background probe
   let reconnectAttempts = 0;
   let isReconnecting = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -137,20 +137,66 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     });
   }
 
+  // Enable required CDP domains. Called on every CDP connection and after Metro
+  // bundle rebuilds (fast refresh / hot reload resets Hermes domain registration).
+  async function enableCDPDomains(): Promise<void> {
+    try {
+      await cdpSession.send('Runtime.enable');
+      logger.debug('Runtime.enable OK');
+    } catch (err) {
+      logger.warn('Runtime.enable failed:', err);
+    }
+    try {
+      await cdpSession.send('Network.enable');
+      logger.debug('Network.enable OK');
+    } catch (err) {
+      logger.warn('Network.enable failed:', err);
+    }
+    // Fusebox (RN 0.77–0.84 New Architecture) requires the Debugger domain to be
+    // enabled before the runtime fully activates its debug session and starts
+    // emitting Runtime events. Disable all break behaviour so we don't freeze
+    // the app. Failures here are non-fatal — older RN versions ignore these.
+    try {
+      await cdpSession.send('Debugger.enable');
+      await Promise.all([
+        cdpSession.send('Debugger.setPauseOnExceptions', { state: 'none' }),
+        cdpSession.send('Debugger.setBreakpointsActive', { active: false }),
+      ]);
+      logger.debug('Debugger.enable OK');
+    } catch {
+      // Non-fatal
+    }
+    // If the runtime is paused waiting for a debugger to be ready (Fusebox may
+    // pause on attach), resume it so the app continues executing and events flow.
+    try {
+      await cdpSession.send('Runtime.runIfWaitingForDebugger');
+      logger.debug('Runtime.runIfWaitingForDebugger OK');
+    } catch {
+      // Non-fatal — not all runtimes support this command
+    }
+  }
+
   // Enable required CDP domains on every connection (initial and reconnect).
   cdpSession.on('reconnected', async () => {
     reconnectAttempts = 0;
     isReconnecting = false;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    await Promise.all([
-      cdpSession.send('Runtime.enable').catch(() => {}),
-      cdpSession.send('Network.enable').catch(() => {}),
-    ]);
+    await enableCDPDomains();
   });
 
   // Drive all reconnection through connectToMetro() so we always get a fresh target URL.
   cdpSession.on('disconnected', () => {
     scheduleReconnect();
+  });
+
+  // Re-enable CDP domains after a Metro bundle rebuild. Fast refresh / hot reload
+  // resets the Hermes runtime context without triggering a WebSocket reconnect, so
+  // the domain registrations (Runtime, Network, Debugger) are silently cleared.
+  // Metro fires 'bundle_build_done' once the new bundle is ready to run.
+  eventsClient.on('bundle_build_done', async () => {
+    if (!cdpSession.isConnected) return;
+    logger.info('Metro bundle rebuilt — re-enabling CDP domains');
+    await enableCDPDomains();
   });
 
   // Create the plugin context factory
@@ -361,18 +407,20 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
           logger.info(
             `Found existing metro-mcp proxy (PID ${lockData.pid}, port ${lockData.port}) — connecting as secondary`
           );
-          await cdpSession.connectToTarget(targets[0] as unknown as MetroTarget);
-          if (lockData.metroPort) {
-            eventsClient.connect(config.metro.host!, lockData.metroPort);
-            config.metro.port = lockData.metroPort;
-          }
+          // Set active device key BEFORE connecting so plugin event handlers
+          // that fire on the 'reconnected' event can store events immediately.
+          activeDeviceKey = targets[0].id ? `${lockData.port}-${targets[0].id}` : null;
+          activeDeviceName = targets[0].title || targets[0].id || 'secondary';
           // Point devtools plugin at the primary's proxy so open_devtools uses the right port
           (config as Record<string, unknown>).proxy = {
             ...config.proxy,
             port: lockData.port,
           };
-          activeDeviceKey = targets[0].id ? `${lockData.port}-${targets[0].id}` : null;
-          activeDeviceName = targets[0].title || targets[0].id || 'secondary';
+          await cdpSession.connectToTarget(targets[0] as unknown as MetroTarget);
+          if (lockData.metroPort) {
+            eventsClient.connect(config.metro.host!, lockData.metroPort);
+            config.metro.port = lockData.metroPort;
+          }
           return true;
         }
       }
@@ -443,34 +491,41 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
         return false;
       }
 
-      await cdpSession.connectToTarget(target);
-      eventsClient.connect(server.host, server.port);
-
-      // Track active device for per-device buffers
+      // Set active device key BEFORE connecting so plugin event handlers
+      // that fire on the 'reconnected' event can store events immediately.
       activeDeviceKey = `${server.port}-${target.id}`;
       activeDeviceName = target.title || target.deviceName || target.id;
 
       if (supportsMultipleDebuggers(target)) {
+        // RN 0.85+: Metro handles multiple concurrent debugger sessions natively.
+        // No CDPMultiplexer needed — connect directly and skip the proxy.
         logger.info('Target supports multiple debuggers (RN 0.85+) — skipping CDP proxy');
-      } else {
-        if (!cdpMultiplexer && config.proxy?.enabled !== false) {
-          const mux = new CDPMultiplexer(cdpSession, { protectedDomains: ['Runtime', 'Network'] });
-          try {
-            const startedPort = await mux.start(preferredProxyPort);
-            const devtoolsUrl = mux.getDevToolsUrl();
-            logger.info(`CDP proxy started on port ${startedPort}`);
-            if (devtoolsUrl) logger.info(`Chrome DevTools URL: ${devtoolsUrl}`);
-            (config as Record<string, unknown>).proxy = {
-              ...config.proxy,
-              port: startedPort,
-              url: devtoolsUrl,
-            };
-            cdpMultiplexer = mux;
-          } catch (err) {
-            logger.warn('Could not start CDP proxy:', err);
-          }
+      } else if (!cdpMultiplexer && config.proxy?.enabled !== false) {
+        // RN <0.85: start the CDPMultiplexer BEFORE connecting so that the
+        // messageInterceptor is already in place when 'reconnected' fires and
+        // events begin flowing from Metro. Starting it after connectToTarget()
+        // caused a window where events were lost on initial connection.
+        const mux = new CDPMultiplexer(cdpSession, { protectedDomains: ['Runtime', 'Network'] });
+        try {
+          const startedPort = await mux.start(preferredProxyPort);
+          const devtoolsUrl = mux.getDevToolsUrl();
+          logger.info(`CDP proxy started on port ${startedPort}`);
+          if (devtoolsUrl) logger.info(`Chrome DevTools URL: ${devtoolsUrl}`);
+          (config as Record<string, unknown>).proxy = {
+            ...config.proxy,
+            port: startedPort,
+            url: devtoolsUrl,
+          };
+          cdpMultiplexer = mux;
+        } catch (err) {
+          logger.warn('Could not start CDP proxy:', err);
         }
+      }
 
+      await cdpSession.connectToTarget(target);
+      eventsClient.connect(server.host, server.port);
+
+      if (!supportsMultipleDebuggers(target)) {
         const proxyConfig = (config as Record<string, unknown>).proxy as { port?: number } | undefined;
         if (proxyConfig?.port) {
           writeProxyLock(proxyConfig.port, server.port);
@@ -489,15 +544,16 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
   // Schedule a reconnect with exponential backoff, driven from server.ts so we always
   // re-fetch a fresh target URL from Metro's /json endpoint.
   function scheduleReconnect(): void {
-    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-      logger.error('Max reconnection attempts reached, giving up');
-      return;
-    }
     if (reconnectTimer !== null || isReconnecting) return; // already scheduled or in progress
 
-    const delay = RECONNECT_DELAYS[Math.min(reconnectAttempts, RECONNECT_DELAYS.length - 1)];
+    // Use exponential backoff for the initial burst, then fall back to a slow
+    // background probe so the server keeps trying indefinitely (e.g. app started
+    // long after the MCP server).
+    const delay = reconnectAttempts < MAX_BURST_ATTEMPTS
+      ? RECONNECT_DELAYS[Math.min(reconnectAttempts, RECONNECT_DELAYS.length - 1)]
+      : 30000;
     reconnectAttempts++;
-    logger.info(`Reconnecting to Metro in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+    logger.info(`Reconnecting to Metro in ${delay}ms (attempt ${reconnectAttempts})`);
 
     isReconnecting = true;
     reconnectTimer = setTimeout(async () => {
@@ -533,6 +589,11 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
   process.on('SIGTERM', () => { cleanProxyLock(); cdpMultiplexer?.stop(); process.exit(0); });
   process.on('exit', () => { cleanProxyLock(); });
 
-  // Try connecting to Metro (non-blocking — server works without connection)
-  void connectToMetro();
+  // Try connecting to Metro (non-blocking — server works without connection).
+  // If the initial attempt fails before creating any WebSocket (e.g. app not
+  // running yet), no 'disconnected' event fires so scheduleReconnect() would
+  // never be called — trigger it explicitly here so we keep retrying.
+  void connectToMetro().then((connected) => {
+    if (!connected) scheduleReconnect();
+  });
 }
