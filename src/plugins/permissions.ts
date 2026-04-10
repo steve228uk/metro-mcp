@@ -1,6 +1,30 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 
+// Module-level caches — persist across tool handler calls for the lifetime of the server.
+let platformCache: { value: 'ios' | 'android' | null; ts: number } | null = null;
+const PLATFORM_TTL_MS = 5000;
+let bundleIdCache: string | null = null;
+
+function normalizeAndroidPermission(service: string): string {
+  return service.startsWith('android.permission.')
+    ? service
+    : `android.permission.${service.toUpperCase()}`;
+}
+
+const permissionServiceParams = z.object({
+  service: z
+    .string()
+    .describe(
+      'iOS: service name (e.g. "camera", "location"). Android: permission name (e.g. "CAMERA" or "android.permission.CAMERA").'
+    ),
+  platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
+  bundleId: z
+    .string()
+    .optional()
+    .describe('Bundle ID (iOS) or package name (Android). Auto-detected if omitted.'),
+});
+
 export const permissionsPlugin = definePlugin({
   name: 'permissions',
 
@@ -8,37 +32,79 @@ export const permissionsPlugin = definePlugin({
 
   async setup(ctx) {
     async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      try {
-        await ctx.exec('xcrun simctl list booted 2>/dev/null | grep -q Booted');
-        return 'ios';
-      } catch {}
-      try {
-        const output = await ctx.exec('adb devices 2>/dev/null');
-        if (output.trim().split('\n').length > 1) return 'android';
-      } catch {}
-      return null;
+      const now = Date.now();
+      if (platformCache && now - platformCache.ts < PLATFORM_TTL_MS) return platformCache.value;
+      const [iosResult, androidResult] = await Promise.allSettled([
+        ctx.exec('xcrun simctl list booted 2>/dev/null | grep -q Booted'),
+        ctx.exec('adb devices 2>/dev/null'),
+      ]);
+      let platform: 'ios' | 'android' | null = null;
+      if (iosResult.status === 'fulfilled') {
+        platform = 'ios';
+      } else if (androidResult.status === 'fulfilled') {
+        const output = (androidResult as PromiseFulfilledResult<string>).value;
+        if (output.trim().split('\n').length > 1) platform = 'android';
+      }
+      platformCache = { value: platform, ts: now };
+      return platform;
     }
 
     async function detectBundleId(platform: 'ios' | 'android'): Promise<string | null> {
+      if (bundleIdCache) return bundleIdCache;
       const config = ctx.config as Record<string, unknown>;
-      if (platform === 'android' && config.packageName) return String(config.packageName);
-      if (config.bundleId) return String(config.bundleId);
-
+      if (platform === 'android' && config.packageName)
+        return (bundleIdCache = String(config.packageName));
+      if (config.bundleId) return (bundleIdCache = String(config.bundleId));
       try {
         if (ctx.cdp.isConnected) {
           const id = await ctx.evalInApp(
             `(function(){ try { return require('react-native-device-info').getBundleId(); } catch(e) { return null; } })()`,
             { awaitPromise: false }
           );
-          if (id) return String(id);
+          if (id) return (bundleIdCache = String(id));
         }
       } catch {}
-
       return null;
     }
 
-    function resolvePlatform(platform: 'ios' | 'android' | 'auto' | undefined) {
-      return platform === 'auto' || !platform ? detectPlatform() : Promise.resolve(platform);
+    async function resolveTarget(
+      platform: 'ios' | 'android' | 'auto' | undefined,
+      bundleId: string | undefined
+    ): Promise<{ p: 'ios' | 'android'; id: string } | string> {
+      const p = platform === 'auto' || !platform ? await detectPlatform() : platform;
+      if (!p) return 'No simulator/emulator detected.';
+      const id = bundleId || (await detectBundleId(p));
+      if (!id)
+        return 'Bundle ID / package name required. Provide bundleId or ensure the app is running.';
+      return { p, id };
+    }
+
+    function permissionMutationHandler(action: 'grant' | 'revoke') {
+      return async ({ service, platform, bundleId }: z.infer<typeof permissionServiceParams>) => {
+        const resolved = await resolveTarget(platform, bundleId);
+        if (typeof resolved === 'string') return resolved;
+        const { p, id } = resolved;
+        if (p === 'ios') {
+          try {
+            await ctx.exec(`xcrun simctl privacy booted ${action} "${service}" "${id}"`);
+            return action === 'grant'
+              ? `Granted "${service}" permission to ${id} on iOS simulator.`
+              : `Revoked "${service}" permission from ${id} on iOS simulator.`;
+          } catch (err) {
+            return `Failed to ${action} permission: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        } else {
+          const perm = normalizeAndroidPermission(service);
+          try {
+            await ctx.exec(`adb shell pm ${action} "${id}" "${perm}"`);
+            return action === 'grant'
+              ? `Granted "${perm}" to ${id} on Android device.`
+              : `Revoked "${perm}" from ${id} on Android device.`;
+          } catch (err) {
+            return `Failed to ${action} permission: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+      };
     }
 
     ctx.registerTool('list_permissions', {
@@ -53,12 +119,9 @@ export const permissionsPlugin = definePlugin({
           .describe('Bundle ID (iOS) or package name (Android). Auto-detected if omitted.'),
       }),
       handler: async ({ platform, bundleId }) => {
-        const p = await resolvePlatform(platform);
-        if (!p) return 'No simulator/emulator detected.';
-
-        const id = bundleId || (await detectBundleId(p));
-        if (!id)
-          return 'Bundle ID / package name required. Provide bundleId or ensure the app is running.';
+        const resolved = await resolveTarget(platform, bundleId);
+        if (typeof resolved === 'string') return resolved;
+        const { p, id } = resolved;
 
         if (p === 'ios') {
           try {
@@ -78,11 +141,8 @@ export const permissionsPlugin = definePlugin({
           }
         } else {
           try {
-            const output = await ctx.exec(
-              `adb shell dumpsys package "${id}" 2>/dev/null`
-            );
+            const output = await ctx.exec(`adb shell dumpsys package "${id}" 2>/dev/null`);
             const permissions: Record<string, string> = {};
-            // Parse all "android.permission.FOO: granted=true/false" entries
             const permRegex = /(android\.permission\.\w+):\s*granted=(\w+)/g;
             let match;
             while ((match = permRegex.exec(output)) !== null) {
@@ -102,88 +162,16 @@ export const permissionsPlugin = definePlugin({
       description:
         'Grant a permission to the app on the connected iOS simulator or Android emulator.',
       annotations: { destructiveHint: true },
-      parameters: z.object({
-        service: z
-          .string()
-          .describe(
-            'iOS: service name (e.g. "camera", "location"). Android: permission name (e.g. "CAMERA" or "android.permission.CAMERA").'
-          ),
-        platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
-        bundleId: z
-          .string()
-          .optional()
-          .describe('Bundle ID (iOS) or package name (Android). Auto-detected if omitted.'),
-      }),
-      handler: async ({ service, platform, bundleId }) => {
-        const p = await resolvePlatform(platform);
-        if (!p) return 'No simulator/emulator detected.';
-
-        const id = bundleId || (await detectBundleId(p));
-        if (!id) return 'Bundle ID / package name required.';
-
-        if (p === 'ios') {
-          try {
-            await ctx.exec(`xcrun simctl privacy booted grant "${service}" "${id}"`);
-            return `Granted "${service}" permission to ${id} on iOS simulator.`;
-          } catch (err) {
-            return `Failed to grant permission: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        } else {
-          const perm = service.startsWith('android.permission.')
-            ? service
-            : `android.permission.${service.toUpperCase()}`;
-          try {
-            await ctx.exec(`adb shell pm grant "${id}" "${perm}"`);
-            return `Granted "${perm}" to ${id} on Android device.`;
-          } catch (err) {
-            return `Failed to grant permission: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        }
-      },
+      parameters: permissionServiceParams,
+      handler: permissionMutationHandler('grant'),
     });
 
     ctx.registerTool('revoke_permission', {
       description:
         'Revoke a permission from the app on the connected iOS simulator or Android emulator.',
       annotations: { destructiveHint: true },
-      parameters: z.object({
-        service: z
-          .string()
-          .describe(
-            'iOS: service name (e.g. "camera", "location"). Android: permission name (e.g. "CAMERA" or "android.permission.CAMERA").'
-          ),
-        platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
-        bundleId: z
-          .string()
-          .optional()
-          .describe('Bundle ID (iOS) or package name (Android). Auto-detected if omitted.'),
-      }),
-      handler: async ({ service, platform, bundleId }) => {
-        const p = await resolvePlatform(platform);
-        if (!p) return 'No simulator/emulator detected.';
-
-        const id = bundleId || (await detectBundleId(p));
-        if (!id) return 'Bundle ID / package name required.';
-
-        if (p === 'ios') {
-          try {
-            await ctx.exec(`xcrun simctl privacy booted revoke "${service}" "${id}"`);
-            return `Revoked "${service}" permission from ${id} on iOS simulator.`;
-          } catch (err) {
-            return `Failed to revoke permission: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        } else {
-          const perm = service.startsWith('android.permission.')
-            ? service
-            : `android.permission.${service.toUpperCase()}`;
-          try {
-            await ctx.exec(`adb shell pm revoke "${id}" "${perm}"`);
-            return `Revoked "${perm}" from ${id} on Android device.`;
-          } catch (err) {
-            return `Failed to revoke permission: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        }
-      },
+      parameters: permissionServiceParams,
+      handler: permissionMutationHandler('revoke'),
     });
 
     ctx.registerTool('reset_permissions', {
@@ -204,16 +192,14 @@ export const permissionsPlugin = definePlugin({
           .describe('Bundle ID (iOS) or package name (Android). Auto-detected if omitted.'),
       }),
       handler: async ({ service, platform, bundleId }) => {
-        const p = await resolvePlatform(platform);
-        if (!p) return 'No simulator/emulator detected.';
-
-        const id = bundleId || (await detectBundleId(p));
-        if (!id) return 'Bundle ID / package name required.';
+        const resolved = await resolveTarget(platform, bundleId);
+        if (typeof resolved === 'string') return resolved;
+        const { p, id } = resolved;
 
         if (p === 'ios') {
-          const target = service ?? 'all';
+          const iosTarget = service ?? 'all';
           try {
-            await ctx.exec(`xcrun simctl privacy booted reset "${target}" "${id}"`);
+            await ctx.exec(`xcrun simctl privacy booted reset "${iosTarget}" "${id}"`);
             return `Reset ${service ? `"${service}"` : 'all'} permissions for ${id} on iOS simulator.`;
           } catch (err) {
             return `Failed to reset permissions: ${err instanceof Error ? err.message : String(err)}`;
@@ -221,13 +207,11 @@ export const permissionsPlugin = definePlugin({
         } else {
           try {
             if (service) {
-              const perm = service.startsWith('android.permission.')
-                ? service
-                : `android.permission.${service.toUpperCase()}`;
+              const perm = normalizeAndroidPermission(service);
               await ctx.exec(`adb shell pm revoke "${id}" "${perm}"`);
               return `Reset "${perm}" for ${id} on Android device.`;
             } else {
-              // pm reset-permissions is available on newer Android; fall back to pm clear
+              // pm reset-permissions not available on older Android; pm clear resets all app state including permissions
               try {
                 await ctx.exec(`adb shell pm reset-permissions -p "${id}" 2>/dev/null`);
               } catch {
@@ -256,7 +240,7 @@ export const permissionsPlugin = definePlugin({
           ),
       }),
       handler: async ({ platform, bundleId }) => {
-        const p = await resolvePlatform(platform);
+        const p = platform === 'auto' ? await detectPlatform() : platform;
         if (!p) return 'No simulator/emulator detected.';
 
         if (p === 'ios') {
