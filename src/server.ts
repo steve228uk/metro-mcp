@@ -50,6 +50,7 @@ import { inspectPointPlugin } from './plugins/inspect-point.js';
 import { devtoolsPlugin } from './plugins/devtools.js';
 import { permissionsPlugin } from './plugins/permissions.js';
 import { filesystemPlugin } from './plugins/filesystem.js';
+import { environmentPlugin } from './plugins/environment.js';
 
 const logger = createLogger('server');
 
@@ -79,6 +80,7 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   inspectPointPlugin,
   devtoolsPlugin,
   filesystemPlugin,
+  environmentPlugin,
 ];
 
 export async function startServer(config: Required<MetroMCPConfig>): Promise<void> {
