@@ -48,6 +48,13 @@ import { statuslinePlugin } from './plugins/statusline.js';
 import { debugGlobalsPlugin } from './plugins/debug-globals.js';
 import { inspectPointPlugin } from './plugins/inspect-point.js';
 import { devtoolsPlugin } from './plugins/devtools.js';
+import { environmentPlugin } from './plugins/environment.js';
+import { clipboardPlugin } from './plugins/clipboard.js';
+import { permissionsPlugin } from './plugins/permissions.js';
+import { filesystemPlugin } from './plugins/filesystem.js';
+import { animationsPlugin } from './plugins/animations.js';
+import { networkMockPlugin } from './plugins/network-mock.js';
+import { bundleAnalyzerPlugin } from './plugins/bundle-analyzer.js';
 
 const logger = createLogger('server');
 
@@ -75,6 +82,13 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   debugGlobalsPlugin,
   inspectPointPlugin,
   devtoolsPlugin,
+  environmentPlugin,
+  clipboardPlugin,
+  permissionsPlugin,
+  filesystemPlugin,
+  animationsPlugin,
+  networkMockPlugin,
+  bundleAnalyzerPlugin,
 ];
 
 export async function startServer(config: Required<MetroMCPConfig>): Promise<void> {
