@@ -4,7 +4,7 @@ import { definePlugin } from '../plugin.js';
 export const environmentPlugin = definePlugin({
   name: 'environment',
 
-  description: 'Inspect app runtime environment: build flags, platform constants, Metro connection state, and a filtered subset of process.env',
+  description: 'Inspect app runtime environment: build flags, platform constants, and a filtered subset of process.env',
 
   async setup(ctx) {
     ctx.registerTool('get_build_info', {
@@ -14,7 +14,7 @@ export const environmentPlugin = definePlugin({
       parameters: z.object({}),
       handler: async () => {
         try {
-          const result = await ctx.evalInApp(
+          return await ctx.evalInApp(
             `(function() {
   var RN = require('react-native');
   var Platform = RN.Platform;
@@ -34,7 +34,6 @@ export const environmentPlugin = definePlugin({
   return result;
 })()`,
           );
-          return result;
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -56,26 +55,23 @@ export const environmentPlugin = definePlugin({
           .describe('When true, includes credential keys that are otherwise redacted'),
       }),
       handler: async ({ filter, includeAll }) => {
-        const filterStr = filter ?? '';
-        const includeAllBool = includeAll ?? false;
-
         const expression = `(function() {
   var env = typeof process !== 'undefined' ? process.env : {};
   var DENY = /SECRET|KEY|TOKEN|PASSWORD|PASS|PRIVATE|AUTH|CREDENTIAL|DSN/i;
-  var filter = ${JSON.stringify(filterStr)};
-  var includeAll = ${JSON.stringify(includeAllBool)};
+  var filter = ${JSON.stringify(filter ?? '')};
+  var filterLower = filter.toLowerCase();
+  var includeAll = ${JSON.stringify(includeAll)};
   var result = {};
   Object.keys(env).forEach(function(k) {
     if (!includeAll && DENY.test(k)) return;
-    if (filter && k.toLowerCase().indexOf(filter.toLowerCase()) === -1) return;
+    if (filter && !k.toLowerCase().includes(filterLower)) return;
     result[k] = env[k];
   });
   return result;
 })()`;
 
         try {
-          const result = await ctx.evalInApp(expression);
-          return result;
+          return await ctx.evalInApp(expression);
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -88,8 +84,7 @@ export const environmentPlugin = definePlugin({
       parameters: z.object({}),
       handler: async () => {
         try {
-          const result = await ctx.evalInApp(`require('react-native').Platform.constants`);
-          return result;
+          return await ctx.evalInApp(`require('react-native').Platform.constants`);
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
@@ -103,7 +98,7 @@ export const environmentPlugin = definePlugin({
       parameters: z.object({}),
       handler: async () => {
         try {
-          const result = await ctx.evalInApp(
+          return await ctx.evalInApp(
             `(function() {
   try {
     return require('expo-constants').default.expoConfig ||
@@ -111,7 +106,6 @@ export const environmentPlugin = definePlugin({
   } catch(e) { return null; }
 })()`,
           );
-          return result;
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
