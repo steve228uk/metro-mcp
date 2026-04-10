@@ -4,23 +4,23 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 
 ## Console
 
-- **`get_console_logs`** — Get recent console output. Filter by `level` (log/warn/error/info/debug), `search` text, `limit`. Supports `summary` and `compact` modes.
+- **`get_console_logs`** — Get recent console output. Filter by `level` (log/warn/error/info/debug), `search` text, `limit`. Use `since` (Unix ms timestamp) to fetch only new entries. Supports `summary` mode. Output format: `HH:MM:SS.mmm [level] message`.
 - **`clear_console_logs`** — Clear the log buffer.
 
 ## Network
 
 ### Request Tracking
 
-- **`get_network_requests`** — Get buffered HTTP requests with method, URL, status, timing. Supports `device` param for per-device filtering.
+- **`get_network_requests`** — Get buffered HTTP requests with method, URL, status, timing. Use `since` (Unix ms timestamp) to fetch only new entries. Supports `device` param for per-device filtering. Output format: `HH:MM:SS.mmm METHOD URL → STATUS (duration, size)`.
 - **`get_request_details`** — Get full headers for a specific request by URL.
-- **`get_response_body`** — Get the response body for a specific request. Bodies under 1 MB are eagerly cached and survive reconnections; larger bodies are fetched on demand from the current CDP session.
-- **`search_network`** — Filter by URL pattern, method, status code, or errors only.
+- **`get_response_body`** — Get response body for a network request (cached if small; requires active session if large).
+- **`search_network`** — Filter by URL pattern, method, status code, or errors only. Use `limit` to cap results (default 20).
 - **`get_network_stats`** — Aggregated network statistics: breakdown by domain, status code distribution, response time percentiles (p50/p95/p99), and slowest endpoints.
 - **`clear_network_requests`** — Clear the network request buffer.
 
 ## Errors
 
-- **`get_errors`** — Get uncaught exceptions with symbolicated stack traces.
+- **`get_errors`** — Get uncaught exceptions with symbolicated stack traces. Use `since` (Unix ms timestamp) to fetch only new entries. Output format: `HH:MM:SS.mmm Message\nStack`.
 - **`clear_errors`** — Clear the error buffer.
 
 ## Evaluate
@@ -159,23 +159,25 @@ Records real user interactions via React fiber patching — no app code changes 
 
 ## Token-Efficient Output
 
-All tools support modifiers to reduce context window usage:
+Console, network, and error tools always output compact single-line text with short timestamps (`HH:MM:SS.mmm`) rather than JSON objects. All JSON responses are minified.
 
-| Modifier | Effect |
-|----------|--------|
-| `summary: true` | Counts + last N items |
-| `structureOnly: true` | Component tree without props/state (~1-3KB) |
-| `compact: true` | Single-line compressed format (30–50% smaller) |
-| `maxLength: number` | Truncate long values |
-| `limit: number` | Cap number of results |
+Additional modifiers to reduce context window usage:
+
+| Modifier | Applies To | Effect |
+|----------|------------|--------|
+| `since: number` | Console, Network, Errors | Only return entries after this Unix timestamp (ms) — pass the last seen entry's timestamp to avoid re-fetching already-seen data |
+| `summary: true` | Console, Network, Errors | One-line summary with counts instead of full output |
+| `structureOnly: true` | Components | Component tree without props/state (~1-3KB) |
+| `compact: true` | Components, Navigation, Redux | Single-line compressed format |
+| `limit: number` | Most tools | Cap number of results |
 
 ## Resources
 
 | URI | Description |
 |-----|-------------|
-| `metro://logs` | Live console log stream |
-| `metro://network` | Live network request stream |
-| `metro://errors` | Live error stream |
+| `metro://logs` | Live console log stream (plain text, compact format) |
+| `metro://network` | Live network request stream (plain text, compact format) |
+| `metro://errors` | Live error stream (plain text, compact format) |
 | `metro://status` | Connection status |
 | `metro://redux/state` | Redux state snapshot |
 | `metro://navigation` | Navigation state |
