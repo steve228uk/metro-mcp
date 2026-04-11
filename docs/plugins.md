@@ -5,7 +5,7 @@ metro-mcp is plugin-based. You can extend it with local files or npm packages.
 ## Creating a plugin
 
 ```typescript
-import { definePlugin } from 'metro-mcp/plugin';
+import { definePlugin } from 'metro-mcp';
 import { z } from 'zod';
 
 export default definePlugin({
