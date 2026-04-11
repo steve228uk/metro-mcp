@@ -114,6 +114,7 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 | **automation** | 3 | Wait/polling helpers for async state changes |
 | **profiler** | 9 | CPU profiling (React DevTools hook) + heap sampling + render tracking |
 | **test-recorder** | 7 | Record interactions and generate Appium, Maestro, or Detox tests |
+| **filesystem** | 5 | Browse and read files in app sandbox directories (Documents, caches, SQLite DBs) |
 | **devtools** | 1 | Open Chrome DevTools alongside the MCP via CDP proxy |
 | **debug-globals** | 1 | Auto-discover Redux stores, Apollo Client, and other debug globals |
 | **inspect-point** | 1 | Coordinate-based React component inspection (experimental) |

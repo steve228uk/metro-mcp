@@ -1,6 +1,6 @@
 # Tools Reference
 
-Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Evaluate](#evaluate) · [Device](#device) · [Redux](#redux) · [Components](#components) · [Storage](#storage) · [Bundle](#bundle) · [Simulator](#simulator) · [Deep Link](#deep-link) · [Permissions](#permissions) · [UI Interact](#ui-interact) · [Navigation](#navigation) · [Accessibility](#accessibility) · [Profiler](#profiler) · [Test Recorder](#test-recorder) · [Commands](#commands) · [Resources](#resources) · [Prompts](#prompts)
+Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Evaluate](#evaluate) · [Device](#device) · [Redux](#redux) · [Components](#components) · [Storage](#storage) · [Bundle](#bundle) · [Simulator](#simulator) · [Filesystem](#filesystem) · [Deep Link](#deep-link) · [Permissions](#permissions) · [UI Interact](#ui-interact) · [Navigation](#navigation) · [Accessibility](#accessibility) · [Profiler](#profiler) · [Test Recorder](#test-recorder) · [Commands](#commands) · [Resources](#resources) · [Prompts](#prompts)
 
 ## Console
 
@@ -76,6 +76,20 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 - **`get_native_logs`** — Native logs (iOS syslog / Android logcat).
 - **`app_lifecycle`** — Launch, terminate, install, uninstall apps.
 - **`get_screen_orientation`** — Get current orientation.
+
+## Filesystem
+
+Browse and read files inside the app's private sandbox. Useful for inspecting SQLite databases, MMKV stores, exported files, and cached data — without needing a rooted device or custom app code.
+
+- **`get_app_directories`** — Return absolute paths for the app's known directories: `root`, `documents`, `library`, `cache`, `temp`. iOS requires `bundleId`; Android falls back to `evalInApp` via expo-file-system / react-native-fs if `bundleId` is omitted.
+- **`list_directory`** — List files and subdirectories at a path. Returns compact text — one entry per line with type (`d`/`f`), size, modified date, and name; directories have a trailing `/`. Pass `recursive: true` for a full tree (raw text). Call `get_app_directories` first to get the root path.
+- **`read_file`** — Read file contents with a configurable byte cap (default 50 KB, hard cap 1 MB). Returns the file content as a plain string, or `{ content, truncated: true }` when the cap was reached. Use `encoding: 'base64'` for binary files (SQLite, images, MMKV). Params: `path`, `bundleId` (Android), `encoding`, `maxBytes`.
+- **`get_file_info`** — Get metadata for a single file or directory. Returns a compact single-line string: type (`d`/`f`), size, modified date, and name.
+- **`delete_file`** *(destructive)* — Delete a file. Requires `confirm: true` to prevent accidental deletion.
+
+> **Platform notes**
+> - **iOS Simulator**: uses `xcrun simctl get_app_container` to resolve the sandbox root, then `ls`/`head` on the host.
+> - **Android**: uses `adb shell run-as <packageName>` for app-private directories; public storage paths can be read without `bundleId`.
 
 ## Deep Link
 
