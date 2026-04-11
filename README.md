@@ -100,6 +100,7 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 | **errors** | 3 | Runtime exception collection + Metro bundle error detection |
 | **evaluate** | 1 | Execute JavaScript in the app runtime |
 | **device** | 4 | Device management, connection status, and app reload |
+| **environment** | 4 | Build flags, platform constants, env vars, and Expo config inspection |
 | **source** | 1 | Stack trace symbolication |
 | **redux** | 3 | Redux state inspection and action dispatch |
 | **components** | 5 | React component tree inspection |
