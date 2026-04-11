@@ -1,6 +1,6 @@
 # Tools Reference
 
-Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Evaluate](#evaluate) · [Device](#device) · [Redux](#redux) · [Components](#components) · [Storage](#storage) · [Bundle](#bundle) · [Simulator](#simulator) · [Filesystem](#filesystem) · [Deep Link](#deep-link) · [Permissions](#permissions) · [UI Interact](#ui-interact) · [Navigation](#navigation) · [Accessibility](#accessibility) · [Profiler](#profiler) · [Test Recorder](#test-recorder) · [Commands](#commands) · [Resources](#resources) · [Prompts](#prompts)
+Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Evaluate](#evaluate) · [Device](#device) · [Environment](#environment) · [Redux](#redux) · [Components](#components) · [Storage](#storage) · [Bundle](#bundle) · [Simulator](#simulator) · [Filesystem](#filesystem) · [Deep Link](#deep-link) · [Permissions](#permissions) · [UI Interact](#ui-interact) · [Navigation](#navigation) · [Accessibility](#accessibility) · [Profiler](#profiler) · [Test Recorder](#test-recorder) · [Commands](#commands) · [Resources](#resources) · [Prompts](#prompts)
 
 ## Console
 
@@ -33,6 +33,13 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 - **`get_app_info`** — Bundle URL, platform, device name, VM type.
 - **`get_connection_status`** — CDP connection state and Metro status.
 - **`reload_app`** — Reload the app. Tries Metro's HTTP reload endpoint first, then falls back to `DevSettings.reload()` via CDP.
+
+## Environment
+
+- **`get_build_info`** — Return build-time and runtime flags: `__DEV__`, platform, OS version, React Native version, Hermes engine status, New Architecture flag, and expo-application fields (`bundleId`, `appVersion`, `buildNumber`) when available.
+- **`get_env_vars`** — Return a filtered subset of `process.env` from the running app. Credential-like keys (`SECRET`, `KEY`, `TOKEN`, `PASSWORD`, etc.) are redacted by default. Params: `filter` (key name substring), `includeAll` (include redacted keys).
+- **`get_platform_constants`** — Return the full `Platform.constants` object from React Native, including OS-specific build details and `reactNativeVersion`.
+- **`get_expo_config`** — Return `expo-constants` manifest / `expoConfig` fields if the app uses Expo, otherwise `null`. Skips internal fields (`plugins`, `hooks`, `_internal`, etc.).
 
 ## Source
 
