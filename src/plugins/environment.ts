@@ -16,20 +16,25 @@ export const environmentPlugin = definePlugin({
         try {
           return await ctx.evalInApp(
             `(function() {
-  var RN = require('react-native');
-  var Platform = RN.Platform;
+  var constants = nativeModuleProxy.PlatformConstants.getConstants();
+  var systemName = constants.systemName || '';
   var result = {
     isDev: typeof __DEV__ !== 'undefined' ? __DEV__ : null,
-    platform: Platform.OS,
-    version: Platform.Version,
+    platform: systemName.toLowerCase() === 'ios' ? 'ios' : 'android',
+    version: constants.osVersion,
     hermesEnabled: typeof HermesInternal !== 'undefined',
     newArch: typeof nativeFabricUIManager !== 'undefined',
   };
   try {
-    var Application = require('expo-application');
-    result.bundleId = Application.applicationId;
-    result.appVersion = Application.nativeApplicationVersion;
-    result.buildNumber = Application.nativeBuildVersion;
+    var app = nativeModuleProxy.ExpoApplication;
+    if (app && app.getConstants) {
+      var appC = app.getConstants();
+      if (appC) {
+        result.bundleId = appC.applicationId;
+        result.appVersion = appC.nativeApplicationVersion;
+        result.buildNumber = appC.nativeBuildVersion;
+      }
+    }
   } catch(e) {}
   return result;
 })()`,
@@ -84,7 +89,7 @@ export const environmentPlugin = definePlugin({
       parameters: z.object({}),
       handler: async () => {
         try {
-          return await ctx.evalInApp(`require('react-native').Platform.constants`);
+          return await ctx.evalInApp(`nativeModuleProxy.PlatformConstants.getConstants()`);
         } catch (err) {
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }
