@@ -52,18 +52,11 @@ export const filesystemPlugin = definePlugin({
       return out.trim();
     }
 
-    interface FileEntry {
-      name: string;
-      path: string;
-      isDirectory: boolean;
-      size: number;
-      modified: string;
-    }
-
-    // Parse `ls -la` output (macOS or Android busybox) into structured entries.
-    function parseLsOutput(output: string, parentPath: string): FileEntry[] {
-      const base = parentPath.replace(/\/$/, '');
-      const entries: FileEntry[] = [];
+    // Parse `ls -la` output (macOS or Android busybox) into a compact text listing.
+    // Format: `d`/`f` + padded size + modified + name (dirs get trailing `/`).
+    // First line is `# parentPath` so the AI can reconstruct full paths.
+    function parseLsOutput(output: string, parentPath: string): string {
+      const lines: string[] = [`# ${parentPath}`];
       for (const line of output.trim().split('\n')) {
         if (!line.trim() || line.startsWith('total ')) continue;
         const match = line.match(
@@ -72,33 +65,22 @@ export const filesystemPlugin = definePlugin({
         if (!match) continue;
         const [, perms, sizeStr, modified, name] = match;
         if (name === '.' || name === '..') continue;
-        entries.push({
-          name,
-          path: `${base}/${name}`,
-          isDirectory: perms.startsWith('d'),
-          size: parseInt(sizeStr, 10),
-          modified,
-        });
+        const type = perms.startsWith('d') ? 'd' : 'f';
+        lines.push(`${type}  ${sizeStr.padStart(7)}  ${modified}  ${name}${type === 'd' ? '/' : ''}`);
       }
-      return entries;
+      return lines.join('\n');
     }
 
-    // Parse a single `ls -lad` line; uses itemPath for name/path since lad
-    // shows the full path in the name column rather than just the basename.
-    function parseFileInfoLine(output: string, itemPath: string): FileEntry | null {
+    // Parse a single `ls -lad` line into a compact text entry.
+    function parseFileInfoLine(output: string, itemPath: string): string | null {
       for (const line of output.trim().split('\n')) {
         if (!line.trim() || line.startsWith('total ')) continue;
         const match = line.match(LS_LINE_RE);
         if (!match) continue;
         const [, perms, sizeStr, modified] = match;
         const name = itemPath.split('/').filter(Boolean).pop() ?? itemPath;
-        return {
-          name,
-          path: itemPath,
-          isDirectory: perms.startsWith('d'),
-          size: parseInt(sizeStr, 10),
-          modified,
-        };
+        const type = perms.startsWith('d') ? 'd' : 'f';
+        return `${type}  ${parseInt(sizeStr, 10).toString().padStart(7)}  ${modified}  ${name}${type === 'd' ? '/' : ''}`;
       }
       return null;
     }
@@ -237,7 +219,7 @@ export const filesystemPlugin = definePlugin({
               ? await ctx.exec(`ls ${flags} "${targetPath}" 2>&1`)
               : await ctx.exec(`adb shell ${runAs(bundleId)}ls ${flags} "${targetPath}" 2>&1`);
 
-          if (recursive) return { path: targetPath, raw: output };
+          if (recursive) return output;
           return parseLsOutput(output, targetPath);
         } catch (err) {
           return {
@@ -292,7 +274,10 @@ export const filesystemPlugin = definePlugin({
                 : await ctx.exec(`adb shell ${ra}dd if="${path}" bs=${limit} count=1 2>/dev/null`);
           }
 
-          return { path, content, encoding, bytesLimitApplied: limit };
+          const truncated = encoding === 'base64'
+            ? content.length >= Math.ceil(limit / 3) * 4
+            : content.length >= limit;
+          return truncated ? { content, truncated: true } : content;
         } catch (err) {
           return {
             error: `Failed to read file: ${err instanceof Error ? err.message : String(err)}`,
@@ -325,7 +310,7 @@ export const filesystemPlugin = definePlugin({
               : await ctx.exec(`adb shell ${runAs(bundleId)}ls -lad "${path}" 2>&1`);
 
           const info = parseFileInfoLine(output, path);
-          return info ?? { path, raw: output.trim() };
+          return info ?? output.trim();
         } catch (err) {
           return {
             error: `Failed to get file info: ${err instanceof Error ? err.message : String(err)}`,

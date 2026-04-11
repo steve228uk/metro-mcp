@@ -82,9 +82,9 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 Browse and read files inside the app's private sandbox. Useful for inspecting SQLite databases, MMKV stores, exported files, and cached data — without needing a rooted device or custom app code.
 
 - **`get_app_directories`** — Return absolute paths for the app's known directories: `root`, `documents`, `library`, `cache`, `temp`. iOS requires `bundleId`; Android falls back to `evalInApp` via expo-file-system / react-native-fs if `bundleId` is omitted.
-- **`list_directory`** — List files and subdirectories at a path. Returns structured entries (`name`, `path`, `isDirectory`, `size`, `modified`). Pass `recursive: true` for a full tree (returned as raw text). Call `get_app_directories` first to get the root path.
-- **`read_file`** — Read file contents with a configurable byte cap (default 50 KB, hard cap 1 MB). Use `encoding: 'base64'` for binary files (SQLite, images, MMKV). Params: `path`, `bundleId` (Android), `encoding`, `maxBytes`.
-- **`get_file_info`** — Get metadata for a single file or directory: `size`, `modified`, `isDirectory`.
+- **`list_directory`** — List files and subdirectories at a path. Returns compact text — one entry per line with type (`d`/`f`), size, modified date, and name; directories have a trailing `/`. Pass `recursive: true` for a full tree (raw text). Call `get_app_directories` first to get the root path.
+- **`read_file`** — Read file contents with a configurable byte cap (default 50 KB, hard cap 1 MB). Returns the file content as a plain string, or `{ content, truncated: true }` when the cap was reached. Use `encoding: 'base64'` for binary files (SQLite, images, MMKV). Params: `path`, `bundleId` (Android), `encoding`, `maxBytes`.
+- **`get_file_info`** — Get metadata for a single file or directory. Returns a compact single-line string: type (`d`/`f`), size, modified date, and name.
 - **`delete_file`** *(destructive)* — Delete a file. Requires `confirm: true` to prevent accidental deletion.
 
 > **Platform notes**
