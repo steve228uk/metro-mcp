@@ -16,19 +16,24 @@ Usage:
   metro-mcp [options]
 
 Options:
-  --host, -H <host>    Metro host (default: localhost, env: METRO_HOST)
-  --port, -p <port>    Metro port (default: 8081, env: METRO_PORT)
-  --intercept-fetch    Enable fetch interception for network tracking
-  --help               Show this help message
+  --host, -H <host>       Metro host (default: localhost, env: METRO_HOST)
+  --port, -p <port>       Metro port (default: 8081, env: METRO_PORT)
+  --config, -c <path>     Path to config file (env: METRO_MCP_CONFIG)
+  --plugin <path>         Load a plugin (repeatable, env: METRO_MCP_PLUGINS)
+  --help                  Show this help message
 
 Environment Variables:
-  METRO_HOST           Metro bundler host
-  METRO_PORT           Metro bundler port
-  DEBUG                Enable debug logging
+  METRO_HOST              Metro bundler host
+  METRO_PORT              Metro bundler port
+  METRO_MCP_CONFIG        Path to config file (absolute or relative to CWD)
+  METRO_MCP_PLUGINS       Colon-separated plugin paths
+  DEBUG                   Enable debug logging
 
 Examples:
   metro-mcp
   metro-mcp --port 19000
+  metro-mcp --config /path/to/metro-mcp.config.ts
+  METRO_MCP_CONFIG=/path/to/metro-mcp.config.ts metro-mcp
   METRO_PORT=8082 metro-mcp
 `);
     process.exit(0);
@@ -37,7 +42,7 @@ Examples:
   try {
     const config = await loadConfig(args);
     logger.info(`Starting metro-mcp (Metro: ${config.metro.host}:${config.metro.port})`);
-    await startServer(config);
+    await startServer(config, args);
   } catch (err) {
     logger.error('Fatal error:', err);
     process.exit(1);

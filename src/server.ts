@@ -1,9 +1,10 @@
 import { exec } from 'child_process';
+import { resolve } from 'node:path';
 import { promisify } from 'util';
 import fs from 'fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { SubscribeRequestSchema, UnsubscribeRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { SubscribeRequestSchema, UnsubscribeRequestSchema, RootsListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const execAsync = promisify(exec);
 import { z } from 'zod';
@@ -18,6 +19,7 @@ import type {
 } from './plugin.js';
 import { CDPSession, CDPMultiplexer, scanMetroPorts, selectBestTarget, fetchTargets, supportsMultipleDebuggers } from 'metro-bridge';
 import type { MetroTarget } from 'metro-bridge';
+import { loadConfig } from './config.js';
 import { MetroEventsClient } from './metro/events.js';
 import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
@@ -83,7 +85,7 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   environmentPlugin,
 ];
 
-export async function startServer(config: Required<MetroMCPConfig>): Promise<void> {
+export async function startServer(config: Required<MetroMCPConfig>, args: string[] = []): Promise<void> {
   const mcpServer = new McpServer(
     {
       name: 'metro-mcp',
@@ -205,8 +207,12 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     await enableCDPDomains();
   });
 
+  // Tracks all plugin registrations (tools, resources, prompts) so they can be
+  // removed and re-registered when the active project root changes.
+  const registrations: Array<{ remove: () => void }> = [];
+
   // Create the plugin context factory
-  function createPluginContext(plugin: PluginDefinition): PluginContext {
+  function createPluginContext(plugin: PluginDefinition, cfg: Required<MetroMCPConfig>): PluginContext {
     const pluginLogger = createLogger(plugin.name);
     return {
       cdp: cdpSession,
@@ -217,7 +223,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
             ? (toolConfig.parameters as z.ZodObject<z.ZodRawShape>).shape
             : { input: toolConfig.parameters };
 
-          mcpServer.registerTool(
+          const registration = mcpServer.registerTool(
             name,
             {
               description: toolConfig.description,
@@ -246,6 +252,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
               }
             }
           );
+          registrations.push(registration);
           pluginLogger.debug(`Registered tool: ${name}`);
         } catch (err) {
           pluginLogger.error(`Failed to register tool ${name}:`, err);
@@ -253,7 +260,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
       },
       registerResource: (uri: string, resourceConfig: ResourceConfig) => {
         try {
-          mcpServer.resource(
+          const registration = mcpServer.resource(
             resourceConfig.name,
             uri,
             { description: resourceConfig.description, mimeType: resourceConfig.mimeType || 'application/json' },
@@ -262,6 +269,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
               return { contents: [{ uri, text: content, mimeType: resourceConfig.mimeType || 'application/json' }] };
             }
           );
+          registrations.push(registration);
           pluginLogger.debug(`Registered resource: ${uri}`);
         } catch (err) {
           pluginLogger.error(`Failed to register resource ${uri}:`, err);
@@ -276,7 +284,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
               argsShape[arg.name] = arg.required ? z.string() : z.string().optional();
             }
           }
-          mcpServer.prompt(
+          const registration = mcpServer.prompt(
             name,
             promptConfig.description,
             argsShape,
@@ -290,6 +298,7 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
               };
             }
           );
+          registrations.push(registration);
           pluginLogger.debug(`Registered prompt: ${name}`);
         } catch (err) {
           pluginLogger.error(`Failed to register prompt ${name}:`, err);
@@ -342,13 +351,13 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
           throw err;
         }
       },
-      config: config as unknown as Record<string, unknown>,
+      config: cfg as unknown as Record<string, unknown>,
       logger: pluginLogger,
       metro: {
-        host: config.metro.host!,
-        port: config.metro.port!,
+        host: cfg.metro.host!,
+        port: cfg.metro.port!,
         fetch: async (path: string) => {
-          return fetch(`http://${config.metro.host}:${config.metro.port}${path}`);
+          return fetch(`http://${cfg.metro.host}:${cfg.metro.port}${path}`);
         },
       },
       exec: async (command: string) => {
@@ -362,33 +371,44 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
     };
   }
 
-  // Load and initialize all plugins
-  const allPlugins = [...BUILT_IN_PLUGINS];
+  // Load and initialize all plugins. Clears existing registrations first so this
+  // can be called again when the active project root changes.
+  async function initPlugins(cfg: Required<MetroMCPConfig>, rootPath?: string): Promise<void> {
+    // Remove all existing tool/resource/prompt registrations
+    for (const reg of registrations) {
+      try { reg.remove(); } catch { /* ignore */ }
+    }
+    registrations.length = 0;
 
-  // Load external plugins from config
-  for (const pluginPath of config.plugins) {
-    try {
-      const mod = await import(pluginPath);
-      const plugin: PluginDefinition = mod.default || mod;
-      if (plugin?.name && typeof plugin?.setup === 'function') {
-        allPlugins.push(plugin);
-        logger.info(`Loaded external plugin: ${plugin.name}`);
+    const baseDir = rootPath ?? process.cwd();
+    const allPlugins = [...BUILT_IN_PLUGINS];
+
+    for (const pluginPath of cfg.plugins) {
+      try {
+        const resolvedPath = pluginPath.startsWith('.') ? resolve(baseDir, pluginPath) : pluginPath;
+        const mod = await import(resolvedPath);
+        const plugin: PluginDefinition = mod.default || mod;
+        if (plugin?.name && typeof plugin?.setup === 'function') {
+          allPlugins.push(plugin);
+          logger.info(`Loaded external plugin: ${plugin.name}`);
+        }
+      } catch (err) {
+        logger.error(`Failed to load plugin ${pluginPath}:`, err);
       }
-    } catch (err) {
-      logger.error(`Failed to load plugin ${pluginPath}:`, err);
+    }
+
+    for (const plugin of allPlugins) {
+      try {
+        const ctx = createPluginContext(plugin, cfg);
+        await plugin.setup(ctx);
+        logger.debug(`Initialized plugin: ${plugin.name}`);
+      } catch (err) {
+        logger.error(`Failed to initialize plugin ${plugin.name}:`, err);
+      }
     }
   }
 
-  // Initialize plugins
-  for (const plugin of allPlugins) {
-    try {
-      const ctx = createPluginContext(plugin);
-      await plugin.setup(ctx);
-      logger.debug(`Initialized plugin: ${plugin.name}`);
-    } catch (err) {
-      logger.error(`Failed to initialize plugin ${plugin.name}:`, err);
-    }
-  }
+  await initPlugins(config);
 
   // Singleton proxy lock — prevents multiple metro-mcp instances from competing
   // for Metro's single CDP WebSocket, which causes a connect/disconnect spam loop.
@@ -589,6 +609,38 @@ export async function startServer(config: Required<MetroMCPConfig>): Promise<voi
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
   logger.info('MCP server started');
+
+  // Reload config + plugins from the client's active project root. A concurrency
+  // guard prevents interleaved runs if roots-changed fires while a reload is already
+  // in progress (IDE batch-sends notifications on project switch).
+  let reloadInProgress = false;
+  async function reloadFromRoots(suppressErrors = false): Promise<void> {
+    if (reloadInProgress) return;
+    reloadInProgress = true;
+    try {
+      const { roots } = await mcpServer.server.listRoots();
+      const firstRoot = roots[0];
+      if (!firstRoot) return;
+      const rootPath = new URL(firstRoot.uri).pathname;
+      logger.info(`Reloading plugins from: ${rootPath}`);
+      const newConfig = await loadConfig(args, rootPath);
+      await initPlugins(newConfig, rootPath);
+      logger.info(`Plugins reloaded for: ${rootPath}`);
+    } catch (err) {
+      if (!suppressErrors) logger.error('Failed to reload plugins on roots change:', err);
+    } finally {
+      reloadInProgress = false;
+    }
+  }
+
+  // Reload all plugins when the client's active project root changes.
+  // This lets a single global metro-mcp install automatically pick up the
+  // metro-mcp.config.ts from whichever project the user is working in.
+  mcpServer.server.setNotificationHandler(RootsListChangedNotificationSchema, () => reloadFromRoots());
+
+  // On first client connection, load config from the initial project root (if any).
+  // This handles the case where the user opens an IDE with a project already open.
+  mcpServer.server.oninitialized = () => reloadFromRoots(true);
 
   // Clean up on shutdown
   process.on('SIGINT', () => { cleanProxyLock(); cdpMultiplexer?.stop(); process.exit(0); });

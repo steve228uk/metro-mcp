@@ -67,3 +67,30 @@ export default defineConfig({
 ```
 
 npm packages use the `metro-mcp-plugin-*` naming convention.
+
+## Loading plugins without a config file
+
+Load plugins via CLI or env var — useful for global installs where auto-discovery of a project config file isn't reliable:
+
+```bash
+# Single plugin
+bunx metro-mcp --plugin ./my-plugin.ts
+
+# Multiple plugins (colon-separated env var)
+METRO_MCP_PLUGINS=./plugin-a.ts:metro-mcp-plugin-foo bunx metro-mcp
+```
+
+In an MCP server config:
+
+```json
+{
+  "mcpServers": {
+    "metro-mcp": {
+      "command": "bunx",
+      "args": ["metro-mcp", "--plugin", "./my-plugin.ts"]
+    }
+  }
+}
+```
+
+Plugins specified this way are appended after any plugins defined in the config file.

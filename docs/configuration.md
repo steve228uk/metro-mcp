@@ -6,6 +6,8 @@
 |----------|---------|-------------|
 | `METRO_HOST` | `localhost` | Metro bundler host |
 | `METRO_PORT` | `8081` | Metro bundler port |
+| `METRO_MCP_CONFIG` | — | Path to config file (absolute or relative to CWD) |
+| `METRO_MCP_PLUGINS` | — | Colon-separated plugin paths to load (e.g. `./my-plugin.ts:metro-mcp-plugin-foo`) |
 | `METRO_MCP_PROXY_ENABLED` | `true` | Enable the CDP proxy for Chrome DevTools coexistence |
 | `METRO_MCP_PROXY_PORT` | `0` (random) | Fixed port for the CDP proxy. Use `0` for a random available port |
 | `DEBUG` | — | Enable debug logging |
@@ -20,12 +22,48 @@ bunx metro-mcp --host 192.168.1.100 --port 19000
 
 | Argument | Description |
 |----------|-------------|
-| `--host`, `-h` | Metro bundler host |
+| `--host`, `-H` | Metro bundler host |
 | `--port`, `-p` | Metro bundler port |
+| `--config`, `-c` | Path to config file (overrides `METRO_MCP_CONFIG`) |
+| `--plugin` | Load a plugin by path (repeatable) |
 
 ## Config File
 
-Create `metro-mcp.config.ts` in your project root:
+metro-mcp loads `metro-mcp.config.ts` (or `.js`) from the **current working directory** at startup.
+
+::: tip TypeScript vs JavaScript
+`metro-mcp.config.ts` only works when running via `bunx` (Bun runtime). Use `metro-mcp.config.js` if running via `npx` / Node.js.
+:::
+
+**For global MCP installs** (the typical setup in Claude Code and Cursor), the server's CWD is not reliably set to your project root. Specify the config path explicitly instead:
+
+```json
+{
+  "mcpServers": {
+    "metro-mcp": {
+      "command": "bunx",
+      "args": ["metro-mcp"],
+      "env": { "METRO_MCP_CONFIG": "/Users/you/my-project/metro-mcp.config.ts" }
+    }
+  }
+}
+```
+
+Or via CLI when adding the MCP server:
+
+```bash
+claude mcp add metro-mcp -- bunx metro-mcp --config /Users/you/my-project/metro-mcp.config.ts
+```
+
+Run with `DEBUG=1` to see exactly where the server is looking for config:
+
+```bash
+DEBUG=1 bunx metro-mcp
+# logs: Config search CWD: /some/path
+# logs: Loaded config from /full/path/metro-mcp.config.ts
+```
+
+Create the config file:
 
 ```typescript
 import { defineConfig } from 'metro-mcp';
