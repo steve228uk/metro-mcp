@@ -70,7 +70,7 @@ npm packages use the `metro-mcp-plugin-*` naming convention.
 
 ## Loading plugins without a config file
 
-Load plugins via CLI or env var — useful for global installs where auto-discovery of a project config file isn't reliable:
+Load plugins via CLI or env var — useful when you want to load a plugin without creating a config file, or for clients that don't support MCP roots:
 
 ```bash
 # Single plugin

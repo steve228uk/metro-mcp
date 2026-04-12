@@ -41,24 +41,17 @@ Or use the one-click install buttons:
 
 ### With a config file
 
-For global MCP installs (the typical setup), the server's CWD is not reliably set to your project root, so pass the config path explicitly:
+In Claude Code, Cursor, and VS Code, metro-mcp automatically discovers `metro-mcp.config.ts` (or `.js`) from your project root — no extra configuration needed. Just add the file and it will be picked up.
+
+```bash
+# Install metro-mcp as usual
+claude mcp add metro-mcp -- bunx metro-mcp
+```
+
+If your client doesn't support MCP roots, pass the config path explicitly:
 
 ```bash
 claude mcp add metro-mcp -- bunx metro-mcp --config /Users/you/my-project/metro-mcp.config.ts
-```
-
-Or set it via `METRO_MCP_CONFIG` in your MCP server config (useful in Cursor / VS Code):
-
-```json
-{
-  "mcpServers": {
-    "metro-mcp": {
-      "command": "bunx",
-      "args": ["metro-mcp"],
-      "env": { "METRO_MCP_CONFIG": "/Users/you/my-project/metro-mcp.config.ts" }
-    }
-  }
-}
 ```
 
 See [Configuration](/configuration) for all options.

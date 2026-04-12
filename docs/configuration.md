@@ -29,13 +29,13 @@ bunx metro-mcp --host 192.168.1.100 --port 19000
 
 ## Config File
 
-metro-mcp loads `metro-mcp.config.ts` (or `.js`) from the **current working directory** at startup.
+metro-mcp looks for `metro-mcp.config.ts` (or `.js`) in your project root. In **Claude Code, Cursor, and VS Code**, the project root is discovered automatically via MCP roots — no path configuration needed.
 
 ::: tip TypeScript vs JavaScript
 `metro-mcp.config.ts` only works when running via `bunx` (Bun runtime). Use `metro-mcp.config.js` if running via `npx` / Node.js.
 :::
 
-**For global MCP installs** (the typical setup in Claude Code and Cursor), the server's CWD is not reliably set to your project root. Specify the config path explicitly instead:
+If your client doesn't support MCP roots, or you want to point at a config in a non-standard location, pass the path explicitly:
 
 ```json
 {
@@ -49,7 +49,7 @@ metro-mcp loads `metro-mcp.config.ts` (or `.js`) from the **current working dire
 }
 ```
 
-Or via CLI when adding the MCP server:
+Or via CLI:
 
 ```bash
 claude mcp add metro-mcp -- bunx metro-mcp --config /Users/you/my-project/metro-mcp.config.ts
