@@ -2,26 +2,12 @@
 import { ref, computed } from 'vue'
 import { data as plugins } from '../data/plugins.data'
 import type { CommunityPlugin } from '../data/plugins.data'
+import { sanitizeExternalUrl } from '../utils/sanitizeExternalUrl'
 
 const query = ref('')
 
 type CommunityPluginWithSafeLinks = CommunityPlugin & {
   safeLinks: { repository?: string; homepage?: string }
-}
-
-function sanitizeExternalUrl(url: string | undefined): string | undefined {
-  if (!url) return undefined
-
-  try {
-    const parsed = new URL(url)
-    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-      return parsed.toString()
-    }
-  } catch {
-    return undefined
-  }
-
-  return undefined
 }
 
 const filtered = computed<CommunityPluginWithSafeLinks[]>(() => {
