@@ -391,7 +391,11 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
 
     for (const pluginPath of cfg.plugins) {
       try {
-        const resolvedPath = pluginPath.startsWith('.') ? resolve(baseDir, pluginPath) : pluginPath;
+        const resolvedPath = pluginPath.startsWith('.')
+          ? resolve(baseDir, pluginPath)
+          : pluginPath.startsWith('/')
+            ? pluginPath
+            : import.meta.resolve(pluginPath);
         const mod = await import(resolvedPath);
         const plugin: PluginDefinition = mod.default || mod;
         if (plugin?.name && typeof plugin?.setup === 'function') {
