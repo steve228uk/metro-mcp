@@ -51,6 +51,7 @@ export default defineConfig({
       {
         text: 'Reference',
         items: [
+          { text: 'CLI', link: '/cli' },
           { text: 'Tools', link: '/tools' },
           { text: 'Changelog', link: '/changelog' },
         ],
