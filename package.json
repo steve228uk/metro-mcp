@@ -60,6 +60,7 @@
   "author": "Stephen Radford",
   "license": "MIT",
   "dependencies": {
+    "@clack/prompts": "^1.2.0",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "chrome-launcher": "^1.2.1",
     "chromium-edge-launcher": "^0.3.0",

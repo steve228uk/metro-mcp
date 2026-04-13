@@ -7,10 +7,41 @@ const logger = createLogger('main');
 
 async function main() {
   const args = process.argv.slice(2);
+  const subcommand = args[0];
+
+  if (subcommand === 'create-plugin') {
+    const { runCreatePlugin } = await import('./commands/create-plugin.js');
+    await runCreatePlugin();
+    process.exit(0);
+  }
+
+  if (subcommand === 'init') {
+    const { runInit } = await import('./commands/init.js');
+    await runInit();
+    process.exit(0);
+  }
+
+  if (subcommand === 'doctor') {
+    const { runDoctor } = await import('./commands/doctor.js');
+    await runDoctor();
+    process.exit(0);
+  }
+
+  if (subcommand === 'validate-plugin') {
+    const { runValidatePlugin } = await import('./commands/validate-plugin.js');
+    await runValidatePlugin(args[1]);
+    process.exit(0);
+  }
 
   if (args.includes('--help') || args.includes('-h')) {
     console.error(`
 metro-mcp — React Native MCP Server
+
+Commands:
+  create-plugin           Scaffold a new metro-mcp plugin package
+  init                    Create a metro-mcp.config.ts in the current project
+  doctor                  Check Metro connectivity and config health
+  validate-plugin <path>  Validate a plugin file exports a valid PluginDefinition
 
 Usage:
   metro-mcp [options]
