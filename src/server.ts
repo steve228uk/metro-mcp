@@ -219,8 +219,14 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
       events: eventsClient,
       registerTool: <T extends z.ZodType>(name: string, toolConfig: ToolConfig<T>) => {
         try {
-          const inputSchema = toolConfig.parameters instanceof z.ZodObject
-            ? (toolConfig.parameters as z.ZodObject<z.ZodRawShape>).shape
+          // Use duck typing in addition to instanceof so plugins that bundle a
+          // different copy of zod (e.g. via file: deps or yarn link) still work.
+          const params = toolConfig.parameters as Record<string, unknown>;
+          const isZodObject =
+            params instanceof z.ZodObject ||
+            (typeof params.shape === 'object' && params.shape !== null);
+          const inputSchema = isZodObject
+            ? (toolConfig.parameters as unknown as z.ZodObject<z.ZodRawShape>).shape
             : { input: toolConfig.parameters };
 
           const registration = mcpServer.registerTool(

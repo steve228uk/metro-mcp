@@ -43,6 +43,7 @@ export default defineConfig({
         items: [
           { text: 'Client SDK', link: '/sdk' },
           { text: 'Custom Plugins', link: '/plugins' },
+          { text: 'Community Plugins', link: '/community-plugins' },
           { text: 'Profiling', link: '/profiling' },
           { text: 'Test Recording', link: '/testing' },
         ],
