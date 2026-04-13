@@ -33,6 +33,12 @@ async function main() {
     process.exit(0);
   }
 
+  // Catch unknown subcommands (args that look like commands, not flags)
+  if (subcommand && !subcommand.startsWith('-')) {
+    console.error(`Unknown command: ${subcommand}\nRun \`metro-mcp --help\` for usage.`);
+    process.exit(1);
+  }
+
   if (args.includes('--help') || args.includes('-h')) {
     console.error(`
 metro-mcp — React Native MCP Server
