@@ -89,6 +89,6 @@ export default {
     const searchNames = new Set(fromSearch.map((p: CommunityPlugin) => p.name))
     const extra = pinned.filter((p) => !searchNames.has(p.name))
 
-    return [...fromSearch, ...extra]
+    return [...fromSearch, ...extra].sort((a, b) => a.name.localeCompare(b.name))
   },
 }
