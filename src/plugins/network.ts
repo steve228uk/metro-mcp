@@ -3,6 +3,7 @@ import { definePlugin } from '../plugin.js';
 import { DeviceBufferManager } from '../utils/buffer.js';
 import { formatTime, formatBytes } from '../utils/format.js';
 import { createLogger } from '../utils/logger.js';
+import { buildNetworkDashboardHtml } from '../apps/network.js';
 
 const logger = createLogger('network');
 
@@ -158,9 +159,16 @@ export const networkPlugin = definePlugin({
       return buffers.resolve(device, ctx.getActiveDeviceKey());
     }
 
+    ctx.registerAppResource('ui://metro/network', {
+      name: 'Network Dashboard',
+      description: 'Interactive network request dashboard with filtering, detail view, and live updates',
+      handler: async () => buildNetworkDashboardHtml(),
+    });
+
     ctx.registerTool('get_network_requests', {
       description: 'Get recent network requests from the React Native app.',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/network',
       parameters: z.object({
         limit: z.number().default(50).describe('Maximum number of requests to return'),
         since: z.number().optional().describe('Only return requests after this Unix timestamp (ms). Pass the timestamp of the last seen entry to fetch only new ones.'),

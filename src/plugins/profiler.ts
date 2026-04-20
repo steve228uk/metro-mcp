@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import { buildFlamegraphHtml } from '../apps/flamegraph.js';
 
 // ── CDP CPU profiler types ────────────────────────────────────────────────────
 
@@ -615,6 +616,12 @@ export const profilerPlugin = definePlugin({
       }),
     });
 
+    ctx.registerAppResource('ui://metro/profiler/flamegraph', {
+      name: 'Flamegraph Viewer',
+      description: 'Interactive React component profile and CPU flamegraph visualization',
+      handler: async () => buildFlamegraphHtml(),
+    });
+
     ctx.registerTool('get_flamegraph', {
       description:
         'Return the current profiling results as a human-readable text chart. ' +
@@ -622,6 +629,7 @@ export const profilerPlugin = definePlugin({
         'and React render data from <Profiler> components (if set up). ' +
         'Call stop_profiling first to populate the profile data.',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/profiler/flamegraph',
       parameters: z.object({}),
       handler: buildFlamegraphText,
     });

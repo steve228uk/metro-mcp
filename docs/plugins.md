@@ -332,6 +332,204 @@ npm publish
 
 The generated `package.json` lists `metro-mcp` and `zod` as `peerDependencies` — users provide them through their metro-mcp installation, so there's no version conflict.
 
+## MCP Apps — interactive UIs
+
+[MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) lets tools return interactive HTML UIs that render inside a sandboxed iframe in MCP-capable hosts (Claude Desktop, VS Code Copilot, Goose, and others). Instead of returning text for the AI to summarize, the tool opens a live dashboard the user can filter, explore, and interact with directly.
+
+metro-mcp exposes two primitives for this:
+
+| API | Purpose |
+|---|---|
+| `ctx.registerAppResource(uri, config)` | Register an HTML page at a `ui://` URI |
+| `appUri` in `registerTool` | Link a tool's result to an app resource |
+
+### How it works
+
+1. You register an HTML resource at a `ui://my-plugin/dashboard` URI
+2. You add `appUri: 'ui://my-plugin/dashboard'` to a tool
+3. When an MCP Apps host invokes the tool, it fetches the `ui://` resource and renders it in a sandboxed iframe
+4. The iframe communicates with the host via a `postMessage` JSON-RPC bridge — receiving the tool's result and calling other tools for live updates
+
+Non-MCP-Apps hosts (CLI, simple clients) ignore `appUri` and display the tool's text result normally — fully backward-compatible.
+
+### Registering an app resource
+
+```typescript
+ctx.registerAppResource('ui://my-plugin/dashboard', {
+  name: 'My Dashboard',
+  description: 'Interactive data viewer',
+  handler: async () => MY_HTML,
+});
+```
+
+The HTML is served with MIME type `text/html;profile=mcp-app` automatically. The URI must start with `ui://`. Use `ui://your-plugin-name/...` as a namespace to avoid collisions with built-in apps (`ui://metro/...`).
+
+### Linking a tool to an app
+
+```typescript
+ctx.registerTool('get_my_data', {
+  description: 'Get data with a visual dashboard',
+  parameters: z.object({}),
+  appUri: 'ui://my-plugin/dashboard',  // ← that's all
+  handler: async () => fetchMyData(),
+});
+```
+
+metro-mcp automatically injects `_meta.ui.resourceUri` into the tool result — you don't touch `_meta` in your handler.
+
+### The postMessage bridge
+
+The iframe communicates with the host via JSON-RPC over `postMessage`. Copy this bootstrap snippet into your app's `<script>` tag — it exposes a `mcpBridge` global:
+
+```html
+<script>
+(function() {
+  var pending = new Map(), handlers = new Map(), nextId = 1;
+  function send(msg) { window.parent.postMessage(JSON.stringify(msg), '*'); }
+  window.addEventListener('message', function(e) {
+    var msg; try { msg = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch { return; }
+    if (!msg || msg.jsonrpc !== '2.0') return;
+    if (msg.id != null && pending.has(msg.id)) {
+      var cb = pending.get(msg.id); pending.delete(msg.id);
+      msg.error ? cb.reject(new Error(msg.error.message)) : cb.resolve(msg.result);
+      return;
+    }
+    if (msg.method) {
+      if (msg.method === 'ui/notifications/host-context-changed') {
+        var css = msg.params && msg.params.cssVariables;
+        if (css) Object.keys(css).forEach(function(k) { document.documentElement.style.setProperty(k, css[k]); });
+      }
+      var h = handlers.get(msg.method); if (h) h(msg.params || {});
+    }
+  });
+  window.mcpBridge = {
+    initialize: function() {
+      return new Promise(function(resolve, reject) {
+        var id = nextId++; pending.set(id, { resolve, reject });
+        send({ jsonrpc: '2.0', id, method: 'ui/initialize',
+          params: { appInfo: { name: 'my-app', version: '1.0' }, appCapabilities: {}, protocolVersion: '2026-01-26' } });
+      });
+    },
+    call: function(method, params) {
+      return new Promise(function(resolve, reject) {
+        var id = nextId++; pending.set(id, { resolve, reject });
+        send({ jsonrpc: '2.0', id, method, params: params || {} });
+      });
+    },
+    on: function(method, handler) { handlers.set(method, handler); }
+  };
+})();
+</script>
+```
+
+| Method | Description |
+|---|---|
+| `mcpBridge.initialize()` | Handshake with host (call first, returns `Promise<void>`) |
+| `mcpBridge.call(method, params)` | JSON-RPC call — returns `Promise<result>` |
+| `mcpBridge.on(method, handler)` | Listen for host notifications |
+
+### Calling tools and resources from the app
+
+```javascript
+// Call a tool (re-fetch data)
+mcpBridge.call('tools/call', { name: 'get_my_data', arguments: { limit: 50 } })
+  .then(function(result) {
+    var text = result.content[0].text;
+    // render...
+  });
+
+// Read a resource
+mcpBridge.call('resources/read', { uri: 'metro://profiler/data' })
+  .then(function(result) {
+    var json = JSON.parse(result.contents[0].text);
+    // render...
+  });
+```
+
+### Receiving the tool result automatically
+
+The host sends `ui/notifications/tool-result` to the iframe when the linked tool finishes:
+
+```javascript
+mcpBridge.on('ui/notifications/tool-result', function(params) {
+  var text = params.result.content[0].text;
+  // render the initial data without calling tools/call
+});
+```
+
+### Theming
+
+The host sends CSS variables via `ui/notifications/host-context-changed`. The bridge bootstrap applies them to `:root` automatically. Use CSS custom properties with safe defaults:
+
+```css
+body {
+  background: var(--color-bg, #0d0d0d);
+  color: var(--color-text-primary, #e8e8e8);
+  font-family: var(--font-sans, -apple-system, sans-serif);
+}
+```
+
+### Security
+
+MCP App iframes run in a strict sandbox:
+- **No external network access by default** — CSP blocks all external connections. Your HTML must be fully self-contained (no CDN links).
+- **No parent page access** — the iframe cannot read cookies, localStorage, or the parent DOM.
+- External access requires declaring permissions explicitly in your resource — most hosts will reject or warn.
+
+### Full example
+
+```typescript
+import { definePlugin } from 'metro-mcp';
+import { z } from 'zod';
+
+const BRIDGE = `/* paste the bootstrap snippet above */`;
+
+const MY_HTML = \`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font-family: var(--font-sans, sans-serif); color: var(--color-text-primary, #e8e8e8); padding: 16px; }
+  </style>
+</head>
+<body>
+  <h2>My Plugin</h2>
+  <div id="root">Loading…</div>
+  <script>
+    \${BRIDGE}
+    mcpBridge.initialize()
+      .then(() => mcpBridge.call('tools/call', { name: 'my_tool', arguments: {} }))
+      .then(function(result) {
+        document.getElementById('root').textContent = result.content[0].text;
+      });
+  <\/script>
+</body>
+</html>\`;
+
+export default definePlugin({
+  name: 'my-plugin',
+  async setup(ctx) {
+    // 1. Register the HTML resource
+    ctx.registerAppResource('ui://my-plugin/dashboard', {
+      name: 'My Dashboard',
+      description: 'Interactive data viewer',
+      handler: async () => MY_HTML,
+    });
+
+    // 2. Link the tool — appUri is the only change needed
+    ctx.registerTool('my_tool', {
+      description: 'Returns data shown in the dashboard',
+      parameters: z.object({}),
+      appUri: 'ui://my-plugin/dashboard',
+      handler: async () => {
+        const data = await ctx.evalInApp('JSON.stringify(global.__MY_DATA__)');
+        return data || '{}';
+      },
+    });
+  },
+});
+```
+
 ## Validating a plugin
 
 Use the [`validate-plugin` CLI command](/cli#validate-plugin) to check that your plugin file exports a valid `PluginDefinition` before loading it into the server:

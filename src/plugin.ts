@@ -54,6 +54,13 @@ export interface ToolConfig<T extends z.ZodType = z.ZodType> {
   description: string;
   parameters: T;
   annotations?: ToolAnnotations;
+  /**
+   * URI of the MCP App resource to display alongside this tool's result.
+   * When set, the tool result will include `_meta.ui.resourceUri` automatically.
+   * The resource at this URI must be registered via `ctx.registerAppResource`.
+   * Example: `'ui://metro/network'`
+   */
+  appUri?: string;
   handler: (args: z.infer<T>, ctx: ToolHandlerContext) => Promise<unknown>;
 }
 
@@ -66,6 +73,14 @@ export interface ResourceConfig {
   onSubscribe?: (uri: string) => void;
   /** Called when a client unsubscribes from this resource URI */
   onUnsubscribe?: (uri: string) => void;
+}
+
+/** Configuration for an MCP App HTML resource registered at a `ui://` URI. */
+export interface AppResourceConfig {
+  name: string;
+  description: string;
+  /** Returns the full HTML document string for the app. */
+  handler: () => Promise<string>;
 }
 
 export interface PromptConfig {
@@ -126,6 +141,16 @@ export interface PluginContext {
   getActiveDeviceName(): string | null;
   /** Notify subscribed clients that a resource's content has changed */
   notifyResourceUpdated(uri: string): void;
+  /**
+   * Register an interactive MCP App at a `ui://` URI.
+   * The resource is served with MIME type `text/html;profile=mcp-app` and
+   * rendered in a sandboxed iframe by MCP Apps-capable hosts (Claude, VS Code, etc.).
+   * Reference it from a tool via `appUri` in `registerTool`.
+   *
+   * URI convention: use `ui://metro/...` for built-in apps,
+   * `ui://your-plugin-name/...` for community plugins.
+   */
+  registerAppResource(uri: string, config: AppResourceConfig): void;
 }
 
 // ── Logger ──

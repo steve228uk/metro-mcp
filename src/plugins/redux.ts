@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import { buildReduxHtml } from '../apps/redux.js';
 
 export const reduxPlugin = definePlugin({
   name: 'redux',
@@ -7,10 +8,17 @@ export const reduxPlugin = definePlugin({
   description: 'Redux state inspection via Runtime.evaluate',
 
   async setup(ctx) {
+    ctx.registerAppResource('ui://metro/redux', {
+      name: 'Redux State Inspector',
+      description: 'Interactive JSON tree explorer for Redux state with search and path copy',
+      handler: async () => buildReduxHtml(),
+    });
+
     ctx.registerTool('get_redux_state', {
       description:
         'Get the current Redux state tree or a specific slice. Works without client SDK if Redux DevTools extension is present or store is exposed globally.',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/redux',
       parameters: z.object({
         path: z.string().optional().describe('Dot-separated path to a state slice (e.g., "user.profile")'),
         compact: z.boolean().default(false).describe('Return compact format'),

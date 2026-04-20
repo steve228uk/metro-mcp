@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import { buildNavigationHtml } from '../apps/navigation.js';
 
 export const navigationPlugin = definePlugin({
   name: 'navigation',
@@ -66,10 +67,17 @@ export const navigationPlugin = definePlugin({
       })()
     `;
 
+    ctx.registerAppResource('ui://metro/navigation', {
+      name: 'Navigation Tree',
+      description: 'Visual React Navigation / Expo Router route tree with active screen highlighted',
+      handler: async () => buildNavigationHtml(),
+    });
+
     ctx.registerTool('get_navigation_state', {
       description:
         'Get the full React Navigation / Expo Router state tree including current route, params, and stack history.',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/navigation',
       parameters: z.object({
         compact: z.boolean().default(false).describe('Return compact format'),
       }),

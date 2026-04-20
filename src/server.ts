@@ -14,9 +14,11 @@ import type {
   PluginDefinition,
   ToolConfig,
   ResourceConfig,
+  AppResourceConfig,
   PromptConfig,
   EvalOptions,
 } from './plugin.js';
+import { buildAppMeta, MCP_APP_MIME_TYPE } from './utils/apps.js';
 import { CDPSession, CDPMultiplexer, scanMetroPorts, selectBestTarget, fetchTargets, supportsMultipleDebuggers } from 'metro-bridge';
 import type { MetroTarget } from 'metro-bridge';
 import { loadConfig } from './config.js';
@@ -251,7 +253,10 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
               try {
                 const result = await toolConfig.handler(args as z.infer<T>, { sendProgress });
                 const content = typeof result === 'string' ? result : JSON.stringify(result);
-                return { content: [{ type: 'text' as const, text: content }] };
+                return {
+                  content: [{ type: 'text' as const, text: content }],
+                  ...(toolConfig.appUri ? { _meta: buildAppMeta(toolConfig.appUri) } : {}),
+                };
               } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
                 return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
@@ -279,6 +284,23 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
           pluginLogger.debug(`Registered resource: ${uri}`);
         } catch (err) {
           pluginLogger.error(`Failed to register resource ${uri}:`, err);
+        }
+      },
+      registerAppResource: (uri: string, appConfig: AppResourceConfig) => {
+        try {
+          const registration = mcpServer.resource(
+            appConfig.name,
+            uri,
+            { description: appConfig.description, mimeType: MCP_APP_MIME_TYPE },
+            async () => {
+              const html = await appConfig.handler();
+              return { contents: [{ uri, text: html, mimeType: MCP_APP_MIME_TYPE }] };
+            }
+          );
+          registrations.push(registration);
+          pluginLogger.debug(`Registered app resource: ${uri}`);
+        } catch (err) {
+          pluginLogger.error(`Failed to register app resource ${uri}:`, err);
         }
       },
       registerPrompt: (name: string, promptConfig: PromptConfig) => {

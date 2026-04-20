@@ -3,6 +3,7 @@ import { definePlugin } from '../plugin.js';
 import { CircularBuffer, DeviceBufferManager } from '../utils/buffer.js';
 import { formatTime } from '../utils/format.js';
 import { extractCDPExceptionMessage } from '../utils/cdp.js';
+import { buildErrorsHtml } from '../apps/errors.js';
 
 interface ErrorEntry {
   timestamp: number;
@@ -133,9 +134,16 @@ export const errorsPlugin = definePlugin({
       return buffers.resolve(device, ctx.getActiveDeviceKey());
     }
 
+    ctx.registerAppResource('ui://metro/errors', {
+      name: 'Error Viewer',
+      description: 'Interactive error viewer with stack traces and symbolication',
+      handler: async () => buildErrorsHtml(),
+    });
+
     ctx.registerTool('get_errors', {
       description: 'Get recent uncaught exceptions from the React Native app.',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/errors',
       parameters: z.object({
         limit: z.number().default(20).describe('Maximum number of errors to return'),
         since: z.number().optional().describe('Only return entries after this Unix timestamp (ms). Pass the timestamp of the last seen entry to fetch only new ones.'),
