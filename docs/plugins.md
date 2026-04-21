@@ -463,9 +463,9 @@ The host sends CSS variables via `ui/notifications/host-context-changed`. The br
 
 ```css
 body {
-  background: var(--color-bg, #0d0d0d);
-  color: var(--color-text-primary, #e8e8e8);
-  font-family: var(--font-sans, -apple-system, sans-serif);
+  background: var(--bg, #0d0d0d);
+  color: var(--text, #e8e8e8);
+  font-family: var(--font, -apple-system, sans-serif);
 }
 ```
 
@@ -489,7 +489,7 @@ const MY_HTML = \`<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <style>
-    body { font-family: var(--font-sans, sans-serif); color: var(--color-text-primary, #e8e8e8); padding: 16px; }
+    body { font-family: var(--font, sans-serif); color: var(--text, #e8e8e8); padding: 16px; }
   </style>
 </head>
 <body>

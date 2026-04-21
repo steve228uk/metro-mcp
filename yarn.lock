@@ -1595,7 +1595,7 @@ postcss@^8.4.43, postcss@^8.5.8:
     picocolors "^1.1.1"
     source-map-js "^1.2.1"
 
-preact@^10.0.0:
+preact@^10.0.0, preact@^10.26.0:
   version "10.29.1"
   resolved "https://registry.yarnpkg.com/preact/-/preact-10.29.1.tgz#2a5b936efe91cfe1e773cdb55dceb55d148d1d4b"
   integrity sha512-gQCLc/vWroE8lIpleXtdJhTFDogTdZG9AjMUpVkDf2iTCNwYNWA+u16dL41TqUDJO4gm2IgrcMv3uTpjd4Pwmg==

@@ -198,8 +198,9 @@ export const consolePlugin = definePlugin({
         since: z.number().optional().describe('Only return entries after this Unix timestamp (ms). Pass the timestamp of the last seen entry to fetch only new ones.'),
         summary: z.boolean().default(false).describe('Return a one-line summary with counts'),
         device: z.string().optional().describe('Device key or "all" for aggregated logs. Defaults to current device.'),
+        format: z.enum(['text', 'json']).default('text').describe("Return 'json' for a structured array of log entries"),
       }),
-      handler: async ({ level, search, limit, since, summary, device }) => {
+      handler: async ({ level, search, limit, since, summary, device, format }) => {
         let logs = buffers.resolve(device, ctx.getActiveDeviceKey());
         if (level) logs = logs.filter((l) => l.level === level);
         if (search) logs = logs.filter((l) => l.message.toLowerCase().includes(search.toLowerCase()));
@@ -212,7 +213,9 @@ export const consolePlugin = definePlugin({
           );
         }
 
-        return logs.slice(-limit).map((l) => `${formatTime(l.timestamp)} [${l.level}] ${l.message}`).join('\n');
+        const slice = logs.slice(-limit);
+        if (format === 'json') return slice;
+        return slice.map((l) => `${formatTime(l.timestamp)} [${l.level}] ${l.message}`).join('\n');
       },
     });
 

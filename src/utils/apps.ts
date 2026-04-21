@@ -110,50 +110,23 @@ export function wrapAppHtml(body: string, opts?: { title?: string; extraStyles?:
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --color-bg:#0d0d0d;
-  --color-surface:#1a1a1a;
-  --color-border:#2a2a2a;
-  --color-text-primary:#e8e8e8;
-  --color-text-secondary:#888;
-  --color-accent:#4f9cf9;
-  --color-warn:#f59e0b;
-  --color-error:#ef4444;
-  --color-success:#22c55e;
-  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-  --font-mono:'SF Mono','Fira Code',monospace;
-  --radius:6px;
+  --bg:#0d0d0d;--surface:#141414;--surface-2:#1e1e1e;--border:#2a2a2a;
+  --text:#e8e8e8;--text-2:#888;--accent:#4f9cf9;--warn:#f59e0b;
+  --error:#ef4444;--success:#22c55e;--purple:#a78bfa;
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  --mono:'SF Mono','Fira Code','Cascadia Code',monospace;--r:5px;
 }
-body{
-  background:var(--color-bg);
-  color:var(--color-text-primary);
-  font-family:var(--font-sans);
-  font-size:13px;
-  line-height:1.5;
-  height:100vh;
-  overflow:hidden;
+@media(prefers-color-scheme:light){
+  :root{--bg:#f5f5f7;--surface:#ffffff;--surface-2:#f0f0f2;--border:#e2e2e2;
+    --text:#111111;--text-2:#666666;--accent:#1a73e8;--warn:#d97706;
+    --error:#dc2626;--success:#16a34a;--purple:#7c3aed;}
 }
-button{
-  background:var(--color-surface);
-  color:var(--color-text-primary);
-  border:1px solid var(--color-border);
-  border-radius:var(--radius);
-  padding:4px 10px;
-  cursor:pointer;
-  font-size:12px;
-  font-family:inherit;
-}
-button:hover{background:var(--color-border)}
-input,select{
-  background:var(--color-surface);
-  color:var(--color-text-primary);
-  border:1px solid var(--color-border);
-  border-radius:var(--radius);
-  padding:4px 8px;
-  font-size:12px;
-  font-family:inherit;
-  outline:none;
-}
-input:focus,select:focus{border-color:var(--color-accent)}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;line-height:1.5;height:100vh;overflow:hidden}
+button{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:var(--r);padding:4px 10px;cursor:pointer;font-size:12px;font-family:inherit}
+button:hover{background:var(--surface-2)}
+input,select{background:var(--surface-2);color:var(--text);border:1px solid var(--border);border-radius:var(--r);padding:5px 8px;font-size:12px;font-family:inherit;outline:none}
+input:focus,select:focus{border-color:var(--accent)}
+a{color:var(--accent);text-decoration:none}
 ${extraStyles}
 </style>
 </head>
