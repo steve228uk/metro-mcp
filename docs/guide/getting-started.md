@@ -21,6 +21,22 @@ claude mcp add metro-mcp -- npx -y metro-mcp
 claude mcp add metro-mcp -- bunx metro-mcp
 ```
 
+### Codex
+
+```bash
+codex mcp add metro-mcp -- npx -y metro-mcp
+# or with Bun
+codex mcp add metro-mcp -- bunx metro-mcp
+```
+
+Codex stores MCP servers in `~/.codex/config.toml` by default, and the Codex CLI and IDE extension share that configuration. If you want to add the server manually, use:
+
+```toml
+[mcp_servers.metro-mcp]
+command = "npx"
+args = ["-y", "metro-mcp"]
+```
+
 ### Cursor / VS Code
 
 ```json
@@ -60,6 +76,7 @@ See [Configuration](/configuration) for all options.
 
 ```bash
 claude mcp add metro-mcp -- npx -y metro-mcp --port 19000
+codex mcp add metro-mcp -- npx -y metro-mcp --port 19000
 ```
 
 ## How It Works
