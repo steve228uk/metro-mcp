@@ -6,7 +6,7 @@ titleTemplate: ':title'
 hero:
   name: metro-mcp
   text: The MCP server for React Native & Expo
-  tagline: Connect Claude, Cursor, or any AI agent to your running app. Inspect components, track network requests, record tests, and more — no app code changes needed.
+  tagline: Connect Claude, Cursor, VS Code, Codex or any MCP-compatible AI agent to your running app. Inspect components, track network requests, record tests, and more — no app code changes needed.
   actions:
     - theme: brand
       text: Get Started
@@ -27,7 +27,7 @@ features:
     details: Every capability is a plugin. Extend metro-mcp with local files or npm packages using the definePlugin API.
   - icon: 🤖
     title: AI-native
-    details: Designed as an MCP server — expose tools, resources, and prompts directly to Claude, Cursor, VS Code, and more.
+    details: Designed as an MCP server — expose tools, resources, and prompts directly to Claude, Cursor, VS Code, Codex and more.
   - icon: 🧪
     title: Test recording
     details: Record real user interactions and generate Appium, Maestro, or Detox tests with accurate selectors automatically.
@@ -38,4 +38,3 @@ features:
     title: Full control
     details: Inspect components, dispatch Redux actions, navigate, take screenshots, run JS — all from your AI agent.
 ---
-
