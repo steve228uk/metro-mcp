@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 
-const tabs = ['Claude Code', 'Cursor', 'VS Code']
-const active = ref('Claude Code')
+const tabs = ['Multiple Agents', 'Claude Code', 'Codex', 'OpenCode', 'Cursor', 'VS Code']
+const active = ref('Multiple Agents')
 </script>
 
 <template>
@@ -21,8 +21,17 @@ const active = ref('Claude Code')
         </button>
       </div>
       <div class="tab-content">
+        <div v-if="active === 'Multiple Agents'">
+          <pre><code>npx add-mcp metro-mcp --all -g -y</code></pre>
+        </div>
         <div v-if="active === 'Claude Code'">
           <pre><code>claude mcp add metro-mcp -- npx -y metro-mcp</code></pre>
+        </div>
+        <div v-if="active === 'Codex'">
+          <pre><code>codex mcp add metro-mcp -- npx -y metro-mcp</code></pre>
+        </div>
+        <div v-if="active === 'OpenCode'">
+          <pre><code>opencode mcp add</code></pre>
         </div>
         <div v-if="active === 'Cursor'">
           <pre><code>{
@@ -94,6 +103,7 @@ const active = ref('Claude Code')
 
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 2px;
   margin-bottom: 0;
 }

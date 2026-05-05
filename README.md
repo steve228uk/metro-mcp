@@ -53,6 +53,46 @@ command = "npx"
 args = ["-y", "metro-mcp"]
 ```
 
+### OpenCode
+
+Run OpenCode's interactive MCP installer:
+
+```bash
+opencode mcp add
+```
+
+Choose a local server, name it `metro-mcp`, and use `npx -y metro-mcp` as the command.
+
+If you prefer to configure it manually, add this to `opencode.json` in your project, or to `~/.config/opencode/opencode.json` for a global install:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "metro-mcp": {
+      "type": "local",
+      "command": ["npx", "-y", "metro-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Or with Bun:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "metro-mcp": {
+      "type": "local",
+      "command": ["bunx", "metro-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
 ### Cursor / VS Code
 
 ```json
@@ -79,12 +119,26 @@ Or with Bun:
 }
 ```
 
+### Install across multiple agents
+
+If you use several MCP clients, [`add-mcp`](https://github.com/neondatabase/add-mcp) can write the config for supported agents, including Claude Code, Codex, Cursor, OpenCode, and VS Code:
+
+```bash
+npx add-mcp metro-mcp --all -g -y
+```
+
 ### With custom Metro port
 
 ```bash
 codex mcp add metro-mcp -- npx -y metro-mcp --port 19000
 # or
 claude mcp add metro-mcp -- npx -y metro-mcp --port 19000
+```
+
+For OpenCode, add the port to the command array:
+
+```json
+"command": ["npx", "-y", "metro-mcp", "--port", "19000"]
 ```
 
 ---
