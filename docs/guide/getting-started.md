@@ -37,6 +37,46 @@ command = "npx"
 args = ["-y", "metro-mcp"]
 ```
 
+### OpenCode
+
+Run OpenCode's interactive MCP installer:
+
+```bash
+opencode mcp add
+```
+
+Choose a local server, name it `metro-mcp`, and use `npx -y metro-mcp` as the command.
+
+If you prefer to configure it manually, add this to `opencode.json` in your project, or to `~/.config/opencode/opencode.json` for a global install:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "metro-mcp": {
+      "type": "local",
+      "command": ["npx", "-y", "metro-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Or with Bun:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "metro-mcp": {
+      "type": "local",
+      "command": ["bunx", "metro-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
 ### Cursor / VS Code
 
 ```json
@@ -55,9 +95,17 @@ Or use the one-click install buttons:
 [![Install in VS Code](https://img.shields.io/badge/Install_in-VS_Code-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect/mcp/install?name=metro-mcp&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22metro-mcp%22%5D%2C%22env%22%3A%7B%7D%7D)
 [![Install in Cursor](https://img.shields.io/badge/Install_in-Cursor-000000?style=flat-square&logoColor=white)](https://cursor.com/en/install-mcp?name=metro-mcp&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIm1ldHJvLW1jcCJdLCJlbnYiOnt9fQ==)
 
+### Install across multiple agents
+
+If you use several MCP clients, [`add-mcp`](https://github.com/neondatabase/add-mcp) can write the config for supported agents, including Claude Code, Codex, Cursor, OpenCode, and VS Code:
+
+```bash
+npx add-mcp metro-mcp --all -g -y
+```
+
 ### With a config file
 
-In Claude Code, Cursor, and VS Code, metro-mcp automatically discovers `metro-mcp.config.ts` (or `.js`) from your project root — no extra configuration needed. Just add the file and it will be picked up.
+In Claude Code, Cursor, VS Code, and OpenCode, metro-mcp automatically discovers `metro-mcp.config.ts` (or `.js`) from your project root — no extra configuration needed. Just add the file and it will be picked up.
 
 ```bash
 # Install metro-mcp as usual
@@ -77,6 +125,12 @@ See [Configuration](/configuration) for all options.
 ```bash
 claude mcp add metro-mcp -- npx -y metro-mcp --port 19000
 codex mcp add metro-mcp -- npx -y metro-mcp --port 19000
+```
+
+For OpenCode, add the port to the command array:
+
+```json
+"command": ["npx", "-y", "metro-mcp", "--port", "19000"]
 ```
 
 ## How It Works
