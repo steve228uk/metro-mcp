@@ -80,6 +80,8 @@ export interface ResourceConfig {
 export interface AppResourceConfig {
   name: string;
   description: string;
+  /** Minimum iframe height requested via CSS and Apps size notifications. Defaults to 420px. */
+  minHeight?: number;
   /** Returns the full HTML document string for the app. */
   handler: () => Promise<string>;
 }
