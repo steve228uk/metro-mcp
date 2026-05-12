@@ -3,6 +3,7 @@ import { definePlugin } from '../plugin.js';
 import { DeviceBufferManager } from '../utils/buffer.js';
 import { formatTime, formatBytes } from '../utils/format.js';
 import { createLogger } from '../utils/logger.js';
+import { buildNetworkDashboardHtml } from '../apps/network.js';
 
 const logger = createLogger('network');
 
@@ -158,16 +159,24 @@ export const networkPlugin = definePlugin({
       return buffers.resolve(device, ctx.getActiveDeviceKey());
     }
 
+    ctx.registerAppResource('ui://metro/network', {
+      name: 'Network Dashboard',
+      description: 'Interactive network request dashboard with filtering, detail view, and live updates',
+      handler: async () => buildNetworkDashboardHtml(),
+    });
+
     ctx.registerTool('get_network_requests', {
       description: 'Get recent network requests from the React Native app.',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/network',
       parameters: z.object({
         limit: z.number().default(50).describe('Maximum number of requests to return'),
         since: z.number().optional().describe('Only return requests after this Unix timestamp (ms). Pass the timestamp of the last seen entry to fetch only new ones.'),
         summary: z.boolean().default(false).describe('Return a one-line summary with counts'),
         device: z.string().optional().describe('Device key or "all" for aggregated requests. Defaults to current device.'),
+        format: z.enum(['text', 'json']).default('text').describe("Return 'json' for a structured array of request objects"),
       }),
-      handler: async ({ limit, since, summary, device }) => {
+      handler: async ({ limit, since, summary, device, format }) => {
         let requests = getRequests(device);
         if (since !== undefined) requests = requests.filter((r) => r.startTime > since);
 
@@ -180,8 +189,9 @@ export const networkPlugin = definePlugin({
           return `${total} requests, ${errors} errors, avg response time: ${Math.round(avgTime)}ms`;
         }
 
-        return requests
-          .slice(-limit)
+        const slice = requests.slice(-limit);
+        if (format === 'json') return slice;
+        return slice
           .map((r) => {
             const duration = r.endTime ? `${r.endTime - r.startTime}ms` : 'pending';
             const status = r.error ? `ERR: ${r.error}` : `${r.status || '???'}`;

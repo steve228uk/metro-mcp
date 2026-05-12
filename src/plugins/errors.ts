@@ -3,6 +3,7 @@ import { definePlugin } from '../plugin.js';
 import { CircularBuffer, DeviceBufferManager } from '../utils/buffer.js';
 import { formatTime } from '../utils/format.js';
 import { extractCDPExceptionMessage } from '../utils/cdp.js';
+import { buildErrorsHtml } from '../apps/errors.js';
 
 interface ErrorEntry {
   timestamp: number;
@@ -133,16 +134,24 @@ export const errorsPlugin = definePlugin({
       return buffers.resolve(device, ctx.getActiveDeviceKey());
     }
 
+    ctx.registerAppResource('ui://metro/errors', {
+      name: 'Error Viewer',
+      description: 'Interactive error viewer with stack traces and symbolication',
+      handler: async () => buildErrorsHtml(),
+    });
+
     ctx.registerTool('get_errors', {
       description: 'Get recent uncaught exceptions from the React Native app.',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/errors',
       parameters: z.object({
         limit: z.number().default(20).describe('Maximum number of errors to return'),
         since: z.number().optional().describe('Only return entries after this Unix timestamp (ms). Pass the timestamp of the last seen entry to fetch only new ones.'),
         summary: z.boolean().default(false).describe('Return a one-line summary with counts'),
         device: z.string().optional().describe('Device key or "all" for aggregated errors. Defaults to current device.'),
+        format: z.enum(['text', 'json']).default('text').describe("Return 'json' for a structured array of error entries"),
       }),
-      handler: async ({ limit, since, summary, device }) => {
+      handler: async ({ limit, since, summary, device, format }) => {
         let errors = getErrors(device);
         if (since !== undefined) errors = errors.filter((e) => e.timestamp > since);
         if (summary) {
@@ -152,6 +161,7 @@ export const errorsPlugin = definePlugin({
           );
         }
         const result = errors.slice(-limit);
+        if (format === 'json') return result;
         if (result.length === 0) return '(no errors)';
         return result.map((e) => {
           const stack = e.symbolicatedStack || e.stack;

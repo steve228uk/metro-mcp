@@ -47,7 +47,7 @@ export const commandsPlugin = definePlugin({
       annotations: { destructiveHint: true, openWorldHint: true },
       parameters: z.object({
         name: z.string().describe('Command name to execute'),
-        params: z.record(z.unknown()).optional().describe('Parameters to pass to the command'),
+        params: z.record(z.string(), z.unknown()).optional().describe('Parameters to pass to the command'),
         timeout: z.number().default(15000).describe('Max ms to wait for async commands (default 15000)'),
       }),
       handler: async ({ name, params, timeout }) => {

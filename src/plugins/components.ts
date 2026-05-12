@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { escapeJsString } from '../utils/format.js';
+import { buildComponentsHtml } from '../apps/components.js';
 
 // JS expression to walk the React fiber tree
 const WALK_FIBER_EXPR = `
@@ -96,10 +97,17 @@ export const componentsPlugin = definePlugin({
   description: 'React component tree inspection via fiber tree walking',
 
   async setup(ctx) {
+    ctx.registerAppResource('ui://metro/components', {
+      name: 'Component Tree',
+      description: 'Interactive React fiber tree explorer with props, state, and testID viewer',
+      handler: async () => buildComponentsHtml(),
+    });
+
     ctx.registerTool('get_component_tree', {
       description:
         'Get the React component tree of the running app. Use structureOnly=true for a compact view (~1-3KB).',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/components',
       parameters: z.object({
         structureOnly: z.boolean().default(false).describe('Return only component names without props/state'),
         maxDepth: z.number().default(30).describe('Maximum depth to traverse'),

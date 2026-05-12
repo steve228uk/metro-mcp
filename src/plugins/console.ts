@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { DeviceBufferManager } from '../utils/buffer.js';
 import { formatTime } from '../utils/format.js';
+import { buildConsoleHtml } from '../apps/console.js';
 
 interface LogEntry {
   timestamp: number;
@@ -180,9 +181,16 @@ export const consolePlugin = definePlugin({
       });
     });
 
+    ctx.registerAppResource('ui://metro/console', {
+      name: 'Console Log Viewer',
+      description: 'Interactive console log viewer with level filtering, search, and live updates',
+      handler: async () => buildConsoleHtml(),
+    });
+
     ctx.registerTool('get_console_logs', {
       description: 'Get recent console output. Filter by level or search text.',
       annotations: { readOnlyHint: true },
+      appUri: 'ui://metro/console',
       parameters: z.object({
         level: z.enum(['log', 'warn', 'error', 'info', 'debug']).optional().describe('Filter by log level'),
         search: z.string().optional().describe('Search text to filter logs'),
@@ -190,8 +198,9 @@ export const consolePlugin = definePlugin({
         since: z.number().optional().describe('Only return entries after this Unix timestamp (ms). Pass the timestamp of the last seen entry to fetch only new ones.'),
         summary: z.boolean().default(false).describe('Return a one-line summary with counts'),
         device: z.string().optional().describe('Device key or "all" for aggregated logs. Defaults to current device.'),
+        format: z.enum(['text', 'json']).default('text').describe("Return 'json' for a structured array of log entries"),
       }),
-      handler: async ({ level, search, limit, since, summary, device }) => {
+      handler: async ({ level, search, limit, since, summary, device, format }) => {
         let logs = buffers.resolve(device, ctx.getActiveDeviceKey());
         if (level) logs = logs.filter((l) => l.level === level);
         if (search) logs = logs.filter((l) => l.message.toLowerCase().includes(search.toLowerCase()));
@@ -204,7 +213,9 @@ export const consolePlugin = definePlugin({
           );
         }
 
-        return logs.slice(-limit).map((l) => `${formatTime(l.timestamp)} [${l.level}] ${l.message}`).join('\n');
+        const slice = logs.slice(-limit);
+        if (format === 'json') return slice;
+        return slice.map((l) => `${formatTime(l.timestamp)} [${l.level}] ${l.message}`).join('\n');
       },
     });
 
