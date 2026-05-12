@@ -341,7 +341,7 @@ metro-mcp exposes two primitives for this:
 | API | Purpose |
 |---|---|
 | `ctx.registerAppResource(uri, config)` | Register an HTML page at a `ui://` URI |
-| `appUri` in `registerTool` | Link a tool's result to an app resource |
+| `appUri` in `registerTool` | Link a tool definition to an app resource |
 
 ### How it works
 
@@ -375,7 +375,7 @@ ctx.registerTool('get_my_data', {
 });
 ```
 
-metro-mcp automatically injects `_meta.ui.resourceUri` into the tool result — you don't touch `_meta` in your handler.
+metro-mcp automatically exposes `_meta.ui.resourceUri` on the tool definition returned by `tools/list` — you don't touch `_meta` in your handler.
 
 ### The postMessage bridge
 
@@ -385,7 +385,22 @@ The iframe communicates with the host via JSON-RPC over `postMessage`. Copy this
 <script>
 (function() {
   var pending = new Map(), handlers = new Map(), nextId = 1;
-  function send(msg) { window.parent.postMessage(JSON.stringify(msg), '*'); }
+  function send(msg) { window.parent.postMessage(msg, '*'); }
+  function applyHostContext(params) {
+    var styleVariables = params && params.styles && params.styles.variables;
+    var legacyVariables = params && params.cssVariables;
+    var variables = styleVariables || legacyVariables;
+    if (variables && typeof variables === 'object') {
+      Object.keys(variables).forEach(function(k) {
+        if (document.documentElement.style.getPropertyValue(k) !== variables[k]) {
+          document.documentElement.style.setProperty(k, variables[k]);
+        }
+      });
+    }
+    if (params && params.theme && document.documentElement.dataset.theme !== params.theme) {
+      document.documentElement.dataset.theme = params.theme;
+    }
+  }
   window.addEventListener('message', function(e) {
     var msg; try { msg = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch { return; }
     if (!msg || msg.jsonrpc !== '2.0') return;
@@ -396,8 +411,7 @@ The iframe communicates with the host via JSON-RPC over `postMessage`. Copy this
     }
     if (msg.method) {
       if (msg.method === 'ui/notifications/host-context-changed') {
-        var css = msg.params && msg.params.cssVariables;
-        if (css) Object.keys(css).forEach(function(k) { document.documentElement.style.setProperty(k, css[k]); });
+        applyHostContext(msg.params || {});
       }
       var h = handlers.get(msg.method); if (h) h(msg.params || {});
     }
@@ -408,6 +422,10 @@ The iframe communicates with the host via JSON-RPC over `postMessage`. Copy this
         var id = nextId++; pending.set(id, { resolve, reject });
         send({ jsonrpc: '2.0', id, method: 'ui/initialize',
           params: { appInfo: { name: 'my-app', version: '1.0' }, appCapabilities: {}, protocolVersion: '2026-01-26' } });
+      }).then(function(result) {
+        if (result && result.hostContext) applyHostContext(result.hostContext);
+        send({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} });
+        return result;
       });
     },
     call: function(method, params) {

@@ -1,24 +1,3 @@
-// ── MCP Apps support ─────────────────────────────────────────────────────────
-// Implements the MCP Apps extension (spec 2026-01-26) natively without the
-// @modelcontextprotocol/ext-apps package, which requires SDK ^1.29.0 while
-// metro-mcp currently uses ^1.12.1. Replace with the official package once
-// the SDK dependency is upgraded.
-
-/** MIME type for MCP App HTML resources. */
-export const MCP_APP_MIME_TYPE = 'text/html;profile=mcp-app';
-
-/**
- * Build the _meta object that links a tool result to an MCP App.
- * Sets both the legacy 'ui/resourceUri' key (older hosts) and the current
- * 'ui.resourceUri' shape (spec 2026-01-26+) for maximum host compatibility.
- */
-export function buildAppMeta(resourceUri: string): Record<string, unknown> {
-  return {
-    'ui/resourceUri': resourceUri,
-    ui: { resourceUri },
-  };
-}
-
 /**
  * Shared postMessage bridge for MCP App HTML pages.
  *
@@ -36,7 +15,22 @@ export const BRIDGE_BOOTSTRAP_JS = `(function() {
   var nextId = 1;
 
   function send(msg) {
-    window.parent.postMessage(JSON.stringify(msg), '*');
+    window.parent.postMessage(msg, '*');
+  }
+
+  function applyHostContext(params) {
+    var styleVariables = params && params.styles && params.styles.variables;
+    var legacyVariables = params && params.cssVariables;
+    var variables = styleVariables || legacyVariables;
+    if (variables && typeof variables === 'object') {
+      var root = document.documentElement;
+      Object.keys(variables).forEach(function(k) {
+        if (root.style.getPropertyValue(k) !== variables[k]) root.style.setProperty(k, variables[k]);
+      });
+    }
+    if (params && params.theme && document.documentElement.dataset.theme !== params.theme) {
+      document.documentElement.dataset.theme = params.theme;
+    }
   }
 
   window.addEventListener('message', function(e) {
@@ -53,13 +47,8 @@ export const BRIDGE_BOOTSTRAP_JS = `(function() {
     }
 
     if (msg.method) {
-      // Apply theming from host-context-changed
       if (msg.method === 'ui/notifications/host-context-changed') {
-        var css = msg.params && msg.params.cssVariables;
-        if (css && typeof css === 'object') {
-          var root = document.documentElement;
-          Object.keys(css).forEach(function(k) { root.style.setProperty(k, css[k]); });
-        }
+        applyHostContext(msg.params || {});
       }
       var h = handlers.get(msg.method);
       if (h) h(msg.params || {});
@@ -79,6 +68,10 @@ export const BRIDGE_BOOTSTRAP_JS = `(function() {
             protocolVersion: '2026-01-26'
           }
         });
+      }).then(function(result) {
+        if (result && result.hostContext) applyHostContext(result.hostContext);
+        send({ jsonrpc: '2.0', method: 'ui/notifications/initialized', params: {} });
+        return result;
       });
     },
     call: function(method, params) {

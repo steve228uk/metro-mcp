@@ -1,7 +1,7 @@
 /** @jsxImportSource preact */
 import { render } from 'preact';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
-import { initialize, callTool, getToolText, onNotification } from '../shared/bridge';
+import { initialize, callTool, getToolText, onToolResultNotification } from '../shared/bridge';
 import { useKeyboard } from '../shared/useKeyboard';
 
 function App() {
@@ -27,10 +27,10 @@ function App() {
 
   useEffect(() => {
     initialize().then(fetchState).catch(() => setLoading(false));
-    onNotification('ui/notifications/tool-result', (params) => {
-      const text = ((params as Record<string, unknown>)?.result as Record<string, unknown>)?.content?.[0]?.text as string | undefined;
+    onToolResultNotification((text) => {
       if (!text) return;
       try { setData(JSON.parse(text)); setMsg(''); } catch {}
+      setLoading(false);
     });
   }, []);
 

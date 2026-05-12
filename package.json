@@ -39,8 +39,8 @@
     "build": "bun run build:apps && bun run clean && bun run build:js && bun run build:bin && bun run build:types",
     "postinstall": "bun run scripts/build-apps.ts",
     "build:apps": "bun run scripts/build-apps.ts",
-    "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external zod --external ws && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/sdk --external zod",
-    "build:bin": "bun build bin/metro-mcp.ts --outfile dist/bin/metro-mcp.js --target node --external @modelcontextprotocol/sdk --external zod --external ws && chmod +x dist/bin/metro-mcp.js",
+    "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod --external ws && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod",
+    "build:bin": "bun build bin/metro-mcp.ts --outfile dist/bin/metro-mcp.js --target node --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod --external ws && chmod +x dist/bin/metro-mcp.js",
     "build:types": "bunx tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "docs:dev": "vitepress dev docs",
@@ -63,12 +63,13 @@
   "license": "MIT",
   "dependencies": {
     "@clack/prompts": "^1.2.0",
-    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@modelcontextprotocol/ext-apps": "^1.7.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "chrome-launcher": "^1.2.1",
     "chromium-edge-launcher": "^0.3.0",
     "metro-bridge": "^0.2.5",
     "ws": "^8.20.0",
-    "zod": "^3.24.4"
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/bun": "^1.2.10",
@@ -78,7 +79,7 @@
     "vitepress": "^1.6.4"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
-  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+  "packageManager": "bun@1.3.10"
 }

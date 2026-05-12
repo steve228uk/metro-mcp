@@ -4,5 +4,6 @@ src/apps/
 *.tsbuildinfo
 .env
 .claude
+.codex
 docs/.vitepress/dist
 docs/.vitepress/cache

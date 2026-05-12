@@ -55,8 +55,9 @@ export interface ToolConfig<T extends z.ZodType = z.ZodType> {
   parameters: T;
   annotations?: ToolAnnotations;
   /**
-   * URI of the MCP App resource to display alongside this tool's result.
-   * When set, the tool result will include `_meta.ui.resourceUri` automatically.
+   * URI of the MCP App resource to display alongside this tool.
+   * When set, the tool definition will include `_meta.ui.resourceUri`
+   * automatically.
    * The resource at this URI must be registered via `ctx.registerAppResource`.
    * Example: `'ui://metro/network'`
    */

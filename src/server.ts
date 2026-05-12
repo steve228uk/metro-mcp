@@ -3,8 +3,14 @@ import { resolve } from 'node:path';
 import { promisify } from 'util';
 import fs from 'fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { ToolCallback } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { SubscribeRequestSchema, UnsubscribeRequestSchema, RootsListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  registerAppResource as registerMcpAppResource,
+  registerAppTool as registerMcpAppTool,
+  RESOURCE_MIME_TYPE,
+} from '@modelcontextprotocol/ext-apps/server';
 
 const execAsync = promisify(exec);
 import { z } from 'zod';
@@ -18,7 +24,6 @@ import type {
   PromptConfig,
   EvalOptions,
 } from './plugin.js';
-import { buildAppMeta, MCP_APP_MIME_TYPE } from './utils/apps.js';
 import { CDPSession, CDPMultiplexer, scanMetroPorts, selectBestTarget, fetchTargets, supportsMultipleDebuggers } from 'metro-bridge';
 import type { MetroTarget } from 'metro-bridge';
 import { loadConfig } from './config.js';
@@ -222,47 +227,63 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
       registerTool: <T extends z.ZodType>(name: string, toolConfig: ToolConfig<T>) => {
         try {
           // Use duck typing in addition to instanceof so plugins that bundle a
-          // different copy of zod (e.g. via file: deps or yarn link) still work.
+          // different copy of zod (e.g. via file: deps or package links) still work.
           const params = toolConfig.parameters as Record<string, unknown>;
           const isZodObject =
             params instanceof z.ZodObject ||
             (typeof params.shape === 'object' && params.shape !== null);
-          const inputSchema = isZodObject
+          const inputSchema: z.ZodRawShape = isZodObject
             ? (toolConfig.parameters as unknown as z.ZodObject<z.ZodRawShape>).shape
             : { input: toolConfig.parameters };
 
-          const registration = mcpServer.registerTool(
-            name,
-            {
-              description: toolConfig.description,
-              inputSchema,
-              annotations: toolConfig.annotations,
-            },
-            async (args, extra) => {
-              // Build a sendProgress helper if the client sent a progressToken
-              const progressToken = extra._meta?.progressToken;
-              const sendProgress = progressToken !== undefined
-                ? async (progress: number, total: number, message?: string) => {
-                    await extra.sendNotification({
-                      method: 'notifications/progress',
-                      params: { progressToken, progress, total, ...(message ? { message } : {}) },
-                    } as Parameters<typeof extra.sendNotification>[0]);
-                  }
-                : undefined;
+          const toolDefinition = {
+            description: toolConfig.description,
+            inputSchema,
+            annotations: toolConfig.annotations,
+          };
 
-              try {
-                const result = await toolConfig.handler(args as z.infer<T>, { sendProgress });
-                const content = typeof result === 'string' ? result : JSON.stringify(result);
-                return {
-                  content: [{ type: 'text' as const, text: content }],
-                  ...(toolConfig.appUri ? { _meta: buildAppMeta(toolConfig.appUri) } : {}),
-                };
-              } catch (err) {
-                const message = err instanceof Error ? err.message : String(err);
-                return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
-              }
+          const handler: ToolCallback<typeof inputSchema> = async (args, extra) => {
+            // Build a sendProgress helper if the client sent a progressToken
+            const progressToken = extra._meta?.progressToken;
+            const sendProgress = progressToken !== undefined
+              ? async (progress: number, total: number, message?: string) => {
+                  await extra.sendNotification({
+                    method: 'notifications/progress',
+                    params: { progressToken, progress, total, ...(message ? { message } : {}) },
+                  } as Parameters<typeof extra.sendNotification>[0]);
+                }
+              : undefined;
+
+            try {
+              const result = await toolConfig.handler(args as z.infer<T>, { sendProgress });
+              const content = typeof result === 'string' ? result : JSON.stringify(result);
+              return {
+                content: [{ type: 'text' as const, text: content }],
+              };
+            } catch (err) {
+              const message = err instanceof Error ? err.message : String(err);
+              return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
             }
-          );
+          };
+
+          let registration: { remove: () => void };
+          if (toolConfig.appUri) {
+            registration = registerMcpAppTool(
+              mcpServer,
+              name,
+              {
+                ...toolDefinition,
+                _meta: { ui: { resourceUri: toolConfig.appUri } },
+              },
+              handler,
+            );
+          } else {
+            registration = mcpServer.registerTool(
+              name,
+              toolDefinition,
+              handler,
+            );
+          }
           registrations.push(registration);
           pluginLogger.debug(`Registered tool: ${name}`);
         } catch (err) {
@@ -288,13 +309,14 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
       },
       registerAppResource: (uri: string, appConfig: AppResourceConfig) => {
         try {
-          const registration = mcpServer.resource(
+          const registration = registerMcpAppResource(
+            mcpServer,
             appConfig.name,
             uri,
-            { description: appConfig.description, mimeType: MCP_APP_MIME_TYPE },
+            { description: appConfig.description },
             async () => {
               const html = await appConfig.handler();
-              return { contents: [{ uri, text: html, mimeType: MCP_APP_MIME_TYPE }] };
+              return { contents: [{ uri, text: html, mimeType: RESOURCE_MIME_TYPE }] };
             }
           );
           registrations.push(registration);

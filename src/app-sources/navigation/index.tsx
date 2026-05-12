@@ -1,7 +1,7 @@
 /** @jsxImportSource preact */
 import { render } from 'preact';
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { initialize, callTool, getToolText, onNotification } from '../shared/bridge';
+import { initialize, callTool, getToolText, onToolResultNotification } from '../shared/bridge';
 
 interface NavRoute {
   name: string;
@@ -63,10 +63,13 @@ function App() {
 
   useEffect(() => {
     initialize().then(fetchState).catch(() => setLoading(false));
-    onNotification('ui/notifications/tool-result', (params) => {
-      const text = ((params as Record<string, unknown>)?.result as Record<string, unknown>)?.content?.[0]?.text as string | undefined;
-      if (!text || text.startsWith('Navigation')) return;
+    onToolResultNotification((text) => {
+      if (!text || text.startsWith('Navigation')) {
+        setLoading(false);
+        return;
+      }
       try { setState(JSON.parse(text) as NavState); setMsg(''); } catch {}
+      setLoading(false);
     });
   }, []);
 

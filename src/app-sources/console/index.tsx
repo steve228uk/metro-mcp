@@ -1,7 +1,7 @@
 /** @jsxImportSource preact */
 import { render } from 'preact';
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
-import { initialize, callTool, getToolText, onNotification } from '../shared/bridge';
+import { initialize, callTool, getToolText, onToolResultNotification } from '../shared/bridge';
 import { usePolling } from '../shared/usePolling';
 import { useKeyboard } from '../shared/useKeyboard';
 
@@ -12,7 +12,9 @@ interface LogEntry {
   stackTrace?: string;
 }
 
-const LEVELS = ['all', 'log', 'info', 'warn', 'error', 'debug'] as const;
+const LOG_LEVELS = ['log', 'info', 'warn', 'error', 'debug'] as const;
+const LEVELS = ['all', ...LOG_LEVELS] as const;
+const CONSOLE_TEXT_LINE_RE = /^(\d{2}):(\d{2}):(\d{2})\.(\d{3}) \[([^\]]+)\] (.*)$/;
 type Level = typeof LEVELS[number];
 
 function App() {
@@ -27,8 +29,7 @@ function App() {
   const fetchLogs = useCallback(async () => {
     try {
       const result = await callTool('get_console_logs', { format: 'json', limit: 200 });
-      const data = JSON.parse(getToolText(result)) as LogEntry[];
-      setLogs(Array.isArray(data) ? data : []);
+      setLogs(parseConsoleLogs(getToolText(result)));
     } catch {
       // keep existing logs
     } finally {
@@ -38,10 +39,10 @@ function App() {
 
   useEffect(() => {
     initialize().then(fetchLogs).catch(() => setLoading(false));
-    onNotification('ui/notifications/tool-result', (params) => {
-      const text = ((params as Record<string, unknown>)?.result as Record<string, unknown>)?.content?.[0]?.text as string | undefined;
+    onToolResultNotification((text) => {
       if (!text) return;
-      try { const d = JSON.parse(text); if (Array.isArray(d)) setLogs(d); } catch {}
+      setLogs(parseConsoleLogs(text));
+      setLoading(false);
     });
   }, []);
 
@@ -64,7 +65,7 @@ function App() {
   );
 
   const counts: Record<string, number> = { all: logs.length };
-  for (const lv of ['log', 'info', 'warn', 'error', 'debug']) {
+  for (const lv of LOG_LEVELS) {
     counts[lv] = logs.filter(l => l.level === lv).length;
   }
 
@@ -123,8 +124,8 @@ function App() {
 function LogRow({ log, search }: { log: LogEntry; search: string }) {
   const [open, setOpen] = useState(false);
   const ts = new Date(log.timestamp).toTimeString().slice(0, 12);
-  const lv = log.level.toLowerCase();
-  const validLvl = ['log', 'info', 'warn', 'error', 'debug'].includes(lv) ? lv : 'log';
+  const lv = normalizeLevel(log.level);
+  const validLvl = LOG_LEVELS.includes(lv as typeof LOG_LEVELS[number]) ? lv : 'log';
   const rowBg = lv === 'warn' ? ' row-warn' : lv === 'error' ? ' row-error' : '';
 
   return (
@@ -147,6 +148,58 @@ function LogRow({ log, search }: { log: LogEntry; search: string }) {
       )}
     </div>
   );
+}
+
+function normalizeLevel(level: string): string {
+  const lower = level.toLowerCase();
+  return lower === 'warning' ? 'warn' : lower;
+}
+
+function parseConsoleLogs(text: string): LogEntry[] {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (Array.isArray(parsed)) return parsed.map(normalizeLogEntry);
+  } catch {
+    // Fall back to the text format used for non-UI clients.
+  }
+
+  const rows: LogEntry[] = [];
+  let current: LogEntry | null = null;
+
+  for (const line of text.split('\n')) {
+    const match = line.match(CONSOLE_TEXT_LINE_RE);
+    if (match) {
+      if (current) rows.push(current);
+      const [, hh, mm, ss, ms, level, message] = match;
+      const timestamp = new Date();
+      timestamp.setHours(Number(hh), Number(mm), Number(ss), Number(ms));
+      current = normalizeLogEntry({
+        timestamp: timestamp.getTime(),
+        level,
+        message,
+      });
+    } else if (current) {
+      current.message += `\n${line}`;
+    } else if (line.trim()) {
+      rows.push(normalizeLogEntry({
+        timestamp: Date.now(),
+        level: 'log',
+        message: line,
+      }));
+    }
+  }
+
+  if (current) rows.push(current);
+  return rows;
+}
+
+function normalizeLogEntry(entry: Partial<LogEntry>): LogEntry {
+  return {
+    timestamp: typeof entry.timestamp === 'number' ? entry.timestamp : Date.now(),
+    level: normalizeLevel(entry.level || 'log'),
+    message: String(entry.message ?? ''),
+    stackTrace: entry.stackTrace,
+  };
 }
 
 function Highlight({ text, q }: { text: string; q: string }) {

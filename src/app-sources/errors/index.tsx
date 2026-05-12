@@ -1,7 +1,7 @@
 /** @jsxImportSource preact */
 import { render } from 'preact';
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { initialize, callTool, getToolText, onNotification } from '../shared/bridge';
+import { initialize, callTool, getToolText, onToolResultNotification } from '../shared/bridge';
 import { usePolling } from '../shared/usePolling';
 
 interface ErrorEntry {
@@ -34,10 +34,13 @@ function App() {
 
   useEffect(() => {
     initialize().then(fetchErrors).catch(() => setLoading(false));
-    onNotification('ui/notifications/tool-result', (params) => {
-      const text = ((params as Record<string, unknown>)?.result as Record<string, unknown>)?.content?.[0]?.text as string | undefined;
-      if (!text || text === '(no errors)') return;
+    onToolResultNotification((text) => {
+      if (!text || text === '(no errors)') {
+        setLoading(false);
+        return;
+      }
       try { const d = JSON.parse(text); if (Array.isArray(d)) setErrors([...d].reverse()); } catch {}
+      setLoading(false);
     });
   }, []);
 
