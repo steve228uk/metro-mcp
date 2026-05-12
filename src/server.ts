@@ -31,7 +31,7 @@ import { MetroEventsClient } from './metro/events.js';
 import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
 import { extractCDPExceptionMessage } from './utils/cdp.js';
-import { withAppSizing } from './utils/apps.js';
+import { createPreferredFrameSizeMeta, withAppSizing } from './utils/apps.js';
 import { version } from './version.js';
 
 // Built-in plugins
@@ -310,11 +310,12 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
       },
       registerAppResource: (uri: string, appConfig: AppResourceConfig) => {
         try {
+          const preferredFrameSizeMeta = createPreferredFrameSizeMeta(appConfig.minHeight);
           const registration = registerMcpAppResource(
             mcpServer,
             appConfig.name,
             uri,
-            { description: appConfig.description },
+            { description: appConfig.description, _meta: preferredFrameSizeMeta },
             async () => {
               const html = await appConfig.handler();
               return {
@@ -322,6 +323,7 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
                   uri,
                   text: withAppSizing(html, appConfig.minHeight),
                   mimeType: RESOURCE_MIME_TYPE,
+                  _meta: preferredFrameSizeMeta,
                 }],
               };
             }
