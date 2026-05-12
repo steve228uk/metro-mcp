@@ -363,7 +363,7 @@ ctx.registerAppResource('ui://my-plugin/dashboard', {
 });
 ```
 
-The HTML is served with MIME type `text/html;profile=mcp-app` automatically. metro-mcp also gives app iframes a default minimum height of `420px` and sends MCP Apps `ui/notifications/size-changed` notifications so hosts do not collapse the frame before content renders.
+The HTML is served with MIME type `text/html;profile=mcp-app` automatically. metro-mcp also gives app iframes a default minimum height of `420px`, advertises that height through `_meta["mcpui.dev/ui-preferred-frame-size"]`, and sends resize notifications so hosts do not collapse the frame before content renders.
 
 The URI must start with `ui://`. Use `ui://your-plugin-name/...` as a namespace to avoid collisions with built-in apps (`ui://metro/...`).
 

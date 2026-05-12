@@ -88,13 +88,28 @@ export const BRIDGE_BOOTSTRAP_JS = `(function() {
 })();`;
 
 export const DEFAULT_APP_MIN_HEIGHT = 420;
+export const MCP_UI_PREFERRED_FRAME_SIZE_META_KEY = 'mcpui.dev/ui-preferred-frame-size';
 
 const APP_SIZING_ATTRIBUTE = 'data-metro-mcp-app-sizing';
 const APP_SIZING_SELECTORS = ['html', 'body', '#app', '.layout'];
+const APP_FIXED_HEIGHT_SELECTORS = ['body', '.layout'];
+const APP_MEASURED_ELEMENT_SELECTORS = ['#app', '.layout'];
+const APP_SIZE_RETRY_DELAYS = [0, 50, 250, 500, 1000];
+const APP_SIZING_SELECTOR_LIST = APP_SIZING_SELECTORS.join(',');
+const APP_FIXED_HEIGHT_SELECTOR_LIST = APP_FIXED_HEIGHT_SELECTORS.join(',');
+const APP_MEASURED_ELEMENT_SELECTORS_JSON = JSON.stringify(APP_MEASURED_ELEMENT_SELECTORS);
+const APP_SIZE_RETRY_DELAYS_JSON = JSON.stringify(APP_SIZE_RETRY_DELAYS);
 
 function normalizeAppMinHeight(minHeight: number): number {
   if (Number.isFinite(minHeight) && minHeight > 0) return Math.round(minHeight);
   return DEFAULT_APP_MIN_HEIGHT;
+}
+
+export function createPreferredFrameSizeMeta(minHeight = DEFAULT_APP_MIN_HEIGHT): Record<string, unknown> {
+  const safeMinHeight = normalizeAppMinHeight(minHeight);
+  return {
+    [MCP_UI_PREFERRED_FRAME_SIZE_META_KEY]: ['100%', `${safeMinHeight}px`],
+  };
 }
 
 function insertBeforeClosingTag(html: string, closingTag: string, insertion: string, whenMissing: 'append' | 'prepend'): string {
@@ -107,51 +122,92 @@ function insertBeforeClosingTag(html: string, closingTag: string, insertion: str
 
 /**
  * Ensure MCP App resources have a non-collapsing initial height and can ask
- * hosts to resize via the official Apps size notification.
+ * hosts to resize via MCP Apps and MCP-UI compatibility sizing channels.
  */
 export function withAppSizing(html: string, minHeight = DEFAULT_APP_MIN_HEIGHT): string {
   if (html.includes(APP_SIZING_ATTRIBUTE)) return html;
 
   const safeMinHeight = normalizeAppMinHeight(minHeight);
-  const selectorList = APP_SIZING_SELECTORS.join(',');
 
   const sizingStyle = `<style ${APP_SIZING_ATTRIBUTE}>
-${selectorList}{min-height:${safeMinHeight}px}
+${APP_SIZING_SELECTOR_LIST}{min-height:${safeMinHeight}px!important}
+${APP_FIXED_HEIGHT_SELECTOR_LIST}{height:max(100vh,${safeMinHeight}px)!important}
 </style>
 `;
 
   const sizingScript = `<script ${APP_SIZING_ATTRIBUTE}>
 (function(){
   var minHeight = ${safeMinHeight};
-  var sizingSelectors = ${JSON.stringify(APP_SIZING_SELECTORS)};
+  var measuredSelectors = ${APP_MEASURED_ELEMENT_SELECTORS_JSON};
+  var retryDelays = ${APP_SIZE_RETRY_DELAYS_JSON};
   var lastWidth = 0;
   var lastHeight = 0;
   var scheduled = false;
+  var initializePatched = false;
+  function sendToHost(message){
+    var target = window.parent || window;
+    try {
+      target.postMessage(message, '*');
+    } catch (err) {
+      try { target.postMessage(message); } catch (innerErr) {}
+    }
+  }
+  function measureElement(element){
+    if (!element) return 0;
+    return Math.max(
+      element.scrollHeight || 0,
+      element.offsetHeight || 0,
+      Math.ceil(element.getBoundingClientRect ? element.getBoundingClientRect().height : 0)
+    );
+  }
   function measureHeight(){
     var height = minHeight;
-    for (var i = 0; i < sizingSelectors.length; i++) {
-      var element = document.querySelector(sizingSelectors[i]);
-      if (element) height = Math.max(height, element.scrollHeight);
+    height = Math.max(height, measureElement(document.documentElement), measureElement(document.body));
+    for (var i = 0; i < measuredSelectors.length; i++) {
+      height = Math.max(height, measureElement(document.querySelector(measuredSelectors[i])));
     }
     return height;
   }
-  function postSize(){
+  function postSize(force){
     scheduled = false;
     var width = Math.ceil(window.innerWidth || document.documentElement.clientWidth || 0);
     var height = measureHeight();
-    if (width === lastWidth && height === lastHeight) return;
+    if (!force && width === lastWidth && height === lastHeight) return;
     lastWidth = width;
     lastHeight = height;
-    window.parent.postMessage({
+    sendToHost({
+      type: 'ui-size-change',
+      payload: { height: height }
+    });
+    sendToHost({
       jsonrpc: '2.0',
       method: 'ui/notifications/size-changed',
       params: { width: width, height: height }
-    }, '*');
+    });
   }
   function schedulePostSize(){
     if (scheduled) return;
     scheduled = true;
-    requestAnimationFrame(postSize);
+    requestAnimationFrame(function(){ postSize(false); });
+  }
+  function forcePostSize(){
+    postSize(true);
+    requestAnimationFrame(function(){ postSize(true); });
+  }
+  function retryPostSizes(){
+    postSize(true);
+    retryDelays.forEach(function(delay){ setTimeout(forcePostSize, delay); });
+  }
+  function patchInitialize(){
+    if (initializePatched || !window.mcpBridge || typeof window.mcpBridge.initialize !== 'function') return;
+    initializePatched = true;
+    var originalInitialize = window.mcpBridge.initialize;
+    window.mcpBridge.initialize = function(){
+      return originalInitialize.apply(window.mcpBridge, arguments).then(function(result){
+        retryPostSizes();
+        return result;
+      });
+    };
   }
   if ('ResizeObserver' in window) {
     var observer = new ResizeObserver(schedulePostSize);
@@ -160,11 +216,13 @@ ${selectorList}{min-height:${safeMinHeight}px}
     var app = document.getElementById('app');
     if (app) observer.observe(app);
   }
-  window.addEventListener('load', schedulePostSize);
-  window.addEventListener('resize', schedulePostSize);
-  schedulePostSize();
-  setTimeout(schedulePostSize, 100);
-  setTimeout(schedulePostSize, 500);
+  patchInitialize();
+  window.addEventListener('load', function(){
+    patchInitialize();
+    retryPostSizes();
+  });
+  window.addEventListener('resize', forcePostSize);
+  retryPostSizes();
 })();
 </script>
 `;
