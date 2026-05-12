@@ -8,7 +8,14 @@ import { SubscribeRequestSchema, UnsubscribeRequestSchema, RootsListChangedNotif
 
 const execAsync = promisify(exec);
 import { z } from 'zod';
+import {
+  MCP_APP_MIME_TYPE,
+  createMCPAppResourceMeta,
+  resolveMCPAppFrameHeight,
+  withMCPAppFrameSizing,
+} from './plugin.js';
 import type {
+  MCPMetadata,
   MetroMCPConfig,
   PluginContext,
   PluginDefinition,
@@ -55,6 +62,18 @@ import { filesystemPlugin } from './plugins/filesystem.js';
 import { environmentPlugin } from './plugins/environment.js';
 
 const logger = createLogger('server');
+
+function isMCPAppResource(uri: string, mimeType?: string): boolean {
+  return uri.startsWith('ui://') || mimeType === MCP_APP_MIME_TYPE;
+}
+
+function withMeta<T extends object>(value: T, meta?: MCPMetadata): T & { _meta?: MCPMetadata } {
+  return meta ? { ...value, _meta: meta } : value;
+}
+
+function createDefaultMCPAppResourceMeta(meta?: MCPMetadata): MCPMetadata {
+  return createMCPAppResourceMeta(undefined, meta);
+}
 
 const BUILT_IN_PLUGINS: PluginDefinition[] = [
   consolePlugin,
@@ -231,11 +250,11 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
 
           const registration = mcpServer.registerTool(
             name,
-            {
+            withMeta({
               description: toolConfig.description,
               inputSchema,
               annotations: toolConfig.annotations,
-            },
+            }, toolConfig._meta),
             async (args, extra) => {
               // Build a sendProgress helper if the client sent a progressToken
               const progressToken = extra._meta?.progressToken;
@@ -266,13 +285,36 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
       },
       registerResource: (uri: string, resourceConfig: ResourceConfig) => {
         try {
+          const isAppResource = isMCPAppResource(uri, resourceConfig.mimeType);
+          const resolvedMimeType = isAppResource ? MCP_APP_MIME_TYPE : (resourceConfig.mimeType || 'application/json');
+          const resolvedResourceMeta = isAppResource
+            ? createDefaultMCPAppResourceMeta(resourceConfig._meta)
+            : resourceConfig._meta;
+          const frameSizingOptions = isAppResource
+            ? { minHeight: resolveMCPAppFrameHeight(resolvedResourceMeta) }
+            : undefined;
+          const registrationOptions = withMeta({
+            description: resourceConfig.description,
+            mimeType: resolvedMimeType,
+          }, resolvedResourceMeta);
+
           const registration = mcpServer.resource(
             resourceConfig.name,
             uri,
-            { description: resourceConfig.description, mimeType: resourceConfig.mimeType || 'application/json' },
+            registrationOptions,
             async () => {
               const content = await resourceConfig.handler();
-              return { contents: [{ uri, text: content, mimeType: resourceConfig.mimeType || 'application/json' }] };
+              const text = isAppResource
+                ? withMCPAppFrameSizing(content, frameSizingOptions)
+                : content;
+
+              return {
+                contents: [withMeta({
+                  uri,
+                  text,
+                  mimeType: resolvedMimeType,
+                }, resolvedResourceMeta)],
+              };
             }
           );
           registrations.push(registration);

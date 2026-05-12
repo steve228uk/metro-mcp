@@ -32,6 +32,98 @@ export interface ComponentNode {
 
 // ── Tool / Resource / Prompt Registration ──
 
+export const DEFAULT_APP_FRAME_HEIGHT = 420;
+export const MCP_APP_MIME_TYPE = 'text/html;profile=mcp-app';
+export const MCP_UI_PREFERRED_FRAME_SIZE_META_KEY = 'mcpui.dev/ui-preferred-frame-size';
+const MCP_APP_FRAME_SIZING_MARKER = 'data-metro-mcp-app-frame-sizing';
+
+export type MCPMetadata = Record<string, unknown>;
+
+export interface MCPAppFrameSize {
+  width?: number | string;
+  height?: number | string;
+}
+
+export interface MCPAppFrameSizingOptions {
+  minHeight?: number;
+  rootSelector?: string;
+}
+
+export function createMCPAppResourceMeta(
+  frameSize: MCPAppFrameSize = { width: '100%', height: DEFAULT_APP_FRAME_HEIGHT },
+  meta: MCPMetadata = {}
+): MCPMetadata {
+  return {
+    [MCP_UI_PREFERRED_FRAME_SIZE_META_KEY]: frameSize,
+    ...meta,
+  };
+}
+
+export function resolveMCPAppFrameHeight(meta?: MCPMetadata): number {
+  const frameSize = meta?.[MCP_UI_PREFERRED_FRAME_SIZE_META_KEY];
+  if (!frameSize || typeof frameSize !== 'object') return DEFAULT_APP_FRAME_HEIGHT;
+
+  const height = (frameSize as MCPAppFrameSize).height;
+  if (typeof height === 'number' && Number.isFinite(height)) return height;
+  if (typeof height === 'string') {
+    const parsed = Number.parseInt(height, 10);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+
+  return DEFAULT_APP_FRAME_HEIGHT;
+}
+
+function insertBeforeClosingTag(html: string, closingTag: string, insertion: string, appendWhenMissing: boolean): string {
+  if (html.includes(closingTag)) return html.replace(closingTag, `${insertion}${closingTag}`);
+  return appendWhenMissing ? `${html}${insertion}` : `${insertion}${html}`;
+}
+
+export function withMCPAppFrameSizing(html: string, options: MCPAppFrameSizingOptions = {}): string {
+  if (html.includes(MCP_APP_FRAME_SIZING_MARKER)) return html;
+
+  const minHeight = options.minHeight ?? DEFAULT_APP_FRAME_HEIGHT;
+  const rootSelector = options.rootSelector ?? '#root';
+  const sizingStyle = `<style ${MCP_APP_FRAME_SIZING_MARKER}>
+html, body, ${rootSelector} {
+  min-height: ${minHeight}px;
+}
+</style>`;
+  const sizingScript = `<script ${MCP_APP_FRAME_SIZING_MARKER}>
+(() => {
+  const minHeight = ${JSON.stringify(minHeight)};
+  const rootSelector = ${JSON.stringify(rootSelector)};
+  let lastHeight;
+  const postSize = () => {
+    const root = document.querySelector(rootSelector);
+    const contentHeight = Math.max(
+      document.documentElement.scrollHeight,
+      document.body ? document.body.scrollHeight : 0,
+      root ? root.scrollHeight : 0
+    );
+    const height = Math.max(contentHeight, minHeight);
+    if (height === lastHeight) return;
+    lastHeight = height;
+    window.parent.postMessage({ type: 'ui-size-change', payload: { height } }, '*');
+    window.parent.postMessage({
+      jsonrpc: '2.0',
+      method: 'ui/notifications/size-changed',
+      params: { height },
+    }, '*');
+  };
+  if ('ResizeObserver' in window) {
+    const resizeObserver = new ResizeObserver(postSize);
+    resizeObserver.observe(document.documentElement);
+    if (document.body) resizeObserver.observe(document.body);
+  }
+  window.addEventListener('load', postSize);
+  postSize();
+})();
+</script>`;
+
+  const htmlWithStyle = insertBeforeClosingTag(html, '</head>', sizingStyle, false);
+  return insertBeforeClosingTag(htmlWithStyle, '</body>', sizingScript, true);
+}
+
 export interface ToolAnnotations {
   /** Human-readable name for display in client UIs */
   title?: string;
@@ -54,6 +146,8 @@ export interface ToolConfig<T extends z.ZodType = z.ZodType> {
   description: string;
   parameters: T;
   annotations?: ToolAnnotations;
+  /** MCP descriptor metadata, such as output templates for UI resources. */
+  _meta?: MCPMetadata;
   handler: (args: z.infer<T>, ctx: ToolHandlerContext) => Promise<unknown>;
 }
 
@@ -61,6 +155,8 @@ export interface ResourceConfig {
   name: string;
   description: string;
   mimeType?: string;
+  /** MCP resource metadata passed through to clients that support it. */
+  _meta?: MCPMetadata;
   handler: () => Promise<string>;
   /** Called when a client subscribes to this resource URI */
   onSubscribe?: (uri: string) => void;

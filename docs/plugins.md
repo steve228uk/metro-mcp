@@ -119,6 +119,31 @@ ctx.registerResource('metro://my-plugin/state', {
 });
 ```
 
+### MCP App resources
+
+Resources with `ui://` URIs are treated as MCP Apps. metro-mcp sets their MIME type
+to `text/html;profile=mcp-app`, adds a preferred frame size hint, and injects a
+small resize helper so iframe hosts such as Cursor can keep the app visible:
+
+```typescript
+import { z } from 'zod';
+
+ctx.registerTool('show_panel', {
+  description: 'Show the plugin panel',
+  parameters: z.object({}),
+  _meta: { ui: { resourceUri: 'ui://my-plugin/panel' } },
+  handler: async () => 'Opening panel...',
+});
+
+ctx.registerResource('ui://my-plugin/panel', {
+  name: 'Plugin Panel',
+  description: 'Interactive plugin UI',
+  handler: async () => `
+    <div id="root">...</div>
+  `,
+});
+```
+
 ### Push updates
 
 When your resource data changes, notify subscribed clients:
