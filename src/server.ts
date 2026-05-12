@@ -31,6 +31,7 @@ import { MetroEventsClient } from './metro/events.js';
 import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
 import { extractCDPExceptionMessage } from './utils/cdp.js';
+import { withAppSizing } from './utils/apps.js';
 import { version } from './version.js';
 
 // Built-in plugins
@@ -316,7 +317,13 @@ export async function startServer(config: Required<MetroMCPConfig>, args: string
             { description: appConfig.description },
             async () => {
               const html = await appConfig.handler();
-              return { contents: [{ uri, text: html, mimeType: RESOURCE_MIME_TYPE }] };
+              return {
+                contents: [{
+                  uri,
+                  text: withAppSizing(html, appConfig.minHeight),
+                  mimeType: RESOURCE_MIME_TYPE,
+                }],
+              };
             }
           );
           registrations.push(registration);

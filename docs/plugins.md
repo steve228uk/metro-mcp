@@ -358,11 +358,14 @@ Non-MCP-Apps hosts (CLI, simple clients) ignore `appUri` and display the tool's 
 ctx.registerAppResource('ui://my-plugin/dashboard', {
   name: 'My Dashboard',
   description: 'Interactive data viewer',
+  minHeight: 560, // Optional; defaults to 420px
   handler: async () => MY_HTML,
 });
 ```
 
-The HTML is served with MIME type `text/html;profile=mcp-app` automatically. The URI must start with `ui://`. Use `ui://your-plugin-name/...` as a namespace to avoid collisions with built-in apps (`ui://metro/...`).
+The HTML is served with MIME type `text/html;profile=mcp-app` automatically. metro-mcp also gives app iframes a default minimum height of `420px` and sends MCP Apps `ui/notifications/size-changed` notifications so hosts do not collapse the frame before content renders.
+
+The URI must start with `ui://`. Use `ui://your-plugin-name/...` as a namespace to avoid collisions with built-in apps (`ui://metro/...`).
 
 ### Linking a tool to an app
 

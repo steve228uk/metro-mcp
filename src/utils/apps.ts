@@ -87,6 +87,92 @@ export const BRIDGE_BOOTSTRAP_JS = `(function() {
   };
 })();`;
 
+export const DEFAULT_APP_MIN_HEIGHT = 420;
+
+const APP_SIZING_ATTRIBUTE = 'data-metro-mcp-app-sizing';
+const APP_SIZING_SELECTORS = ['html', 'body', '#app', '.layout'];
+
+function normalizeAppMinHeight(minHeight: number): number {
+  if (Number.isFinite(minHeight) && minHeight > 0) return Math.round(minHeight);
+  return DEFAULT_APP_MIN_HEIGHT;
+}
+
+function insertBeforeClosingTag(html: string, closingTag: string, insertion: string, whenMissing: 'append' | 'prepend'): string {
+  const index = html.indexOf(closingTag);
+  if (index !== -1) {
+    return `${html.slice(0, index)}${insertion}${html.slice(index)}`;
+  }
+  return whenMissing === 'append' ? `${html}${insertion}` : `${insertion}${html}`;
+}
+
+/**
+ * Ensure MCP App resources have a non-collapsing initial height and can ask
+ * hosts to resize via the official Apps size notification.
+ */
+export function withAppSizing(html: string, minHeight = DEFAULT_APP_MIN_HEIGHT): string {
+  if (html.includes(APP_SIZING_ATTRIBUTE)) return html;
+
+  const safeMinHeight = normalizeAppMinHeight(minHeight);
+  const selectorList = APP_SIZING_SELECTORS.join(',');
+
+  const sizingStyle = `<style ${APP_SIZING_ATTRIBUTE}>
+${selectorList}{min-height:${safeMinHeight}px}
+</style>
+`;
+
+  const sizingScript = `<script ${APP_SIZING_ATTRIBUTE}>
+(function(){
+  var minHeight = ${safeMinHeight};
+  var sizingSelectors = ${JSON.stringify(APP_SIZING_SELECTORS)};
+  var lastWidth = 0;
+  var lastHeight = 0;
+  var scheduled = false;
+  function measureHeight(){
+    var height = minHeight;
+    for (var i = 0; i < sizingSelectors.length; i++) {
+      var element = document.querySelector(sizingSelectors[i]);
+      if (element) height = Math.max(height, element.scrollHeight);
+    }
+    return height;
+  }
+  function postSize(){
+    scheduled = false;
+    var width = Math.ceil(window.innerWidth || document.documentElement.clientWidth || 0);
+    var height = measureHeight();
+    if (width === lastWidth && height === lastHeight) return;
+    lastWidth = width;
+    lastHeight = height;
+    window.parent.postMessage({
+      jsonrpc: '2.0',
+      method: 'ui/notifications/size-changed',
+      params: { width: width, height: height }
+    }, '*');
+  }
+  function schedulePostSize(){
+    if (scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(postSize);
+  }
+  if ('ResizeObserver' in window) {
+    var observer = new ResizeObserver(schedulePostSize);
+    observer.observe(document.documentElement);
+    if (document.body) observer.observe(document.body);
+    var app = document.getElementById('app');
+    if (app) observer.observe(app);
+  }
+  window.addEventListener('load', schedulePostSize);
+  window.addEventListener('resize', schedulePostSize);
+  schedulePostSize();
+  setTimeout(schedulePostSize, 100);
+  setTimeout(schedulePostSize, 500);
+})();
+</script>
+`;
+
+  const withStyle = insertBeforeClosingTag(html, '</head>', sizingStyle, 'prepend');
+  return insertBeforeClosingTag(withStyle, '</body>', sizingScript, 'append');
+}
+
 /**
  * Wrap a body HTML snippet in a complete, self-contained MCP App document.
  * Includes the postMessage bridge, CSS reset, and theme-aware custom properties.
