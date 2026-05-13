@@ -30,15 +30,13 @@
     }
   },
   "files": [
-    "dist",
-    "scripts/postinstall.cjs"
+    "dist"
   ],
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
     "clean": "rm -rf dist",
     "build": "bun run build:apps && bun run clean && bun run build:js && bun run build:bin && bun run build:types",
-    "postinstall": "node scripts/postinstall.cjs",
     "build:apps": "bun run scripts/build-apps.ts",
     "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod --external ws && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod",
     "build:bin": "bun build bin/metro-mcp.ts --outfile dist/bin/metro-mcp.js --target node --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod --external ws && chmod +x dist/bin/metro-mcp.js",
