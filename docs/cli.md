@@ -52,7 +52,7 @@ Runs the following checks and reports pass/fail for each:
 |---|---|
 | Node.js version | Must be >=18 |
 | Config file | Looks for `metro-mcp.config.ts` or `.js` in the current directory |
-| Metro connectivity | HTTP request to the configured host:port |
+| Metro connectivity | Uses `metro-bridge` status discovery for the configured host:port, including the `localhost` to `127.0.0.1` fallback |
 | Plugin paths | Verifies local plugin file paths from your config exist on disk |
 
 Exit code is `0` if all checks pass, `1` if any fail.
