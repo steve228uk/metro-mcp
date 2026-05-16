@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import * as http from 'node:http';
 import { intro, log, note, outro } from '@clack/prompts';
+import { checkMetroStatus } from 'metro-bridge';
 import { loadConfig } from '../config.js';
 
 function checkNodeVersion(): { ok: boolean; message: string } {
@@ -13,20 +13,12 @@ function checkNodeVersion(): { ok: boolean; message: string } {
   return { ok: false, message: `Node.js ${ver} — requires >=18` };
 }
 
-function checkMetro(host: string, port: number): Promise<{ ok: boolean; message: string }> {
-  return new Promise((resolve) => {
-    const req = http.get({ host, port, path: '/', timeout: 3000 }, (res) => {
-      resolve({ ok: true, message: `Metro reachable at ${host}:${port} (HTTP ${res.statusCode})` });
-      res.resume();
-    });
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ ok: false, message: `Metro not reachable at ${host}:${port} — connection timed out` });
-    });
-    req.on('error', (err) => {
-      resolve({ ok: false, message: `Metro not reachable at ${host}:${port} — ${err.message}` });
-    });
-  });
+async function checkMetro(host: string, port: number): Promise<{ ok: boolean; message: string }> {
+  const status = await checkMetroStatus(host, port);
+  if (status !== null) {
+    return { ok: true, message: `Metro reachable at ${host}:${port} (${status.trim() || 'status ok'})` };
+  }
+  return { ok: false, message: `Metro not reachable at ${host}:${port}` };
 }
 
 function findConfigFile(): string | null {
