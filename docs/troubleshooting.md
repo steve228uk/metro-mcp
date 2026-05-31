@@ -42,15 +42,17 @@ This routes Chrome DevTools through the proxy so both connections remain active.
 
 ## MCP running in multiple agents
 
-Running metro-mcp in more than one AI agent simultaneously (e.g. Claude Code **and** Cursor) causes conflicts — both agents share the same Metro CDP connection and buffers, leading to missed events, duplicate data, and confusing state.
+metro-mcp supports multiple AI agents simultaneously for the same running app. Standard stdio installs start or reuse a shared localhost daemon, so Claude Code, Codex, Cursor, VS Code, and other clients connect to the same Metro/CDP runtime and share buffers.
 
-**Only run metro-mcp in one agent at a time.** If you need to switch agents, stop the MCP in one before starting it in the other. In Claude Code:
+If one agent was started with different Metro flags or config, it may create a separate daemon. Use the same `--port`, `--host`, `--config`, and plugin settings in each MCP client when you want them to share one runtime.
+
+If you need to inspect active MCP servers in Claude Code:
 
 ```
 /mcp
 ```
 
-This shows active MCP servers — remove metro-mcp if you're switching to another editor.
+This shows active MCP servers and lets you restart metro-mcp for that client.
 
 ## Restart the MCP server
 

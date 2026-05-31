@@ -127,6 +127,18 @@ If you use several MCP clients, [`add-mcp`](https://github.com/neondatabase/add-
 npx add-mcp metro-mcp --all -g -y
 ```
 
+metro-mcp supports multiple agents at the same time. Standard stdio installs start or reuse a local shared daemon, so Codex, Claude Code, Cursor, and other clients can connect concurrently to the same running Metro app and see the same logs, network requests, errors, and runtime state.
+
+### Shared HTTP server / Supergateway
+
+If you want to expose one long-lived MCP endpoint yourself, start the shared server explicitly:
+
+```bash
+npx -y metro-mcp serve --mcp-port 8765
+```
+
+This serves Streamable HTTP at `http://127.0.0.1:8765/mcp` and legacy SSE at `http://127.0.0.1:8765/sse`. Tools such as [`supergateway`](https://github.com/supercorp-ai/supergateway) can point at the Streamable HTTP endpoint instead of launching a fresh stdio process per request.
+
 ### With custom Metro port
 
 ```bash

@@ -84,10 +84,16 @@ Prints the plugin's name, version, and description if valid. Exit code is `0` on
 
 ## MCP server options
 
-When run without a subcommand, metro-mcp starts the MCP server:
+When run without a subcommand, metro-mcp starts a stdio MCP server that attaches to a shared localhost daemon. Multiple clients with the same options reuse that daemon and share the same Metro/CDP runtime:
 
 ```bash
 bunx metro-mcp [options]
+```
+
+To run the shared HTTP server in the foreground:
+
+```bash
+bunx metro-mcp serve --mcp-port 8765
 ```
 
 | Flag | Description |
@@ -96,6 +102,8 @@ bunx metro-mcp [options]
 | `--port`, `-p <port>` | Metro bundler port (default: `8081`) |
 | `--config`, `-c <path>` | Path to a config file (absolute or relative to CWD) |
 | `--plugin <path>` | Load a plugin by path — repeatable |
+| `--mcp-port <port>` | Port for `serve` mode (default: random, env: `METRO_MCP_MCP_PORT`) |
+| `--stdio-direct` | Disable multiplexing and run the legacy single-process stdio server |
 | `--help` | Print usage |
 
 **Examples:**
@@ -115,6 +123,9 @@ bunx metro-mcp --plugin ./my-plugin.ts
 
 # Multiple plugins
 bunx metro-mcp --plugin ./plugin-a.ts --plugin ./plugin-b.ts
+
+# Foreground Streamable HTTP endpoint for supergateway or custom clients
+bunx metro-mcp serve --mcp-port 8765
 ```
 
 ## Environment variables
@@ -129,4 +140,6 @@ Key ones at a glance:
 | `METRO_PORT` | Metro bundler port |
 | `METRO_MCP_CONFIG` | Path to config file |
 | `METRO_MCP_PLUGINS` | Colon-separated plugin paths |
+| `METRO_MCP_MCP_PORT` | Port for `serve` mode |
+| `METRO_MCP_MULTIPLEX` | Set to `false` to disable the stdio daemon/proxy |
 | `DEBUG` | Enable debug logging |
