@@ -46,7 +46,7 @@ Standard stdio configuration is still recommended for Codex, Claude Code, Cursor
 }
 ```
 
-Each stdio process connects to a shared local daemon when the Metro/config options match. For tools that need an explicit HTTP endpoint, run:
+Each stdio process connects to a shared local daemon when the project directory and Metro/config options match. For tools that need an explicit HTTP endpoint, run:
 
 ```bash
 npx -y metro-mcp serve --mcp-port 8765

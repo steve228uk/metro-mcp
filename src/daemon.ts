@@ -29,6 +29,7 @@ interface DaemonRecord {
   port: number;
   url: string;
   key: string;
+  cwd: string;
   args: string[];
   startedAt: string;
 }
@@ -47,8 +48,16 @@ function selectedEnv(): Record<string, string | undefined> {
 
 export function getDaemonKey(args: string[]): string {
   const hash = createHash('sha256');
-  hash.update(JSON.stringify({ args, env: selectedEnv() }));
+  hash.update(JSON.stringify({ args, cwd: getDaemonCwd(), env: selectedEnv() }));
   return hash.digest('hex').slice(0, 16);
+}
+
+export function getDaemonCwd(): string {
+  try {
+    return fs.realpathSync(process.cwd());
+  } catch {
+    return process.cwd();
+  }
 }
 
 export function getDaemonRecordPath(key: string): string {

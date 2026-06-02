@@ -84,7 +84,7 @@ Prints the plugin's name, version, and description if valid. Exit code is `0` on
 
 ## MCP server options
 
-When run without a subcommand, metro-mcp starts a stdio MCP server that attaches to a shared localhost daemon. Multiple clients with the same options reuse that daemon and share the same Metro/CDP runtime:
+When run without a subcommand, metro-mcp starts a stdio MCP server that attaches to a shared localhost daemon. Multiple clients launched from the same project directory with the same options reuse that daemon and share the same Metro/CDP runtime:
 
 ```bash
 bunx metro-mcp [options]
