@@ -127,7 +127,7 @@ If you use several MCP clients, [`add-mcp`](https://github.com/neondatabase/add-
 npx add-mcp metro-mcp --all -g -y
 ```
 
-metro-mcp supports multiple agents at the same time. Standard stdio installs start or reuse a local shared daemon, so Codex, Claude Code, Cursor, and other clients can connect concurrently to the same running Metro app and see the same logs, network requests, errors, and runtime state.
+metro-mcp supports multiple agents at the same time. Standard stdio installs start or reuse a local shared daemon for the same project directory and Metro/config options, so Codex, Claude Code, Cursor, and other clients can connect concurrently to the same running Metro app and see the same logs, network requests, errors, and runtime state.
 
 ### Shared HTTP server / Supergateway
 

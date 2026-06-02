@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { loadConfig } from './config.js';
 import { startHttpServer, startServer } from './server.js';
-import { getDaemonKeyFromEnv, startStdioProxy, writeDaemonRecord } from './daemon.js';
+import { getDaemonCwd, getDaemonKeyFromEnv, startStdioProxy, writeDaemonRecord } from './daemon.js';
 import { createLogger } from './utils/logger.js';
 
 const logger = createLogger('main');
@@ -101,6 +101,7 @@ Examples:
             port,
             url,
             key,
+            cwd: getDaemonCwd(),
             args: serverArgs,
             startedAt: new Date().toISOString(),
           });
