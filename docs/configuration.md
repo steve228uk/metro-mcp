@@ -10,6 +10,8 @@
 | `METRO_MCP_PLUGINS` | — | Colon-separated plugin paths to load (e.g. `./my-plugin.ts:metro-mcp-plugin-foo`) |
 | `METRO_MCP_PROXY_ENABLED` | `true` | Enable the CDP proxy for Chrome DevTools coexistence |
 | `METRO_MCP_PROXY_PORT` | `0` (random) | Fixed port for the CDP proxy. Use `0` for a random available port |
+| `METRO_MCP_MCP_PORT` | `0` (random) | Fixed port for `metro-mcp serve` Streamable HTTP/SSE endpoint |
+| `METRO_MCP_MULTIPLEX` | `true` | Set to `false` to run the legacy single-process stdio server |
 | `DEBUG` | — | Enable debug logging |
 
 ## CLI Arguments
@@ -26,6 +28,31 @@ bunx metro-mcp --host 192.168.1.100 --port 19000
 | `--port`, `-p` | Metro bundler port |
 | `--config`, `-c` | Path to config file (overrides `METRO_MCP_CONFIG`) |
 | `--plugin` | Load a plugin by path (repeatable) |
+| `--mcp-port` | Port for `metro-mcp serve` |
+| `--stdio-direct` | Disable stdio multiplexing for this process |
+
+## Multi-client and HTTP mode
+
+Standard stdio configuration is still recommended for Codex, Claude Code, Cursor, VS Code, and OpenCode:
+
+```json
+{
+  "mcpServers": {
+    "metro-mcp": {
+      "command": "npx",
+      "args": ["-y", "metro-mcp"]
+    }
+  }
+}
+```
+
+Each stdio process connects to a shared local daemon when the Metro/config options match. For tools that need an explicit HTTP endpoint, run:
+
+```bash
+npx -y metro-mcp serve --mcp-port 8765
+```
+
+Streamable HTTP is available at `http://127.0.0.1:8765/mcp`; legacy SSE is available at `http://127.0.0.1:8765/sse`.
 
 ## Config File
 
