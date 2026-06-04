@@ -1,24 +1,72 @@
+export interface CircularBufferOptions<T> {
+  maxBytes?: number;
+  sizeOf?: (item: T) => number;
+}
+
+export interface DeviceBufferManagerOptions<T> {
+  maxBytesPerDevice?: number;
+  sizeOf?: (item: T) => number;
+}
+
 /**
  * Fixed-size circular buffer for storing log entries, network requests, etc.
- * When full, oldest entries are overwritten.
+ * When full, oldest entries are overwritten. When a byte budget is provided,
+ * old entries are also evicted until the budget is met, keeping at least one item.
  */
 export class CircularBuffer<T> {
   private items: T[];
+  private itemSizes: number[];
   private head = 0;
   private count = 0;
+  private totalBytes = 0;
 
-  constructor(private readonly capacity: number) {
+  constructor(
+    private readonly capacity: number,
+    private readonly options: CircularBufferOptions<T> = {},
+  ) {
     this.items = new Array(capacity);
+    this.itemSizes = new Array(capacity).fill(0);
   }
 
   push(item: T): void {
     const index = (this.head + this.count) % this.capacity;
+    const itemSize = this.options.sizeOf?.(item) ?? 0;
     if (this.count < this.capacity) {
       this.count++;
     } else {
+      this.totalBytes -= this.itemSizes[this.head] ?? 0;
       this.head = (this.head + 1) % this.capacity;
     }
     this.items[index] = item;
+    this.itemSizes[index] = itemSize;
+    this.totalBytes += itemSize;
+
+    this.evictOverBudget();
+  }
+
+  recalculateByteSize(): void {
+    this.totalBytes = 0;
+    for (let i = 0; i < this.count; i++) {
+      const index = (this.head + i) % this.capacity;
+      const size = this.options.sizeOf?.(this.items[index]!) ?? 0;
+      this.itemSizes[index] = size;
+      this.totalBytes += size;
+    }
+    this.evictOverBudget();
+  }
+
+  private evictOverBudget(): void {
+    while (
+      this.options.maxBytes !== undefined &&
+      this.count > 1 &&
+      this.totalBytes > this.options.maxBytes
+    ) {
+      this.totalBytes -= this.itemSizes[this.head] ?? 0;
+      this.itemSizes[this.head] = 0;
+      this.items[this.head] = undefined as T;
+      this.head = (this.head + 1) % this.capacity;
+      this.count--;
+    }
   }
 
   getAll(): T[] {
@@ -42,6 +90,8 @@ export class CircularBuffer<T> {
     this.head = 0;
     this.count = 0;
     this.items = new Array(this.capacity);
+    this.itemSizes = new Array(this.capacity).fill(0);
+    this.totalBytes = 0;
   }
 
   get size(): number {
@@ -50,6 +100,10 @@ export class CircularBuffer<T> {
 
   get maxSize(): number {
     return this.capacity;
+  }
+
+  get byteSize(): number {
+    return this.totalBytes;
   }
 }
 
@@ -63,7 +117,10 @@ export class DeviceBufferManager<T extends { timestamp: number }> {
   private insertionOrder: string[] = [];
   private readonly maxDevices = 10;
 
-  constructor(private readonly capacityPerDevice: number) {}
+  constructor(
+    private readonly capacityPerDevice: number,
+    private readonly options: DeviceBufferManagerOptions<T> = {},
+  ) {}
 
   /** Get or lazily create a buffer for the given device key. */
   getOrCreate(deviceKey: string): CircularBuffer<T> {
@@ -77,7 +134,10 @@ export class DeviceBufferManager<T extends { timestamp: number }> {
           break;
         }
       }
-      buffer = new CircularBuffer<T>(this.capacityPerDevice);
+      buffer = new CircularBuffer<T>(this.capacityPerDevice, {
+        maxBytes: this.options.maxBytesPerDevice,
+        sizeOf: this.options.sizeOf,
+      });
       this.buffers.set(deviceKey, buffer);
       this.insertionOrder.push(deviceKey);
     }
@@ -119,6 +179,26 @@ export class DeviceBufferManager<T extends { timestamp: number }> {
     } else {
       for (const buffer of this.buffers.values()) {
         buffer.clear();
+      }
+    }
+  }
+
+  /** Clear the same device selection syntax used by resolve(). */
+  clearResolved(device: string | undefined, activeKey: string | null): void {
+    if (device === 'all') {
+      this.clear();
+    } else {
+      this.clear(device || activeKey || undefined);
+    }
+  }
+
+  /** Recalculate byte accounting after a retained entry is mutated in place. */
+  recalculateByteSize(deviceKey?: string): void {
+    if (deviceKey) {
+      this.buffers.get(deviceKey)?.recalculateByteSize();
+    } else {
+      for (const buffer of this.buffers.values()) {
+        buffer.recalculateByteSize();
       }
     }
   }

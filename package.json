@@ -35,6 +35,7 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
+    "test": "bun run build:apps && bun test",
     "clean": "rm -rf dist",
     "build": "bun run build:apps && bun run clean && bun run build:js && bun run build:bin && bun run build:types",
     "build:apps": "bun run scripts/build-apps.ts",

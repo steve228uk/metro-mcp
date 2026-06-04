@@ -35,6 +35,8 @@ import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
 import { extractCDPExceptionMessage } from './utils/cdp.js';
 import { createPreferredFrameSizeMeta, withAppSizing } from './utils/apps.js';
+import { ResourceSubscriptionManager } from './utils/resource-subscriptions.js';
+import { createResourceUpdateScheduler } from './utils/resource-updates.js';
 import { version } from './version.js';
 
 // Built-in plugins
@@ -67,6 +69,7 @@ import { environmentPlugin } from './plugins/environment.js';
 
 const execAsync = promisify(exec);
 const logger = createLogger('server');
+const RESOURCE_UPDATE_COALESCE_MS = 250;
 
 const BUILT_IN_PLUGINS: PluginDefinition[] = [
   consolePlugin,
@@ -149,17 +152,23 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   const formatUtils = createFormatUtils();
   const sessions = new Set<McpSession>();
   const runtimeRegistrations: RuntimeRegistration[] = [];
+  const resourceSubscriptions = new ResourceSubscriptionManager();
   let projectRoot: string | null = null;
   let reloadInProgress = false;
   let isInitializingPlugins = false;
   let runtimeClosed = false;
 
+  const resourceUpdates = createResourceUpdateScheduler({
+    delayMs: RESOURCE_UPDATE_COALESCE_MS,
+    getTargets: () => [...sessions].map((session) => ({
+      id: session.id,
+      isSubscribed: (uri) => session.subscribedResources.has(uri),
+      sendResourceUpdated: (uri) => session.server.server.sendResourceUpdated({ uri }),
+    })),
+  });
+
   function notifyResourceUpdated(uri: string): void {
-    for (const session of sessions) {
-      if (session.subscribedResources.has(uri)) {
-        session.server.server.sendResourceUpdated({ uri }).catch(() => {});
-      }
-    }
+    resourceUpdates.notify(uri);
   }
 
   // Active device tracking — used by plugins to key per-device buffers.
@@ -356,14 +365,19 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
       },
       registerResource: (uri: string, resourceConfig: ResourceConfig) => {
         try {
+          const mimeType = resourceConfig.mimeType || 'application/json';
+          resourceSubscriptions.register(uri, {
+            onSubscribe: resourceConfig.onSubscribe,
+            onUnsubscribe: resourceConfig.onUnsubscribe,
+          });
           addRuntimeRegistration(
             (session) => session.server.resource(
               resourceConfig.name,
               uri,
-              { description: resourceConfig.description, mimeType: resourceConfig.mimeType || 'application/json' },
+              { description: resourceConfig.description, mimeType },
               async () => {
                 const content = await resourceConfig.handler();
-                return { contents: [{ uri, text: content, mimeType: resourceConfig.mimeType || 'application/json' }] };
+                return { contents: [{ uri, text: content, mimeType }] };
               }
             ),
             pluginLogger,
@@ -503,6 +517,7 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   // can be called again when the active project root changes.
   async function initPlugins(cfg: Required<MetroMCPConfig>, rootPath?: string): Promise<void> {
     runtimeRegistrations.length = 0;
+    resourceSubscriptions.clearHooks();
     for (const session of sessions) {
       clearSessionRegistrations(session);
     }
@@ -781,13 +796,13 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     };
 
     session.server.server.setRequestHandler(SubscribeRequestSchema, async (req) => {
-      session.subscribedResources.add(req.params.uri);
+      resourceSubscriptions.subscribe(session, req.params.uri);
       logger.debug(`Client subscribed to resource: ${req.params.uri}`);
       return {};
     });
 
     session.server.server.setRequestHandler(UnsubscribeRequestSchema, async (req) => {
-      session.subscribedResources.delete(req.params.uri);
+      resourceSubscriptions.unsubscribe(session, req.params.uri);
       logger.debug(`Client unsubscribed from resource: ${req.params.uri}`);
       return {};
     });
@@ -798,6 +813,7 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     const previousClose = transport.onclose;
     transport.onclose = () => {
       previousClose?.();
+      resourceUpdates.removeTarget(session.id);
       clearSessionRegistrations(session);
       sessions.delete(session);
       logger.debug(`MCP session closed: ${session.id}`);
@@ -822,10 +838,12 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     process.off('SIGTERM', handleSigterm);
     process.off('exit', handleExit);
     for (const session of sessions) {
+      resourceUpdates.removeTarget(session.id);
       clearSessionRegistrations(session);
       session.server.close().catch(() => {});
     }
     sessions.clear();
+    resourceUpdates.close();
     eventsClient.disconnect();
     cleanProxyLock();
     cdpMultiplexer?.stop();

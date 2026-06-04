@@ -3,7 +3,12 @@ import { definePlugin } from '../plugin.js';
 import { CircularBuffer, DeviceBufferManager } from '../utils/buffer.js';
 import { formatTime } from '../utils/format.js';
 import { extractCDPExceptionMessage } from '../utils/cdp.js';
+import { byteLength, stringifyBounded, truncateString } from '../utils/payload.js';
 import { buildErrorsHtml } from '../apps/errors.js';
+
+const MAX_ERROR_MESSAGE_CHARS = 16 * 1024;
+const MAX_ERROR_STACK_CHARS = 64 * 1024;
+const MAX_ERRORS_BUFFER_BYTES = 1024 * 1024;
 
 interface ErrorEntry {
   timestamp: number;
@@ -29,6 +34,10 @@ const BUNDLE_ERROR_PATTERNS = [
   /Unexpected token/,
 ];
 
+function errorEntrySize(entry: ErrorEntry): number {
+  return byteLength(entry.message) + byteLength(entry.stack) + byteLength(entry.symbolicatedStack) + 64;
+}
+
 function parseErrorLocation(message: string): { file?: string; lineNumber?: number; column?: number } {
   const fileMatch = message.match(/(?:in |from )([^\s:]+(?:\.tsx?|\.jsx?|\.json))/);
   const lineMatch = message.match(/(?:line |:)(\d+)/);
@@ -46,7 +55,10 @@ export const errorsPlugin = definePlugin({
   description: 'Exception collection with auto-symbolication',
 
   async setup(ctx) {
-    const buffers = new DeviceBufferManager<ErrorEntry>(100);
+    const buffers = new DeviceBufferManager<ErrorEntry>(100, {
+      maxBytesPerDevice: MAX_ERRORS_BUFFER_BYTES,
+      sizeOf: errorEntrySize,
+    });
     // Bundle errors are per-Metro-server, not per-device, so a single buffer is fine.
     const bundleErrors = new CircularBuffer<BundleError>(100);
 
@@ -55,7 +67,10 @@ export const errorsPlugin = definePlugin({
     ctx.cdp.on('Runtime.consoleAPICalled', (params) => {
       if (params.type === 'error') {
         const args = (params.args as Array<Record<string, unknown>>) || [];
-        const message = args.map((a) => a.value || a.description || '').join(' ');
+        const message = truncateString(
+          args.map((a) => a.value || a.description || '').join(' '),
+          MAX_ERROR_MESSAGE_CHARS,
+        );
         for (const pattern of BUNDLE_ERROR_PATTERNS) {
           if (pattern.test(message)) {
             bundleErrors.push({
@@ -71,7 +86,7 @@ export const errorsPlugin = definePlugin({
     });
 
     ctx.events.on('bundling_error', (event) => {
-      const message = (event.message as string) || 'Unknown bundling error';
+      const message = truncateString((event.message as string) || 'Unknown bundling error', MAX_ERROR_MESSAGE_CHARS);
       bundleErrors.push({
         timestamp: Date.now(),
         type: 'BundlingError',
@@ -81,15 +96,18 @@ export const errorsPlugin = definePlugin({
     });
 
     ctx.cdp.on('Runtime.exceptionThrown', async (params) => {
-      const message = extractCDPExceptionMessage(
-        params.exceptionDetails as Record<string, unknown>,
-        'Unknown error'
+      const message = truncateString(
+        extractCDPExceptionMessage(
+          params.exceptionDetails as Record<string, unknown>,
+          'Unknown error'
+        ),
+        MAX_ERROR_MESSAGE_CHARS,
       );
 
       const exceptionDetails = params.exceptionDetails as Record<string, unknown>;
       const stackTrace = exceptionDetails?.stackTrace as Record<string, unknown>;
       const stack = stackTrace?.callFrames
-        ? JSON.stringify(stackTrace.callFrames)
+        ? stringifyBounded(stackTrace.callFrames, MAX_ERROR_STACK_CHARS)
         : undefined;
 
       const entry: ErrorEntry = {
@@ -115,7 +133,7 @@ export const errorsPlugin = definePlugin({
             );
             if (symResponse.ok) {
               const result = (await symResponse.json()) as Record<string, unknown>;
-              entry.symbolicatedStack = JSON.stringify(result.stack);
+              entry.symbolicatedStack = stringifyBounded(result.stack, MAX_ERROR_STACK_CHARS);
             }
           }
         } catch {
@@ -180,10 +198,10 @@ export const errorsPlugin = definePlugin({
       }),
       handler: async ({ device }) => {
         if (device === 'all') {
-          buffers.clear();
+          buffers.clearResolved(device, ctx.getActiveDeviceKey());
           return 'Error buffer cleared for all devices.';
         }
-        buffers.clear(device || ctx.getActiveDeviceKey() || undefined);
+        buffers.clearResolved(device, ctx.getActiveDeviceKey());
         return 'Error buffer cleared.';
       },
     });

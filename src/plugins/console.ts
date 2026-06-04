@@ -2,7 +2,12 @@ import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { DeviceBufferManager } from '../utils/buffer.js';
 import { formatTime } from '../utils/format.js';
+import { byteLength, stringifyBounded, truncateString } from '../utils/payload.js';
 import { buildConsoleHtml } from '../apps/console.js';
+
+export const MAX_CONSOLE_MESSAGE_CHARS = 16 * 1024;
+export const MAX_CONSOLE_STACK_CHARS = 32 * 1024;
+const MAX_CONSOLE_BUFFER_BYTES = 2 * 1024 * 1024;
 
 interface LogEntry {
   timestamp: number;
@@ -57,22 +62,22 @@ function formatPreview(preview: CDPObjectPreview): string | null {
  * Used as the immediate fallback before async deep resolution completes.
  */
 function formatRemoteObject(obj: CDPRemoteObject): string {
-  if (obj.type === 'string') return obj.value as string;
+  if (obj.type === 'string') return truncateString(obj.value as string, MAX_CONSOLE_MESSAGE_CHARS);
   if (obj.type === 'number') return String(obj.value);
   if (obj.type === 'boolean') return String(obj.value);
   if (obj.type === 'undefined') return 'undefined';
   if (obj.subtype === 'null') return 'null';
   if (obj.preview) {
     const formatted = formatPreview(obj.preview);
-    if (formatted) return formatted;
+    if (formatted) return truncateString(formatted, MAX_CONSOLE_MESSAGE_CHARS);
   }
-  if (obj.description) return obj.description;
-  if (obj.value !== undefined) return JSON.stringify(obj.value);
+  if (obj.description) return truncateString(obj.description, MAX_CONSOLE_MESSAGE_CHARS);
+  if (obj.value !== undefined) return stringifyBounded(obj.value, MAX_CONSOLE_MESSAGE_CHARS);
   return (obj.className as string) || (obj.type as string) || '[object]';
 }
 
-function formatCDPArgs(args: unknown[]): string {
-  return args
+export function formatCDPArgs(args: unknown[]): string {
+  const message = args
     .map((arg) => {
       if (typeof arg === 'object' && arg !== null) {
         return formatRemoteObject(arg as CDPRemoteObject);
@@ -80,6 +85,7 @@ function formatCDPArgs(args: unknown[]): string {
       return String(arg);
     })
     .join(' ');
+  return truncateString(message, MAX_CONSOLE_MESSAGE_CHARS);
 }
 
 async function resolveRemoteObject(
@@ -89,18 +95,31 @@ async function resolveRemoteObject(
   try {
     const result = (await cdpSend('Runtime.callFunctionOn', {
       objectId,
-      functionDeclaration:
-        'function() { try { return JSON.stringify(this); } catch(e) { return "[unserializable]"; } }',
+      functionDeclaration: buildStringifyRemoteObjectFunction(MAX_CONSOLE_MESSAGE_CHARS),
       returnByValue: true,
     })) as Record<string, unknown>;
     const inner = result.result as Record<string, unknown> | undefined;
-    return inner?.value ? (inner.value as string) : null;
+    return inner?.value ? truncateString(inner.value as string, MAX_CONSOLE_MESSAGE_CHARS) : null;
   } catch {
     return null;
   }
 }
 
-async function formatCDPArgsDeep(
+function buildStringifyRemoteObjectFunction(maxChars: number): string {
+  return `function() {
+    try {
+      var value = JSON.stringify(this);
+      if (typeof value === 'string' && value.length > ${maxChars}) {
+        return value.slice(0, ${maxChars}) + "\\n[truncated " + (value.length - ${maxChars}) + " chars]";
+      }
+      return value;
+    } catch(e) {
+      return "[unserializable]";
+    }
+  }`;
+}
+
+export async function formatCDPArgsDeep(
   cdpSend: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
   args: unknown[],
 ): Promise<string> {
@@ -115,7 +134,16 @@ async function formatCDPArgsDeep(
       return formatRemoteObject(remoteObj);
     }),
   );
-  return parts.join(' ');
+  return truncateString(parts.join(' '), MAX_CONSOLE_MESSAGE_CHARS);
+}
+
+function formatStackTrace(stackTrace: unknown): string | undefined {
+  if (!stackTrace) return undefined;
+  return stringifyBounded((stackTrace as Record<string, unknown>).callFrames, MAX_CONSOLE_STACK_CHARS);
+}
+
+function logEntrySize(entry: LogEntry): number {
+  return byteLength(entry.message) + byteLength(entry.stackTrace) + 64;
 }
 
 export const consolePlugin = definePlugin({
@@ -124,8 +152,21 @@ export const consolePlugin = definePlugin({
   description: 'Console log collection and filtering',
 
   async setup(ctx) {
-    const buffers = new DeviceBufferManager<LogEntry>(500);
+    const buffers = new DeviceBufferManager<LogEntry>(500, {
+      maxBytesPerDevice: MAX_CONSOLE_BUFFER_BYTES,
+      sizeOf: logEntrySize,
+    });
     const cdpSend = ctx.cdp.send.bind(ctx.cdp);
+
+    function pushInfoMessage(message: string): void {
+      const key = ctx.getActiveDeviceKey();
+      if (!key) return;
+      buffers.getOrCreate(key).push({
+        timestamp: Date.now(),
+        level: 'info',
+        message,
+      });
+    }
 
     ctx.cdp.on('Runtime.consoleAPICalled', (params) => {
       const key = ctx.getActiveDeviceKey();
@@ -136,9 +177,7 @@ export const consolePlugin = definePlugin({
         timestamp: Date.now(),
         level: params.type as string,
         message: formatCDPArgs(args),
-        stackTrace: params.stackTrace
-          ? JSON.stringify((params.stackTrace as Record<string, unknown>).callFrames)
-          : undefined,
+        stackTrace: formatStackTrace(params.stackTrace),
       };
       buffers.getOrCreate(key).push(entry);
       ctx.notifyResourceUpdated('metro://logs');
@@ -150,7 +189,10 @@ export const consolePlugin = definePlugin({
       if (hasResolvable) {
         formatCDPArgsDeep(cdpSend, args)
           .then((deep) => {
-            if (deep !== entry.message) entry.message = deep;
+            if (deep !== entry.message) {
+              entry.message = deep;
+              buffers.recalculateByteSize(key);
+            }
           })
           .catch(() => {});
       }
@@ -159,26 +201,14 @@ export const consolePlugin = definePlugin({
     // Mark when Metro starts rebuilding — a reload is imminent.
     ctx.events.on('bundle_transform_progressed', (event) => {
       if (event.transformedFileCount === 1) {
-        const key = ctx.getActiveDeviceKey();
-        if (!key) return;
-        buffers.getOrCreate(key).push({
-          timestamp: Date.now(),
-          level: 'info',
-          message: '── Metro rebuilding ── (file change detected)',
-        });
+        pushInfoMessage('── Metro rebuilding ── (file change detected)');
       }
     });
 
     // Insert a visible boundary marker when the CDP connection is re-established,
     // so it's clear where a gap in logs may have occurred.
     ctx.cdp.on('reconnected', () => {
-      const key = ctx.getActiveDeviceKey();
-      if (!key) return;
-      buffers.getOrCreate(key).push({
-        timestamp: Date.now(),
-        level: 'info',
-        message: '── CDP reconnected ── (logs during the disconnection gap may be missing)',
-      });
+      pushInfoMessage('── CDP reconnected ── (logs during the disconnection gap may be missing)');
     });
 
     ctx.registerAppResource('ui://metro/console', {
@@ -227,10 +257,10 @@ export const consolePlugin = definePlugin({
       }),
       handler: async ({ device }) => {
         if (device === 'all') {
-          buffers.clear();
+          buffers.clearResolved(device, ctx.getActiveDeviceKey());
           return 'Console logs cleared for all devices.';
         }
-        buffers.clear(device || ctx.getActiveDeviceKey() || undefined);
+        buffers.clearResolved(device, ctx.getActiveDeviceKey());
         return 'Console logs cleared.';
       },
     });
