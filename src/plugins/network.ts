@@ -265,7 +265,7 @@ export const networkPlugin = definePlugin({
         try {
           const result = await ctx.cdp.send('Network.getResponseBody', { requestId: req.id }) as { body: string; base64Encoded: boolean };
           const body = decodeResponseBody(result);
-          if (body.length <= MAX_BODY_CACHE_SIZE) {
+          if (byteLength(body) <= MAX_BODY_CACHE_SIZE) {
             req.responseBody = body;
             buffers.recalculateByteSize(device && device !== 'all' ? device : undefined);
           }

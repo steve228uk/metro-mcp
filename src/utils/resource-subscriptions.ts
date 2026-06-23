@@ -31,4 +31,10 @@ export class ResourceSubscriptionManager {
       this.hooks.get(uri)?.onUnsubscribe?.(uri);
     }
   }
+
+  unsubscribeAll(session: ResourceSubscriptionSession): void {
+    for (const uri of [...session.subscribedResources]) {
+      this.unsubscribe(session, uri);
+    }
+  }
 }

@@ -847,6 +847,7 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     const previousClose = transport.onclose;
     transport.onclose = () => {
       previousClose?.();
+      resourceSubscriptions.unsubscribeAll(session);
       resourceUpdates.removeTarget(session.id);
       clearSessionRegistrations(session);
       sessions.delete(session);
@@ -877,6 +878,7 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     process.off('SIGTERM', handleSigterm);
     process.off('exit', handleExit);
     for (const session of sessions) {
+      resourceSubscriptions.unsubscribeAll(session);
       resourceUpdates.removeTarget(session.id);
       clearSessionRegistrations(session);
       session.server.close().catch(() => {});

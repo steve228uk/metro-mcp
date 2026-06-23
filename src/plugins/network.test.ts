@@ -4,7 +4,7 @@ import type { ComponentNode, PluginContext } from '../plugin.js';
 
 type Handler = (params: Record<string, unknown>) => void;
 
-test('network plugin fetches response bodies only on explicit request', async () => {
+async function createNetworkHarness(responseBody: string) {
   const handlers = new Map<string, Handler[]>();
   const tools = new Map<string, { handler: (args: Record<string, unknown>) => Promise<unknown> }>();
   const cdpSends: Array<{ method: string; params?: Record<string, unknown> }> = [];
@@ -35,7 +35,7 @@ test('network plugin fetches response bodies only on explicit request', async ()
       getTarget: () => null,
       send: async (method: string, params?: Record<string, unknown>) => {
         cdpSends.push({ method, params });
-        return { body: '{"ok":true}', base64Encoded: false };
+        return { body: responseBody, base64Encoded: false };
       },
     },
     events: {
@@ -74,6 +74,10 @@ test('network plugin fetches response bodies only on explicit request', async ()
 
   await networkPlugin.setup(ctx);
 
+  return { cdpSends, emit, tools };
+}
+
+function recordFinishedRequest(emit: (event: string, params: Record<string, unknown>) => void): void {
   emit('Network.requestWillBeSent', {
     requestId: 'request-1',
     request: { url: 'https://example.test/api', method: 'GET', headers: {} },
@@ -87,6 +91,12 @@ test('network plugin fetches response bodies only on explicit request', async ()
     requestId: 'request-1',
     encodedDataLength: 12,
   });
+}
+
+test('network plugin fetches response bodies only on explicit request', async () => {
+  const { cdpSends, emit, tools } = await createNetworkHarness('{"ok":true}');
+
+  recordFinishedRequest(emit);
 
   expect(cdpSends).toEqual([]);
 
@@ -102,4 +112,28 @@ test('network plugin fetches response bodies only on explicit request', async ()
     status: 200,
     body: { ok: true },
   });
+});
+
+test('network plugin does not cache response bodies over the byte limit', async () => {
+  const largeMultibyteBody = String.fromCodePoint(0x1f600).repeat(300_000);
+  expect(largeMultibyteBody.length).toBeLessThan(1024 * 1024);
+  expect(Buffer.byteLength(largeMultibyteBody, 'utf8')).toBeGreaterThan(1024 * 1024);
+
+  const { emit, tools } = await createNetworkHarness(largeMultibyteBody);
+  recordFinishedRequest(emit);
+
+  const getResponseBody = tools.get('get_response_body');
+  expect(getResponseBody).toBeDefined();
+
+  const result = await getResponseBody!.handler({ url: 'example.test', index: -1 });
+  expect(result).toEqual({
+    url: 'https://example.test/api',
+    status: 200,
+    body: largeMultibyteBody,
+  });
+
+  emit('reconnected', {});
+
+  const unavailable = await getResponseBody!.handler({ url: 'example.test', index: -1 });
+  expect(unavailable).toContain('Response body unavailable');
 });
