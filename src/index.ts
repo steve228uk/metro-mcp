@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 import { loadConfig } from './config.js';
 import { startHttpServer, startServer } from './server.js';
-import { getDaemonCwd, getDaemonKeyFromEnv, startStdioProxy, writeDaemonRecord } from './daemon.js';
+import {
+  createDaemonIdentity,
+  getDaemonCwd,
+  getDaemonKeyFromEnv,
+  removeDaemonRecordForProcess,
+  startStdioProxy,
+  writeDaemonRecord,
+} from './daemon.js';
 import { createLogger } from './utils/logger.js';
 
 const logger = createLogger('main');
@@ -91,9 +98,12 @@ Examples:
 
     if (subcommand === 'serve') {
       const mcpPort = resolveMcpPort(serverArgs);
-      const key = getDaemonKeyFromEnv(serverArgs);
+      const identity = createDaemonIdentity(serverArgs);
+      const key = getDaemonKeyFromEnv(serverArgs, identity);
+      const cleanupDaemonRecord = () => removeDaemonRecordForProcess(key, process.pid);
       await startHttpServer(config, serverArgs, {
         port: mcpPort,
+        daemon: { key, identity },
         onListening: ({ host, port, url }) => {
           writeDaemonRecord({
             pid: process.pid,
@@ -103,8 +113,10 @@ Examples:
             key,
             cwd: getDaemonCwd(),
             args: serverArgs,
+            identity,
             startedAt: new Date().toISOString(),
           });
+          process.once('exit', cleanupDaemonRecord);
         },
       });
       return;
