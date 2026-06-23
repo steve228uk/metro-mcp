@@ -2,6 +2,7 @@ import fs from 'fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { supportsMultipleDebuggers, openDevTools } from 'metro-bridge';
 import { definePlugin } from '../plugin.js';
 import { createLogger } from '../utils/logger.js';
 
@@ -91,7 +92,8 @@ export const devtoolsPlugin = definePlugin({
         open: z.boolean().default(true).describe('Attempt to open the browser automatically'),
       }),
       handler: async ({ open }) => {
-        if (!ctx.cdp.getTarget()) {
+        const target = ctx.cdp.getTarget();
+        if (!target) {
           return 'Not connected to Metro. Start your React Native app and try again.';
         }
 
@@ -100,6 +102,36 @@ export const devtoolsPlugin = definePlugin({
         const proxyPort = proxyConfig?.port;
 
         if (!proxyPort) {
+          if (supportsMultipleDebuggers(target)) {
+            let frontendUrl: string;
+            if (target.devtoolsFrontendUrl) {
+              frontendUrl = `http://${ctx.metro.host}:${ctx.metro.port}${target.devtoolsFrontendUrl}`;
+            } else {
+              let wsHost: string;
+              try {
+                wsHost = new URL(target.webSocketDebuggerUrl).host;
+              } catch {
+                return 'Could not parse Metro WebSocket URL. Try reconnecting.';
+              }
+              frontendUrl = buildFrontendUrl(ctx.metro.host, ctx.metro.port, wsHost);
+            }
+
+            if (open) {
+              try {
+                const result = await openDevTools(frontendUrl);
+                return { opened: result.opened, url: frontendUrl };
+              } catch (err) {
+                logger.debug('Failed to open DevTools:', err);
+              }
+            }
+
+            return {
+              opened: false,
+              url: frontendUrl,
+              instructions: 'Open this URL in Chrome or Edge: ' + frontendUrl,
+            };
+          }
+
           return 'CDP proxy is not running. Set proxy.enabled to true in your metro-mcp config.';
         }
 
