@@ -37,6 +37,7 @@
     "dev": "bun run --watch src/index.ts",
     "test": "bun run build:apps && bun test",
     "clean": "rm -rf dist",
+    "prepare": "bun run build",
     "build": "bun run build:apps && bun run clean && bun run build:js && bun run build:bin && bun run build:types",
     "build:apps": "bun run scripts/build-apps.ts",
     "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod --external ws && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod",
