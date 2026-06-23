@@ -37,6 +37,8 @@ import { createFormatUtils } from './utils/format.js';
 import { extractCDPExceptionMessage } from './utils/cdp.js';
 import { createPreferredFrameSizeMeta, withAppSizing } from './utils/apps.js';
 import { version } from './version.js';
+import { createDaemonIdentity, getDaemonKey } from './daemon.js';
+import type { DaemonIdentity } from './daemon.js';
 
 // Built-in plugins
 import { consolePlugin } from './plugins/console.js';
@@ -110,6 +112,10 @@ interface McpSession {
 interface HttpServerOptions {
   host?: string;
   port?: number;
+  daemon?: {
+    key: string;
+    identity: DaemonIdentity;
+  };
   onListening?: (info: { host: string; port: number; url: string }) => void;
 }
 
@@ -171,10 +177,19 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   // Start with a very short delay (500ms) to recover quickly from brief disconnects
   // like hot reloads, then ramp up for longer outages.
   const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000, 16000];
+  const RECONNECT_STABLE_MS = 5000;
   const MAX_BURST_ATTEMPTS = 15; // fast retries; after this, switch to slow background probe
   let reconnectAttempts = 0;
   let isReconnecting = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectStabilityTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearReconnectStabilityTimer(): void {
+    if (reconnectStabilityTimer) {
+      clearTimeout(reconnectStabilityTimer);
+      reconnectStabilityTimer = null;
+    }
+  }
 
   function waitForReconnect(): Promise<void> {
     return new Promise<void>((resolve) => {
@@ -226,14 +241,23 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
 
   // Enable required CDP domains on every connection (initial and reconnect).
   cdpSession.on('reconnected', async () => {
-    reconnectAttempts = 0;
     isReconnecting = false;
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     await enableCDPDomains();
+    clearReconnectStabilityTimer();
+    reconnectStabilityTimer = setTimeout(() => {
+      reconnectStabilityTimer = null;
+      if (!runtimeClosed && cdpSession.isConnected) {
+        reconnectAttempts = 0;
+        logger.debug('CDP connection stable; reset reconnect backoff');
+      }
+    }, RECONNECT_STABLE_MS);
   });
 
   // Drive all reconnection through connectToMetro() so we always get a fresh target URL.
   cdpSession.on('disconnected', () => {
+    clearReconnectStabilityTimer();
+    cleanProxyLock();
     scheduleReconnect();
   });
 
@@ -560,8 +584,18 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     try {
       const lockData = JSON.parse(fs.readFileSync(PROXY_LOCK_FILE, 'utf8'));
       if (lockData.pid && lockData.port) {
+        if (lockData.pid === process.pid) {
+          return false;
+        }
+
         // Check if the owning process is still alive
-        try { process.kill(lockData.pid, 0); } catch { return false; }
+        try {
+          process.kill(lockData.pid, 0);
+        } catch {
+          try { fs.unlinkSync(PROXY_LOCK_FILE); } catch {}
+          return false;
+        }
+
         const resp = await fetch(`http://127.0.0.1:${lockData.port}/json`, {
           signal: AbortSignal.timeout(2000),
         });
@@ -628,8 +662,10 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     }
     isReconnecting = true;
     try {
+      const proxyEnabled = config.proxy?.enabled !== false;
+
       // If another metro-mcp instance is already connected, piggyback on its proxy
-      if (await tryConnectViaProxy()) {
+      if (proxyEnabled && await tryConnectViaProxy()) {
         return true;
       }
 
@@ -659,8 +695,6 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
       // that fire on the 'reconnected' event can store events immediately.
       activeDeviceKey = `${server.port}-${target.id}`;
       activeDeviceName = target.title || target.deviceName || target.id;
-
-      const proxyEnabled = config.proxy?.enabled !== false;
 
       if (!cdpMultiplexer && proxyEnabled) {
         // Start the CDPMultiplexer BEFORE connecting so that the
@@ -705,6 +739,7 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   // Schedule a reconnect with exponential backoff, driven from server.ts so we always
   // re-fetch a fresh target URL from Metro's /json endpoint.
   function scheduleReconnect(): void {
+    if (runtimeClosed) return;
     if (reconnectTimer !== null || isReconnecting) return; // already scheduled or in progress
 
     // Use exponential backoff for the initial burst, then fall back to a slow
@@ -817,6 +852,11 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   function closeRuntime(): void {
     if (runtimeClosed) return;
     runtimeClosed = true;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    clearReconnectStabilityTimer();
     process.off('SIGINT', handleSigint);
     process.off('SIGTERM', handleSigterm);
     process.off('exit', handleExit);
@@ -867,6 +907,8 @@ export async function startHttpServer(
   const runtime = await createMetroRuntime(config, args);
   const host = options.host ?? '127.0.0.1';
   const requestedPort = options.port ?? 0;
+  const daemonIdentity = options.daemon?.identity ?? createDaemonIdentity(args);
+  const daemonKey = options.daemon?.key ?? getDaemonKey(args, daemonIdentity);
   const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
   const sseTransports = new Map<string, SSEServerTransport>();
 
@@ -920,7 +962,15 @@ export async function startHttpServer(
 
     try {
       if (url.pathname === '/health') {
-        sendJson(res, 200, { ok: true, name: 'metro-mcp', version });
+        sendJson(res, 200, {
+          ok: true,
+          name: 'metro-mcp',
+          version,
+          daemon: {
+            key: daemonKey,
+            identity: daemonIdentity,
+          },
+        });
         return;
       }
 
