@@ -1,6 +1,6 @@
 {
   "name": "metro-mcp",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "mcpName": "io.github.steve228uk/metro-mcp",
   "description": "Plugin-based MCP server for React Native/Expo runtime debugging, inspection, and automation via Metro/CDP",
   "homepage": "https://metromcp.dev",
@@ -35,7 +35,9 @@
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
+    "test": "bun run build:apps && bun test",
     "clean": "rm -rf dist",
+    "prepare": "bun run build",
     "build": "bun run build:apps && bun run clean && bun run build:js && bun run build:bin && bun run build:types",
     "build:apps": "bun run scripts/build-apps.ts",
     "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod --external ws && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod",

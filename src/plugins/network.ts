@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { DeviceBufferManager } from '../utils/buffer.js';
 import { formatTime, formatBytes } from '../utils/format.js';
+import { byteLength, truncateRecordValues, truncateString } from '../utils/payload.js';
 import { createLogger } from '../utils/logger.js';
 import { buildNetworkDashboardHtml } from '../apps/network.js';
 
@@ -9,8 +10,9 @@ const logger = createLogger('network');
 
 /** Maximum *decoded* body size (bytes) to keep cached. */
 const MAX_BODY_CACHE_SIZE = 1024 * 1024; // 1 MB
-/** Maximum concurrent getResponseBody CDP calls to avoid flooding the pipeline. */
-const MAX_CONCURRENT_BODY_FETCHES = 4;
+const MAX_NETWORK_BUFFER_BYTES = 2 * 1024 * 1024;
+const MAX_URL_CHARS = 4096;
+const MAX_HEADER_VALUE_CHARS = 4096;
 
 function decodeResponseBody(raw: { body: string; base64Encoded: boolean }): string {
   return raw.base64Encoded ? Buffer.from(raw.body, 'base64').toString('utf8') : raw.body;
@@ -37,43 +39,60 @@ interface NetworkRequest {
   session: number;
 }
 
+function estimateRecordBytes(record: Record<string, string> | undefined, maxBytes: number): number {
+  if (!record) return 0;
+  let total = 0;
+  for (const [key, value] of Object.entries(record)) {
+    total += byteLength(key) + byteLength(value) + 4;
+    if (total >= maxBytes) return maxBytes;
+  }
+  return total;
+}
+
+function estimateNetworkRequestBytes(req: NetworkRequest): number {
+  return (
+    byteLength(req.url) +
+    byteLength(req.method) +
+    byteLength(req.type) +
+    byteLength(req.statusText) +
+    byteLength(req.error) +
+    byteLength(req.responseBody) +
+    estimateRecordBytes(req.requestHeaders, 64 * 1024) +
+    estimateRecordBytes(req.responseHeaders, 64 * 1024) +
+    128
+  );
+}
+
+function formatNetworkRequestLine(
+  r: NetworkRequest,
+  options: { includeTimestamp?: boolean; includeSize?: boolean } = {},
+): string {
+  const duration = r.endTime ? `${r.endTime - r.startTime}ms` : 'pending';
+  const status = r.error ? `ERR: ${r.error}` : `${r.status || '???'}`;
+  const size = options.includeSize && r.size ? `, ${formatBytes(r.size)}` : '';
+  const line = `${r.method} ${r.url} → ${status} (${duration}${size})`;
+  return options.includeTimestamp ? `${formatTime(r.startTime)} ${line}` : line;
+}
+
 export const networkPlugin = definePlugin({
   name: 'network',
 
   description: 'Network request tracking via CDP Network domain',
 
   async setup(ctx) {
-    const buffers = new DeviceBufferManager<NetworkRequest>(200);
+    const buffers = new DeviceBufferManager<NetworkRequest>(200, {
+      maxBytesPerDevice: MAX_NETWORK_BUFFER_BYTES,
+      sizeOf: estimateNetworkRequestBytes,
+    });
     const pendingRequests = new Map<string, NetworkRequest>();
 
     /** Monotonically increasing session counter – bumped on every reconnect so we
      *  can tell which requests belong to the current CDP session vs a stale one. */
     let currentSession = 0;
 
-    /** Simple concurrency limiter for eager body fetches to avoid flooding CDP. */
-    let activeFetches = 0;
-
     function getDeviceBuffer(): ReturnType<DeviceBufferManager<NetworkRequest>['getOrCreate']> | null {
       const key = ctx.getActiveDeviceKey();
       return key ? buffers.getOrCreate(key) : null;
-    }
-
-    function fetchAndCacheBody(req: NetworkRequest): void {
-      if (activeFetches >= MAX_CONCURRENT_BODY_FETCHES) return;
-      activeFetches++;
-      ctx.cdp.send('Network.getResponseBody', { requestId: req.id })
-        .then((result) => {
-          const body = decodeResponseBody(result as { body: string; base64Encoded: boolean });
-          if (body.length <= MAX_BODY_CACHE_SIZE) {
-            req.responseBody = body;
-          }
-        })
-        .catch((err) => {
-          logger.debug(`Could not cache body for ${req.method} ${req.url}: ${err}`);
-        })
-        .finally(() => {
-          activeFetches--;
-        });
     }
 
     // ── CDP Network domain ─────────────────────────────────────────────────────
@@ -87,7 +106,7 @@ export const networkPlugin = definePlugin({
       if ((params.initiator as Record<string, unknown> | undefined)?.stack) return;
 
       const req = params.request as Record<string, unknown>;
-      const url = req?.url as string;
+      const url = truncateString(req?.url as string, MAX_URL_CHARS);
       const method = req?.method as string || 'GET';
       const type = params.type as string | undefined;
       const now = Date.now();
@@ -97,7 +116,7 @@ export const networkPlugin = definePlugin({
         url,
         method,
         type,
-        requestHeaders: req?.headers as Record<string, string>,
+        requestHeaders: truncateRecordValues(req?.headers, MAX_HEADER_VALUE_CHARS),
         startTime: now,
         get timestamp() { return this.startTime; },
         session: currentSession,
@@ -111,7 +130,7 @@ export const networkPlugin = definePlugin({
         const response = params.response as Record<string, unknown>;
         req.status = response.status as number;
         req.statusText = response.statusText as string;
-        req.responseHeaders = response.headers as Record<string, string>;
+        req.responseHeaders = truncateRecordValues(response.headers, MAX_HEADER_VALUE_CHARS);
       }
     });
 
@@ -123,7 +142,6 @@ export const networkPlugin = definePlugin({
         pendingRequests.delete(req.id);
         getDeviceBuffer()?.push(req);
         ctx.notifyResourceUpdated('metro://network');
-        fetchAndCacheBody(req);
       }
     });
 
@@ -159,6 +177,13 @@ export const networkPlugin = definePlugin({
       return buffers.resolve(device, ctx.getActiveDeviceKey());
     }
 
+    function resolveRequest(url: string, index: number, device?: string): NetworkRequest | string {
+      const matches = getRequests(device).filter((r) => r.url.includes(url));
+      if (matches.length === 0) return `No requests found matching "${url}"`;
+      const req = index === -1 ? matches[matches.length - 1] : matches[index];
+      return req ?? `Request index ${index} out of range (${matches.length} matches)`;
+    }
+
     ctx.registerAppResource('ui://metro/network', {
       name: 'Network Dashboard',
       description: 'Interactive network request dashboard with filtering, detail view, and live updates',
@@ -192,12 +217,7 @@ export const networkPlugin = definePlugin({
         const slice = requests.slice(-limit);
         if (format === 'json') return slice;
         return slice
-          .map((r) => {
-            const duration = r.endTime ? `${r.endTime - r.startTime}ms` : 'pending';
-            const status = r.error ? `ERR: ${r.error}` : `${r.status || '???'}`;
-            const size = r.size ? `, ${formatBytes(r.size)}` : '';
-            return `${formatTime(r.startTime)} ${r.method} ${r.url} → ${status} (${duration}${size})`;
-          })
+          .map((r) => formatNetworkRequestLine(r, { includeTimestamp: true, includeSize: true }))
           .join('\n');
       },
     });
@@ -211,11 +231,7 @@ export const networkPlugin = definePlugin({
         device: z.string().optional().describe('Device key or "all". Defaults to current device.'),
       }),
       handler: async ({ url, index, device }) => {
-        const matches = getRequests(device).filter((r) => r.url.includes(url));
-        if (matches.length === 0) return `No requests found matching "${url}"`;
-        const req = index === -1 ? matches[matches.length - 1] : matches[index];
-        if (!req) return `Request index ${index} out of range (${matches.length} matches)`;
-        return req;
+        return resolveRequest(url, index, device);
       },
     });
 
@@ -228,10 +244,8 @@ export const networkPlugin = definePlugin({
         device: z.string().optional().describe('Device key or "all". Defaults to current device.'),
       }),
       handler: async ({ url, index, device }) => {
-        const matches = getRequests(device).filter((r) => r.url.includes(url));
-        if (matches.length === 0) return `No requests found matching "${url}"`;
-        const req = index === -1 ? matches[matches.length - 1] : matches[index];
-        if (!req) return `Request index ${index} out of range (${matches.length} matches)`;
+        const req = resolveRequest(url, index, device);
+        if (typeof req === 'string') return req;
 
         // Use cached body if available (survives reconnections)
         if (req.responseBody !== undefined) {
@@ -251,7 +265,10 @@ export const networkPlugin = definePlugin({
         try {
           const result = await ctx.cdp.send('Network.getResponseBody', { requestId: req.id }) as { body: string; base64Encoded: boolean };
           const body = decodeResponseBody(result);
-          req.responseBody = body;
+          if (byteLength(body) <= MAX_BODY_CACHE_SIZE) {
+            req.responseBody = body;
+            buffers.recalculateByteSize(device && device !== 'all' ? device : undefined);
+          }
           try {
             return { url: req.url, status: req.status, body: JSON.parse(body) };
           } catch {
@@ -285,11 +302,7 @@ export const networkPlugin = definePlugin({
         if (errorsOnly) results = results.filter((r) => r.error || (r.status && r.status >= 400));
         return results
           .slice(-limit)
-          .map((r) => {
-            const duration = r.endTime ? `${r.endTime - r.startTime}ms` : 'pending';
-            const status = r.error ? `ERR: ${r.error}` : `${r.status || '???'}`;
-            return `${r.method} ${r.url} → ${status} (${duration})`;
-          })
+          .map((r) => formatNetworkRequestLine(r))
           .join('\n');
       },
     });
@@ -302,11 +315,7 @@ export const networkPlugin = definePlugin({
       }),
       handler: async ({ device }) => {
         const count = buffers.size;
-        if (device === 'all') {
-          buffers.clear();
-        } else {
-          buffers.clear(device || ctx.getActiveDeviceKey() || undefined);
-        }
+        buffers.clearResolved(device, ctx.getActiveDeviceKey());
         pendingRequests.clear();
         return `Cleared ${count} network requests.`;
       },
@@ -447,11 +456,7 @@ export const networkPlugin = definePlugin({
         const requests = getRequests().slice(-20);
         if (requests.length === 0) return '(no requests)';
         return requests
-          .map((r) => {
-            const duration = r.endTime ? `${r.endTime - r.startTime}ms` : 'pending';
-            const status = r.error ? `ERR: ${r.error}` : `${r.status || '???'}`;
-            return `${formatTime(r.startTime)} ${r.method} ${r.url} → ${status} (${duration})`;
-          })
+          .map((r) => formatNetworkRequestLine(r, { includeTimestamp: true }))
           .join('\n');
       },
     });
