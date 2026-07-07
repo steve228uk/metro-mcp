@@ -93,6 +93,60 @@ function recordFinishedRequest(emit: (event: string, params: Record<string, unkn
   });
 }
 
+test('network plugin captures stack-bearing requests when no native twin is emitted', async () => {
+  // Modern fusebox inspector (RN 0.76+) emits a single requestWillBeSent that
+  // carries a JS call stack; its requestId is referenced by the later events.
+  const { emit, tools } = await createNetworkHarness('{"ok":true}');
+
+  emit('Network.requestWillBeSent', {
+    requestId: 'uuid-1',
+    request: { url: 'https://example.test/graphql', method: 'POST', headers: {} },
+    type: 'Fetch',
+    initiator: { type: 'script', stack: { callFrames: [] } },
+  });
+  emit('Network.responseReceived', {
+    requestId: 'uuid-1',
+    response: { status: 200, statusText: 'OK', headers: {} },
+  });
+  emit('Network.loadingFinished', { requestId: 'uuid-1', encodedDataLength: 12 });
+
+  const getResponseBody = tools.get('get_response_body');
+  const result = await getResponseBody!.handler({ url: 'example.test/graphql', index: -1 });
+  expect(result).toEqual({
+    url: 'https://example.test/graphql',
+    status: 200,
+    body: { ok: true },
+  });
+});
+
+test('network plugin drops the JS-layer duplicate when a native twin is also emitted', async () => {
+  // Legacy double-emit: native (stackless) event first, then the JS-layer duplicate.
+  const { emit, tools } = await createNetworkHarness('{"ok":true}');
+
+  emit('Network.requestWillBeSent', {
+    requestId: 'native-1',
+    request: { url: 'https://example.test/api', method: 'GET', headers: {} },
+    type: 'Fetch',
+  });
+  emit('Network.requestWillBeSent', {
+    requestId: 'uuid-1',
+    request: { url: 'https://example.test/api', method: 'GET', headers: {} },
+    type: 'Fetch',
+    initiator: { type: 'script', stack: { callFrames: [] } },
+  });
+  emit('Network.responseReceived', {
+    requestId: 'native-1',
+    response: { status: 200, statusText: 'OK', headers: {} },
+  });
+  emit('Network.loadingFinished', { requestId: 'native-1', encodedDataLength: 12 });
+  // The JS-layer duplicate must never have been tracked, so its id resolves to nothing.
+  emit('Network.loadingFinished', { requestId: 'uuid-1', encodedDataLength: 12 });
+
+  const getResponseBody = tools.get('get_response_body');
+  const result = await getResponseBody!.handler({ url: 'example.test/api', index: -1 });
+  expect(result).toMatchObject({ url: 'https://example.test/api', status: 200 });
+});
+
 test('network plugin fetches response bodies only on explicit request', async () => {
   const { cdpSends, emit, tools } = await createNetworkHarness('{"ok":true}');
 

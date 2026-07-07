@@ -97,13 +97,26 @@ export const networkPlugin = definePlugin({
 
     // ── CDP Network domain ─────────────────────────────────────────────────────
 
+    // Some React Native setups' JS networking polyfill fires two requestWillBeSent
+    // events per fetch call:
+    //   1. JS XHR polyfill layer — UUID request ID, full JS call stack in initiator.stack
+    //   2. Native networking layer — numeric request ID, initiator has no call stack
+    // On those, we drop the JS-layer (stack-bearing) event so each request appears once.
+    //
+    // But the modern fusebox inspector (RN 0.76+) emits only a *single*, stack-bearing
+    // event per request, and its requestId is what the subsequent responseReceived /
+    // loadingFinished events reference. Unconditionally dropping stack-bearing events
+    // therefore discards 100% of traffic there. So only treat a stack-bearing event as a
+    // droppable duplicate once we've actually observed a native (stackless) event — i.e.
+    // we know this runtime double-emits. Otherwise keep it; it's the only event we'll get.
+    let sawNativeRequest = false;
     ctx.cdp.on('Network.requestWillBeSent', (params) => {
-      // Hermes fires two requestWillBeSent events per fetch call:
-      //   1. JS XHR polyfill layer — UUID request ID, full JS call stack in initiator.stack
-      //   2. Native networking layer — numeric request ID, initiator has no call stack
-      // Drop the JS-layer event (identified by having a call stack) so each request
-      // appears exactly once, sourced from the native layer.
-      if ((params.initiator as Record<string, unknown> | undefined)?.stack) return;
+      const hasStack = !!(params.initiator as Record<string, unknown> | undefined)?.stack;
+      if (!hasStack) {
+        sawNativeRequest = true;
+      } else if (sawNativeRequest) {
+        return;
+      }
 
       const req = params.request as Record<string, unknown>;
       const url = truncateString(req?.url as string, MAX_URL_CHARS);
