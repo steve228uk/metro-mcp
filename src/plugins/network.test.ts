@@ -119,21 +119,56 @@ test('network plugin captures stack-bearing requests when no native twin is emit
   });
 });
 
-test('network plugin drops the JS-layer duplicate when a native twin is also emitted', async () => {
-  // Legacy double-emit: native (stackless) event first, then the JS-layer duplicate.
+test('network plugin keeps an unrelated stack-bearing request after a stackless request', async () => {
   const { emit, tools } = await createNetworkHarness('{"ok":true}');
 
+  recordFinishedRequest(emit);
   emit('Network.requestWillBeSent', {
+    requestId: 'uuid-2',
+    request: { url: 'https://example.test/graphql', method: 'POST', headers: {} },
+    type: 'Fetch',
+    initiator: { type: 'script', stack: { callFrames: [] } },
+  });
+  emit('Network.responseReceived', {
+    requestId: 'uuid-2',
+    response: { status: 201, statusText: 'Created', headers: {} },
+  });
+  emit('Network.loadingFinished', { requestId: 'uuid-2', encodedDataLength: 12 });
+
+  const getNetworkRequests = tools.get('get_network_requests');
+  const result = await getNetworkRequests!.handler({
+    limit: 50,
+    summary: false,
+    format: 'json',
+  });
+  expect(result).toEqual([
+    expect.objectContaining({ id: 'request-1', status: 200 }),
+    expect.objectContaining({ id: 'uuid-2', status: 201 }),
+  ]);
+});
+
+async function expectLegacyDuplicateToBeCollapsed(stackBearingFirst: boolean): Promise<void> {
+  const { emit, tools } = await createNetworkHarness('{"ok":true}');
+
+  const nativeEvent = {
     requestId: 'native-1',
     request: { url: 'https://example.test/api', method: 'GET', headers: {} },
     type: 'Fetch',
-  });
-  emit('Network.requestWillBeSent', {
+  };
+  const stackBearingEvent = {
     requestId: 'uuid-1',
     request: { url: 'https://example.test/api', method: 'GET', headers: {} },
     type: 'Fetch',
     initiator: { type: 'script', stack: { callFrames: [] } },
-  });
+  };
+
+  const requestEvents = stackBearingFirst
+    ? [stackBearingEvent, nativeEvent]
+    : [nativeEvent, stackBearingEvent];
+  for (const event of requestEvents) {
+    emit('Network.requestWillBeSent', event);
+  }
+
   emit('Network.responseReceived', {
     requestId: 'native-1',
     response: { status: 200, statusText: 'OK', headers: {} },
@@ -142,9 +177,27 @@ test('network plugin drops the JS-layer duplicate when a native twin is also emi
   // The JS-layer duplicate must never have been tracked, so its id resolves to nothing.
   emit('Network.loadingFinished', { requestId: 'uuid-1', encodedDataLength: 12 });
 
-  const getResponseBody = tools.get('get_response_body');
-  const result = await getResponseBody!.handler({ url: 'example.test/api', index: -1 });
-  expect(result).toMatchObject({ url: 'https://example.test/api', status: 200 });
+  const getNetworkRequests = tools.get('get_network_requests');
+  const result = await getNetworkRequests!.handler({
+    limit: 50,
+    summary: false,
+    format: 'json',
+  });
+  expect(result).toEqual([
+    expect.objectContaining({
+      id: 'native-1',
+      url: 'https://example.test/api',
+      status: 200,
+    }),
+  ]);
+}
+
+test('network plugin drops a stack-bearing duplicate emitted after its native twin', async () => {
+  await expectLegacyDuplicateToBeCollapsed(false);
+});
+
+test('network plugin drops a stack-bearing duplicate emitted before its native twin', async () => {
+  await expectLegacyDuplicateToBeCollapsed(true);
 });
 
 test('network plugin fetches response bodies only on explicit request', async () => {
