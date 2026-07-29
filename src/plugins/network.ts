@@ -13,6 +13,7 @@ const MAX_BODY_CACHE_SIZE = 1024 * 1024; // 1 MB
 const MAX_NETWORK_BUFFER_BYTES = 2 * 1024 * 1024;
 const MAX_URL_CHARS = 4096;
 const MAX_HEADER_VALUE_CHARS = 4096;
+const REQUEST_TWIN_WINDOW_MS = 1000;
 
 function decodeResponseBody(raw: { body: string; base64Encoded: boolean }): string {
   return raw.base64Encoded ? Buffer.from(raw.body, 'base64').toString('utf8') : raw.body;
@@ -85,6 +86,8 @@ export const networkPlugin = definePlugin({
       sizeOf: estimateNetworkRequestBytes,
     });
     const pendingRequests = new Map<string, NetworkRequest>();
+    const stackBearingRequestIds = new Set<string>();
+    const pairedRequestIds = new Set<string>();
 
     /** Monotonically increasing session counter – bumped on every reconnect so we
      *  can tell which requests belong to the current CDP session vs a stale one. */
@@ -95,21 +98,61 @@ export const networkPlugin = definePlugin({
       return key ? buffers.getOrCreate(key) : null;
     }
 
+    function findPendingInitiatorTwin(
+      url: string,
+      method: string,
+      type: string | undefined,
+      hasInitiatorStack: boolean,
+      now: number,
+    ): string | undefined {
+      for (const [id, request] of pendingRequests) {
+        if (pairedRequestIds.has(id)) continue;
+        const hasOppositeInitiatorShape = stackBearingRequestIds.has(id) !== hasInitiatorStack;
+        if (
+          hasOppositeInitiatorShape &&
+          request.url === url &&
+          request.method === method &&
+          request.type === type &&
+          now - request.startTime <= REQUEST_TWIN_WINDOW_MS
+        ) {
+          return id;
+        }
+      }
+      return undefined;
+    }
+
+    function takePendingRequest(id: string): NetworkRequest | undefined {
+      const request = pendingRequests.get(id);
+      if (request) {
+        pendingRequests.delete(id);
+        stackBearingRequestIds.delete(id);
+        pairedRequestIds.delete(id);
+      }
+      return request;
+    }
+
     // ── CDP Network domain ─────────────────────────────────────────────────────
 
+    // Legacy Hermes can emit a stack-bearing JS event and a stackless native event
+    // for the same request, in either order. Modern Fusebox emits only the
+    // stack-bearing event, so dedupe only when an opposite-shape twin is pending.
     ctx.cdp.on('Network.requestWillBeSent', (params) => {
-      // Hermes fires two requestWillBeSent events per fetch call:
-      //   1. JS XHR polyfill layer — UUID request ID, full JS call stack in initiator.stack
-      //   2. Native networking layer — numeric request ID, initiator has no call stack
-      // Drop the JS-layer event (identified by having a call stack) so each request
-      // appears exactly once, sourced from the native layer.
-      if ((params.initiator as Record<string, unknown> | undefined)?.stack) return;
-
       const req = params.request as Record<string, unknown>;
       const url = truncateString(req?.url as string, MAX_URL_CHARS);
       const method = req?.method as string || 'GET';
       const type = params.type as string | undefined;
       const now = Date.now();
+      const hasInitiatorStack = Boolean(
+        (params.initiator as Record<string, unknown> | undefined)?.stack,
+      );
+      const twinId = findPendingInitiatorTwin(url, method, type, hasInitiatorStack, now);
+      if (twinId) {
+        if (hasInitiatorStack) {
+          pairedRequestIds.add(twinId);
+          return;
+        }
+        takePendingRequest(twinId);
+      }
 
       const request: NetworkRequest = {
         id: params.requestId as string,
@@ -122,6 +165,8 @@ export const networkPlugin = definePlugin({
         session: currentSession,
       };
       pendingRequests.set(request.id, request);
+      if (hasInitiatorStack) stackBearingRequestIds.add(request.id);
+      if (twinId) pairedRequestIds.add(request.id);
     });
 
     ctx.cdp.on('Network.responseReceived', (params) => {
@@ -135,22 +180,20 @@ export const networkPlugin = definePlugin({
     });
 
     ctx.cdp.on('Network.loadingFinished', (params) => {
-      const req = pendingRequests.get(params.requestId as string);
+      const req = takePendingRequest(params.requestId as string);
       if (req) {
         req.endTime = Date.now();
         req.size = params.encodedDataLength as number;
-        pendingRequests.delete(req.id);
         getDeviceBuffer()?.push(req);
         ctx.notifyResourceUpdated('metro://network');
       }
     });
 
     ctx.cdp.on('Network.loadingFailed', (params) => {
-      const req = pendingRequests.get(params.requestId as string);
+      const req = takePendingRequest(params.requestId as string);
       if (req) {
         req.endTime = Date.now();
         req.error = params.errorText as string;
-        pendingRequests.delete(req.id);
         getDeviceBuffer()?.push(req);
         ctx.notifyResourceUpdated('metro://network');
       }
@@ -165,6 +208,8 @@ export const networkPlugin = definePlugin({
         buf?.push(req);
       }
       pendingRequests.clear();
+      stackBearingRequestIds.clear();
+      pairedRequestIds.clear();
     });
 
     ctx.cdp.on('reconnected', () => {
@@ -317,6 +362,8 @@ export const networkPlugin = definePlugin({
         const count = buffers.size;
         buffers.clearResolved(device, ctx.getActiveDeviceKey());
         pendingRequests.clear();
+        stackBearingRequestIds.clear();
+        pairedRequestIds.clear();
         return `Cleared ${count} network requests.`;
       },
     });
