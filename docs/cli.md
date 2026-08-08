@@ -13,6 +13,7 @@ bunx metro-mcp create-plugin
 ```
 
 Prompts for:
+
 - **Plugin name suffix** — becomes the directory and package name (`metro-mcp-plugin-<name>`)
 - **Description** — optional
 - **Author** — defaults to `git config user.name`
@@ -48,12 +49,12 @@ bunx metro-mcp doctor
 
 Runs the following checks and reports pass/fail for each:
 
-| Check | Details |
-|---|---|
-| Node.js version | Must be >=18 |
-| Config file | Looks for `metro-mcp.config.ts` or `.js` in the current directory |
+| Check              | Details                                                                                                              |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| Node.js version    | Must be >=18                                                                                                         |
+| Config file        | Looks for `metro-mcp.config.ts` or `.js` in the current directory                                                    |
 | Metro connectivity | Uses `metro-bridge` status discovery for the configured host:port, including the `localhost` to `127.0.0.1` fallback |
-| Plugin paths | Verifies local plugin file paths from your config exist on disk |
+| Plugin paths       | Verifies local plugin file paths from your config exist on disk                                                      |
 
 Exit code is `0` if all checks pass, `1` if any fail.
 
@@ -75,6 +76,7 @@ bunx metro-mcp validate-plugin ./node_modules/metro-mcp-plugin-mmkv/dist/index.j
 ```
 
 Checks that the file:
+
 1. Exists and can be imported
 2. Exports an object (as default or named export) with a `name` string and a `setup` function
 
@@ -96,15 +98,16 @@ To run the shared HTTP server in the foreground:
 bunx metro-mcp serve --mcp-port 8765
 ```
 
-| Flag | Description |
-|---|---|
-| `--host`, `-H <host>` | Metro bundler host (default: `localhost`) |
-| `--port`, `-p <port>` | Metro bundler port (default: `8081`) |
-| `--config`, `-c <path>` | Path to a config file (absolute or relative to CWD) |
-| `--plugin <path>` | Load a plugin by path — repeatable |
-| `--mcp-port <port>` | Port for `serve` mode (default: random, env: `METRO_MCP_MCP_PORT`) |
-| `--stdio-direct` | Disable multiplexing and run the legacy single-process stdio server |
-| `--help` | Print usage |
+| Flag                    | Description                                                         |
+| ----------------------- | ------------------------------------------------------------------- |
+| `--host`, `-H <host>`   | Metro bundler host (default: `localhost`)                           |
+| `--port`, `-p <port>`   | Metro bundler port (default: `8081`)                                |
+| `--config`, `-c <path>` | Path to a config file (absolute or relative to CWD)                 |
+| `--plugin <path>`       | Load a plugin by path — repeatable                                  |
+| `--project-root <path>` | Project root for config discovery, plugins, and daemon identity     |
+| `--mcp-port <port>`     | Port for `serve` mode (default: random, env: `METRO_MCP_MCP_PORT`)  |
+| `--stdio-direct`        | Disable multiplexing and run the legacy single-process stdio server |
+| `--help`                | Print usage                                                         |
 
 **Examples:**
 
@@ -134,12 +137,13 @@ See [Configuration](/configuration#environment-variables) for the full list of e
 
 Key ones at a glance:
 
-| Variable | Description |
-|---|---|
-| `METRO_HOST` | Metro bundler host |
-| `METRO_PORT` | Metro bundler port |
-| `METRO_MCP_CONFIG` | Path to config file |
-| `METRO_MCP_PLUGINS` | Colon-separated plugin paths |
-| `METRO_MCP_MCP_PORT` | Port for `serve` mode |
-| `METRO_MCP_MULTIPLEX` | Set to `false` to disable the stdio daemon/proxy |
-| `DEBUG` | Enable debug logging |
+| Variable                 | Description                                      |
+| ------------------------ | ------------------------------------------------ |
+| `METRO_HOST`             | Metro bundler host                               |
+| `METRO_PORT`             | Metro bundler port                               |
+| `METRO_MCP_CONFIG`       | Path to config file                              |
+| `METRO_MCP_PLUGINS`      | Colon-separated plugin paths                     |
+| `METRO_MCP_PROJECT_ROOT` | Project root                                     |
+| `METRO_MCP_MCP_PORT`     | Port for `serve` mode                            |
+| `METRO_MCP_MULTIPLEX`    | Set to `false` to disable the stdio daemon/proxy |
+| `DEBUG`                  | Enable debug logging                             |

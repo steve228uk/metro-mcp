@@ -137,7 +137,7 @@ If you want to expose one long-lived MCP endpoint yourself, start the shared ser
 npx -y metro-mcp serve --mcp-port 8765
 ```
 
-This serves Streamable HTTP at `http://127.0.0.1:8765/mcp` and legacy SSE at `http://127.0.0.1:8765/sse`. Tools such as [`supergateway`](https://github.com/supercorp-ai/supergateway) can point at the Streamable HTTP endpoint instead of launching a fresh stdio process per request.
+This serves Streamable HTTP at `http://127.0.0.1:8765/mcp`. The endpoint supports both the 2025-era MCP handshake and the 2026-07-28 negotiation; `/sse` and `/messages` are intentionally unavailable. Tools such as [`supergateway`](https://github.com/supercorp-ai/supergateway) can point at the Streamable HTTP endpoint instead of launching a fresh stdio process per request.
 
 ### With custom Metro port
 
@@ -160,7 +160,7 @@ For OpenCode, add the port to the command array:
 - **Node.js** 18+ or **Bun** 1.0+
 - **iOS**: Xcode 14+ with Simulator (`xcrun simctl` is used for most operations)
 - **Android**: Android SDK with `adb` on your PATH
-- **IDB** *(optional)*: Some iOS operations fall back to [IDB (idb-companion)](https://github.com/facebook/idb) — install with `brew install idb-companion`. Tools will tell you when IDB is needed.
+- **IDB** _(optional)_: Some iOS operations fall back to [IDB (idb-companion)](https://github.com/facebook/idb) — install with `brew install idb-companion`. Tools will tell you when IDB is needed.
 
 ---
 
@@ -179,33 +179,33 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 
 ## Features
 
-| Plugin | Tools | Description |
-|--------|-------|-------------|
-| **console** | 2 | Console log collection with filtering |
-| **network** | 6 | Network request tracking, response body inspection, and stats |
-| **errors** | 3 | Runtime exception collection + Metro bundle error detection |
-| **evaluate** | 1 | Execute JavaScript in the app runtime |
-| **device** | 4 | Device management, connection status, and app reload |
-| **environment** | 4 | Build flags, platform constants, env vars, and Expo config inspection |
-| **source** | 1 | Stack trace symbolication |
-| **redux** | 3 | Redux state inspection and action dispatch |
-| **components** | 5 | React component tree inspection |
-| **storage** | 3 | AsyncStorage reading |
-| **simulator** | 6 | iOS simulator / Android device control |
-| **deeplink** | 2 | Cross-platform deep link testing |
-| **permissions** | 5 | Inspect and manage app permissions on iOS Simulator and Android Emulator |
-| **ui-interact** | 6 | UI automation (tap, swipe, type) |
-| **navigation** | 4 | React Navigation / Expo Router state |
-| **accessibility** | 3 | Accessibility auditing |
-| **commands** | 2 | Custom app commands |
-| **automation** | 3 | Wait/polling helpers for async state changes |
-| **profiler** | 9 | CPU profiling (React DevTools hook) + heap sampling + render tracking |
-| **test-recorder** | 7 | Record interactions and generate Appium, Maestro, or Detox tests |
-| **filesystem** | 5 | Browse and read files in app sandbox directories (Documents, caches, SQLite DBs) |
-| **devtools** | 1 | Open Chrome DevTools alongside the MCP via CDP proxy |
-| **debug-globals** | 1 | Auto-discover Redux stores, Apollo Client, and other debug globals |
-| **inspect-point** | 1 | Coordinate-based React component inspection (experimental) |
-| **statusline** | 1 | Claude Code status bar integration |
+| Plugin            | Tools | Description                                                                      |
+| ----------------- | ----- | -------------------------------------------------------------------------------- |
+| **console**       | 2     | Console log collection with filtering                                            |
+| **network**       | 6     | Network request tracking, response body inspection, and stats                    |
+| **errors**        | 3     | Runtime exception collection + Metro bundle error detection                      |
+| **evaluate**      | 1     | Execute JavaScript in the app runtime                                            |
+| **device**        | 4     | Device management, connection status, and app reload                             |
+| **environment**   | 4     | Build flags, platform constants, env vars, and Expo config inspection            |
+| **source**        | 1     | Stack trace symbolication                                                        |
+| **redux**         | 3     | Redux state inspection and action dispatch                                       |
+| **components**    | 5     | React component tree inspection                                                  |
+| **storage**       | 3     | AsyncStorage reading                                                             |
+| **simulator**     | 6     | iOS simulator / Android device control                                           |
+| **deeplink**      | 2     | Cross-platform deep link testing                                                 |
+| **permissions**   | 5     | Inspect and manage app permissions on iOS Simulator and Android Emulator         |
+| **ui-interact**   | 6     | UI automation (tap, swipe, type)                                                 |
+| **navigation**    | 4     | React Navigation / Expo Router state                                             |
+| **accessibility** | 3     | Accessibility auditing                                                           |
+| **commands**      | 2     | Custom app commands                                                              |
+| **automation**    | 3     | Wait/polling helpers for async state changes                                     |
+| **profiler**      | 9     | CPU profiling (React DevTools hook) + heap sampling + render tracking            |
+| **test-recorder** | 7     | Record interactions and generate Appium, Maestro, or Detox tests                 |
+| **filesystem**    | 5     | Browse and read files in app sandbox directories (Documents, caches, SQLite DBs) |
+| **devtools**      | 1     | Open Chrome DevTools alongside the MCP via CDP proxy                             |
+| **debug-globals** | 1     | Auto-discover Redux stores, Apollo Client, and other debug globals               |
+| **inspect-point** | 1     | Coordinate-based React component inspection (experimental)                       |
+| **statusline**    | 1     | Claude Code status bar integration                                               |
 
 → See the [full tools reference](docs/tools.md).
 
@@ -225,11 +225,11 @@ The tool automatically finds Chrome or Edge using the same detection as Metro an
 
 ### What to avoid
 
-| Method | What happens |
-|--------|-------------|
-| Pressing **"j"** in Metro terminal | Disconnects the MCP |
-| **"Open Debugger"** in the dev menu | Disconnects the MCP |
-| `open_devtools` MCP tool | Works alongside the MCP |
+| Method                              | What happens            |
+| ----------------------------------- | ----------------------- |
+| Pressing **"j"** in Metro terminal  | Disconnects the MCP     |
+| **"Open Debugger"** in the dev menu | Disconnects the MCP     |
+| `open_devtools` MCP tool            | Works alongside the MCP |
 
 ### Configuration
 
@@ -257,11 +257,11 @@ Run `setup_statusline` in Claude Code — it writes a script to `~/.claude/metro
 
 The status bar segment shows three states:
 
-| State | Display |
-|-------|---------|
-| Not running | `Metro ○` (dimmed) |
-| Running, not connected | `Metro ●` (red) |
-| Connected | `Metro ● localhost:8081` (green) |
+| State                  | Display                          |
+| ---------------------- | -------------------------------- |
+| Not running            | `Metro ○` (dimmed)               |
+| Running, not connected | `Metro ●` (red)                  |
+| Connected              | `Metro ● localhost:8081` (green) |
 
 ---
 
@@ -273,7 +273,7 @@ Record real user interactions (taps, text entry, scrolls) and generate productio
 
 Describe a flow and the AI navigates the app, then generates the test:
 
-> *"Write an Appium test for the guest checkout flow — start by tapping 'Start Shopping' on the welcome screen and end when the cart screen is visible."*
+> _"Write an Appium test for the guest checkout flow — start by tapping 'Start Shopping' on the welcome screen and end when the cart screen is visible."_
 
 The AI calls `start_test_recording`, navigates using `tap_element`/`type_text`/`swipe`, then generates a complete test with real selectors observed from the fiber tree.
 

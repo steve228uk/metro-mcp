@@ -5,18 +5,26 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { ToolCallback } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { SubscribeRequestSchema, UnsubscribeRequestSchema, RootsListChangedNotificationSchema, isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import {
-  registerAppResource as registerMcpAppResource,
-  registerAppTool as registerMcpAppTool,
-  RESOURCE_MIME_TYPE,
-} from '@modelcontextprotocol/ext-apps/server';
+  createMcpHandler,
+  isInitializeRequest,
+  isLegacyRequest,
+  McpServer,
+} from '@modelcontextprotocol/server';
+import type {
+  McpHttpHandler,
+  ServerContext,
+  ToolCallback,
+  Transport,
+} from '@modelcontextprotocol/server';
+import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import {
+  NodeStreamableHTTPServerTransport,
+  hostHeaderValidation,
+  originValidation,
+  toNodeHandler,
+  toWebRequest,
+} from '@modelcontextprotocol/node';
 import { z } from 'zod';
 import type {
   MetroMCPConfig,
@@ -28,9 +36,14 @@ import type {
   PromptConfig,
   EvalOptions,
 } from './plugin.js';
-import { CDPSession, CDPMultiplexer, scanMetroPorts, selectBestTarget, fetchTargets } from 'metro-bridge';
+import {
+  CDPSession,
+  CDPMultiplexer,
+  scanMetroPorts,
+  selectBestTarget,
+  fetchTargets,
+} from 'metro-bridge';
 import type { MetroTarget } from 'metro-bridge';
-import { loadConfig } from './config.js';
 import { MetroEventsClient } from './metro/events.js';
 import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
@@ -103,7 +116,7 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   environmentPlugin,
 ];
 
-type RuntimeRegistration = (session: McpSession) => { remove: () => void };
+type RuntimeRegistration = (server: McpServer) => { remove: () => void };
 
 interface McpSession {
   id: string;
@@ -130,11 +143,15 @@ function createMcpServer(): McpServer {
     },
     {
       instructions: `React Native runtime debugging MCP server. Connects to Metro bundler via Chrome DevTools Protocol to provide console logs, network requests, component tree inspection, state management debugging, device control, and more. Use list_devices to see connected targets, then use other tools to inspect and interact with the running app.`,
-    }
+    },
   );
 }
 
-function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+function sendJson(
+  res: http.ServerResponse,
+  status: number,
+  body: unknown,
+): void {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
 }
@@ -148,11 +165,16 @@ async function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
   return raw ? JSON.parse(raw) : undefined;
 }
 
-async function closeQuietly(closable: { close(): Promise<void> }): Promise<void> {
+async function closeQuietly(closable: {
+  close(): Promise<void>;
+}): Promise<void> {
   await closable.close().catch(() => {});
 }
 
-export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>, args: string[] = []) {
+export async function createMetroRuntime(
+  initialConfig: Required<MetroMCPConfig>,
+  args: string[] = [],
+) {
   let config = initialConfig;
   const cdpSession = new CDPSession();
   const eventsClient = new MetroEventsClient();
@@ -160,22 +182,26 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   const sessions = new Set<McpSession>();
   const runtimeRegistrations: RuntimeRegistration[] = [];
   const resourceSubscriptions = new ResourceSubscriptionManager();
-  let projectRoot: string | null = null;
-  let reloadInProgress = false;
   let isInitializingPlugins = false;
   let runtimeClosed = false;
+  let modernResourceNotifier: ((uri: string) => void) | null = null;
+  let stdioHandle: { close(): Promise<void> } | null = null;
 
   const resourceUpdates = createResourceUpdateScheduler({
     delayMs: RESOURCE_UPDATE_COALESCE_MS,
-    getTargets: () => [...sessions].map((session) => ({
-      id: session.id,
-      isSubscribed: (uri) => session.subscribedResources.has(uri),
-      sendResourceUpdated: (uri) => session.server.server.sendResourceUpdated({ uri }),
-    })),
+    getTargets: () =>
+      [...sessions].map((session) => ({
+        id: session.id,
+        isSubscribed: (uri) => session.subscribedResources.has(uri),
+        sendResourceUpdated: async (uri) => {
+          await session.server.server.sendResourceUpdated({ uri });
+        },
+      })),
   });
 
   function notifyResourceUpdated(uri: string): void {
     resourceUpdates.notify(uri);
+    modernResourceNotifier?.(uri);
   }
 
   // Active device tracking — used by plugins to key per-device buffers.
@@ -202,9 +228,15 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
 
   function waitForReconnect(): Promise<void> {
     return new Promise<void>((resolve) => {
-      if (!isReconnecting) { resolve(); return; }
+      if (!isReconnecting) {
+        resolve();
+        return;
+      }
       const check = setInterval(() => {
-        if (!isReconnecting) { clearInterval(check); resolve(); }
+        if (!isReconnecting) {
+          clearInterval(check);
+          resolve();
+        }
       }, 100);
     });
   }
@@ -251,7 +283,10 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   // Enable required CDP domains on every connection (initial and reconnect).
   cdpSession.on('reconnected', async () => {
     isReconnecting = false;
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     await enableCDPDomains();
     clearReconnectStabilityTimer();
     reconnectStabilityTimer = setTimeout(() => {
@@ -280,107 +315,97 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     await enableCDPDomains();
   });
 
-  function clearSessionRegistrations(session: McpSession): void {
-    for (const reg of session.registrations) {
-      try { reg.remove(); } catch { /* ignore */ }
-    }
-    session.registrations.length = 0;
-  }
-
-  function materializeSession(session: McpSession): void {
-    clearSessionRegistrations(session);
-    for (const register of runtimeRegistrations) {
-      try {
-        session.registrations.push(register(session));
-      } catch (err) {
-        logger.error(`Failed to materialize MCP registration for session ${session.id}:`, err);
-      }
-    }
-  }
-
-  function materializeAllSessions(): void {
-    for (const session of sessions) {
-      materializeSession(session);
-    }
-  }
-
   function addRuntimeRegistration(
     register: RuntimeRegistration,
     registrationLogger: ReturnType<typeof createLogger>,
     debugMessage: string,
   ): void {
     runtimeRegistrations.push(register);
-    if (!isInitializingPlugins) materializeAllSessions();
     registrationLogger.debug(debugMessage);
   }
 
+  function materializeServer(server: McpServer): Array<{ remove: () => void }> {
+    const registrations: Array<{ remove: () => void }> = [];
+    for (const register of runtimeRegistrations) {
+      try {
+        registrations.push(register(server));
+      } catch (err) {
+        logger.error('Failed to materialize MCP registration:', err);
+      }
+    }
+    return registrations;
+  }
+
   // Create the plugin context factory
-  function createPluginContext(plugin: PluginDefinition, cfg: Required<MetroMCPConfig>): PluginContext {
+  function createPluginContext(
+    plugin: PluginDefinition,
+    cfg: Required<MetroMCPConfig>,
+  ): PluginContext {
     const pluginLogger = createLogger(plugin.name);
     return {
       cdp: cdpSession,
       events: eventsClient,
-      registerTool: <T extends z.ZodType>(name: string, toolConfig: ToolConfig<T>) => {
+      registerTool: <T extends z.ZodObject<z.ZodRawShape>>(
+        name: string,
+        toolConfig: ToolConfig<T>,
+      ) => {
         try {
-          // Use duck typing in addition to instanceof so plugins that bundle a
-          // different copy of zod (e.g. via file: deps or package links) still work.
-          const params = toolConfig.parameters as Record<string, unknown>;
-          const isZodObject =
-            params instanceof z.ZodObject ||
-            (typeof params.shape === 'object' && params.shape !== null);
-          const inputSchema: z.ZodRawShape = isZodObject
-            ? (toolConfig.parameters as unknown as z.ZodObject<z.ZodRawShape>).shape
-            : { input: toolConfig.parameters };
-
-          const toolDefinition = {
-            description: toolConfig.description,
-            inputSchema,
-            annotations: toolConfig.annotations,
-          };
-
-          const handler: ToolCallback<typeof inputSchema> = async (args, extra) => {
-            // Build a sendProgress helper if the client sent a progressToken
-            const progressToken = extra._meta?.progressToken;
-            const sendProgress = progressToken !== undefined
-              ? async (progress: number, total: number, message?: string) => {
-                  await extra.sendNotification({
-                    method: 'notifications/progress',
-                    params: { progressToken, progress, total, ...(message ? { message } : {}) },
-                  } as Parameters<typeof extra.sendNotification>[0]);
-                }
-              : undefined;
+          const handler = async (args: unknown, ctx: ServerContext) => {
+            // V2 carries progress metadata and notification delivery on the
+            // request context rather than the v1 callback `extra` object.
+            const progressToken = ctx.mcpReq._meta?.progressToken;
+            const sendProgress =
+              progressToken !== undefined
+                ? async (progress: number, total: number, message?: string) => {
+                    await ctx.mcpReq.notify({
+                      method: 'notifications/progress',
+                      params: {
+                        progressToken,
+                        progress,
+                        total,
+                        ...(message ? { message } : {}),
+                      },
+                    });
+                  }
+                : undefined;
 
             try {
-              const result = await toolConfig.handler(args as z.infer<T>, { sendProgress });
-              const content = typeof result === 'string' ? result : JSON.stringify(result);
+              const result = await toolConfig.handler(args as z.infer<T>, {
+                sendProgress,
+              });
+              const content =
+                typeof result === 'string' ? result : JSON.stringify(result);
               return {
                 content: [{ type: 'text' as const, text: content }],
               };
             } catch (err) {
               const message = err instanceof Error ? err.message : String(err);
-              return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
+              return {
+                content: [{ type: 'text' as const, text: `Error: ${message}` }],
+                isError: true,
+              };
             }
           };
 
           addRuntimeRegistration(
-            (session) => {
-              if (toolConfig.appUri) {
-                return registerMcpAppTool(
-                  session.server,
-                  name,
-                  {
-                    ...toolDefinition,
-                    _meta: { ui: { resourceUri: toolConfig.appUri } },
-                  },
-                  handler,
-                );
-              }
-              return session.server.registerTool(
+            (server) =>
+              server.registerTool(
                 name,
-                toolDefinition,
-                handler,
-              );
-            },
+                {
+                  description: toolConfig.description,
+                  inputSchema: toolConfig.parameters,
+                  annotations: toolConfig.annotations,
+                  ...(toolConfig.appUri
+                    ? {
+                        _meta: {
+                          ui: { resourceUri: toolConfig.appUri },
+                          'ui/resourceUri': toolConfig.appUri,
+                        },
+                      }
+                    : {}),
+                },
+                handler as ToolCallback<T>,
+              ),
             pluginLogger,
             `Registered tool: ${name}`,
           );
@@ -396,15 +421,20 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
             onUnsubscribe: resourceConfig.onUnsubscribe,
           });
           addRuntimeRegistration(
-            (session) => session.server.resource(
-              resourceConfig.name,
-              uri,
-              { description: resourceConfig.description, mimeType },
-              async () => {
-                const content = await resourceConfig.handler();
-                return { contents: [{ uri, text: content, mimeType }] };
-              }
-            ),
+            (server) =>
+              server.registerResource(
+                resourceConfig.name,
+                uri,
+                { description: resourceConfig.description, mimeType },
+                async (resourceUri) => {
+                  const content = await resourceConfig.handler();
+                  return {
+                    contents: [
+                      { uri: resourceUri.href, text: content, mimeType },
+                    ],
+                  };
+                },
+              ),
             pluginLogger,
             `Registered resource: ${uri}`,
           );
@@ -414,25 +444,33 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
       },
       registerAppResource: (uri: string, appConfig: AppResourceConfig) => {
         try {
-          const preferredFrameSizeMeta = createPreferredFrameSizeMeta(appConfig.minHeight);
+          const preferredFrameSizeMeta = createPreferredFrameSizeMeta(
+            appConfig.minHeight,
+          );
           addRuntimeRegistration(
-            (session) => registerMcpAppResource(
-              session.server,
-              appConfig.name,
-              uri,
-              { description: appConfig.description, _meta: preferredFrameSizeMeta },
-              async () => {
-                const html = await appConfig.handler();
-                return {
-                  contents: [{
-                    uri,
-                    text: withAppSizing(html, appConfig.minHeight),
-                    mimeType: RESOURCE_MIME_TYPE,
-                    _meta: preferredFrameSizeMeta,
-                  }],
-                };
-              }
-            ),
+            (server) =>
+              server.registerResource(
+                appConfig.name,
+                uri,
+                {
+                  description: appConfig.description,
+                  mimeType: 'text/html;profile=mcp-app',
+                  _meta: preferredFrameSizeMeta,
+                },
+                async (resourceUri) => {
+                  const html = await appConfig.handler();
+                  return {
+                    contents: [
+                      {
+                        uri: resourceUri.href,
+                        text: withAppSizing(html, appConfig.minHeight),
+                        mimeType: 'text/html;profile=mcp-app',
+                        _meta: preferredFrameSizeMeta,
+                      },
+                    ],
+                  };
+                },
+              ),
             pluginLogger,
             `Registered app resource: ${uri}`,
           );
@@ -446,24 +484,32 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
           const argsShape: Record<string, z.ZodType> = {};
           if (promptConfig.arguments) {
             for (const arg of promptConfig.arguments) {
-              argsShape[arg.name] = arg.required ? z.string() : z.string().optional();
+              argsShape[arg.name] = arg.required
+                ? z.string()
+                : z.string().optional();
             }
           }
+          const promptDefinition = {
+            description: promptConfig.description,
+            ...(promptConfig.arguments?.length
+              ? { argsSchema: z.object(argsShape) }
+              : {}),
+          };
           addRuntimeRegistration(
-            (session) => session.server.prompt(
-              name,
-              promptConfig.description,
-              argsShape,
-              async (args) => {
-                const messages = await promptConfig.handler(args as Record<string, string>);
-                return {
-                  messages: messages.map((m) => ({
-                    role: m.role as 'user' | 'assistant',
-                    content: { type: 'text' as const, text: m.content },
-                  })),
-                };
-              }
-            ),
+            (server) =>
+              server.registerPrompt(
+                name,
+                promptDefinition as any,
+                async (args: any) => {
+                  const messages = await promptConfig.handler(args ?? {});
+                  return {
+                    messages: messages.map((m) => ({
+                      role: m.role as 'user' | 'assistant',
+                      content: { type: 'text' as const, text: m.content },
+                    })),
+                  };
+                },
+              ),
             pluginLogger,
             `Registered prompt: ${name}`,
           );
@@ -486,7 +532,9 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
             }
           }
           if (!cdpSession.isConnected) {
-            throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+            throw new Error(
+              'Not connected to Metro. Use list_devices to check connection status.',
+            );
           }
           const result = (await cdpSession.send('Runtime.evaluate', {
             expression,
@@ -495,18 +543,24 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
             timeout: options?.timeout,
           })) as Record<string, unknown>;
           if (result.exceptionDetails) {
-            throw new Error(extractCDPExceptionMessage(result.exceptionDetails as Record<string, unknown>));
+            throw new Error(
+              extractCDPExceptionMessage(
+                result.exceptionDetails as Record<string, unknown>,
+              ),
+            );
           }
           return (result.result as Record<string, unknown>).value;
         }
         try {
           return await tryEval();
         } catch (err) {
-          if (err instanceof Error && (
-            err.message === 'WebSocket closed' ||
-            err.message === 'Not connected to CDP target' ||
-            err.message === 'Not connected to Metro. Use list_devices to check connection status.'
-          )) {
+          if (
+            err instanceof Error &&
+            (err.message === 'WebSocket closed' ||
+              err.message === 'Not connected to CDP target' ||
+              err.message ===
+                'Not connected to Metro. Use list_devices to check connection status.')
+          ) {
             if (isReconnecting) {
               await waitForReconnect();
             } else {
@@ -538,25 +592,20 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     };
   }
 
-  // Load and initialize all plugins. Clears existing registrations first so this
-  // can be called again when the active project root changes.
-  async function initPlugins(cfg: Required<MetroMCPConfig>, rootPath?: string): Promise<void> {
+  // Load and initialize plugins once into a long-lived runtime registration set.
+  // Fresh MCP server instances are materialized from this set for each modern
+  // request and each legacy connection.
+  async function initPlugins(cfg: Required<MetroMCPConfig>): Promise<void> {
     runtimeRegistrations.length = 0;
     resourceSubscriptions.clearHooks();
-    for (const session of sessions) {
-      clearSessionRegistrations(session);
-    }
 
-    const baseDir = rootPath ?? process.cwd();
     const allPlugins = [...BUILT_IN_PLUGINS];
 
     for (const pluginPath of cfg.plugins) {
       try {
-        const resolvedPath = pluginPath.startsWith('.')
-          ? resolve(baseDir, pluginPath)
-          : pluginPath.startsWith('/')
-            ? pluginPath
-            : import.meta.resolve(pluginPath);
+        const resolvedPath = pluginPath.startsWith('/')
+          ? pluginPath
+          : import.meta.resolve(pluginPath);
         const mod = await import(resolvedPath);
         const plugin: PluginDefinition = mod.default || mod;
         if (plugin?.name && typeof plugin?.setup === 'function') {
@@ -582,7 +631,6 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     } finally {
       isInitializingPlugins = false;
     }
-    materializeAllSessions();
   }
 
   await initPlugins(config);
@@ -607,7 +655,9 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
         try {
           process.kill(lockData.pid, 0);
         } catch {
-          try { fs.unlinkSync(PROXY_LOCK_FILE); } catch {}
+          try {
+            fs.unlinkSync(PROXY_LOCK_FILE);
+          } catch {}
           return false;
         }
 
@@ -615,21 +665,29 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
           signal: AbortSignal.timeout(2000),
         });
         if (!resp.ok) return false;
-        const targets = await resp.json() as Array<{ id?: string; title?: string; webSocketDebuggerUrl?: string }>;
+        const targets = (await resp.json()) as Array<{
+          id?: string;
+          title?: string;
+          webSocketDebuggerUrl?: string;
+        }>;
         if (targets.length > 0 && targets[0].webSocketDebuggerUrl) {
           logger.info(
-            `Found existing metro-mcp proxy (PID ${lockData.pid}, port ${lockData.port}) — connecting as secondary`
+            `Found existing metro-mcp proxy (PID ${lockData.pid}, port ${lockData.port}) — connecting as secondary`,
           );
           // Set active device key BEFORE connecting so plugin event handlers
           // that fire on the 'reconnected' event can store events immediately.
-          activeDeviceKey = targets[0].id ? `${lockData.port}-${targets[0].id}` : null;
+          activeDeviceKey = targets[0].id
+            ? `${lockData.port}-${targets[0].id}`
+            : null;
           activeDeviceName = targets[0].title || targets[0].id || 'secondary';
           // Point devtools plugin at the primary's proxy so open_devtools uses the right port
           (config as Record<string, unknown>).proxy = {
             ...config.proxy,
             port: lockData.port,
           };
-          await cdpSession.connectToTarget(targets[0] as unknown as MetroTarget);
+          await cdpSession.connectToTarget(
+            targets[0] as unknown as MetroTarget,
+          );
           if (lockData.metroPort) {
             eventsClient.connect(config.metro.host!, lockData.metroPort);
             config.metro.port = lockData.metroPort;
@@ -647,7 +705,7 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     try {
       fs.writeFileSync(
         PROXY_LOCK_FILE,
-        JSON.stringify({ pid: process.pid, port: proxyPort, metroPort })
+        JSON.stringify({ pid: process.pid, port: proxyPort, metroPort }),
       );
       isPrimaryInstance = true;
       logger.info(`Wrote proxy lock (port ${proxyPort})`);
@@ -680,7 +738,7 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
       const proxyEnabled = config.proxy?.enabled !== false;
 
       // If another metro-mcp instance is already connected, piggyback on its proxy
-      if (proxyEnabled && await tryConnectViaProxy()) {
+      if (proxyEnabled && (await tryConnectViaProxy())) {
         return true;
       }
 
@@ -688,12 +746,20 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
       if (config.metro.autoDiscover) {
         servers = await scanMetroPorts(config.metro.host!);
       } else {
-        const targets = await fetchTargets(config.metro.host!, config.metro.port!);
-        servers = targets.length > 0 ? [{ host: config.metro.host!, port: config.metro.port!, targets }] : [];
+        const targets = await fetchTargets(
+          config.metro.host!,
+          config.metro.port!,
+        );
+        servers =
+          targets.length > 0
+            ? [{ host: config.metro.host!, port: config.metro.port!, targets }]
+            : [];
       }
 
       if (servers.length === 0) {
-        logger.warn('No Metro servers found. Tools will report disconnected status.');
+        logger.warn(
+          'No Metro servers found. Tools will report disconnected status.',
+        );
         return false;
       }
 
@@ -716,7 +782,9 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
         // messageInterceptor is already in place when 'reconnected' fires and
         // events begin flowing from Metro. Starting it after connectToTarget()
         // caused a window where events were lost on initial connection.
-        const mux = new CDPMultiplexer(cdpSession, { protectedDomains: ['Runtime', 'Network'] });
+        const mux = new CDPMultiplexer(cdpSession, {
+          protectedDomains: ['Runtime', 'Network'],
+        });
         try {
           const startedPort = await mux.start(preferredProxyPort);
           const devtoolsUrl = mux.getDevToolsUrl();
@@ -732,7 +800,9 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
           logger.warn('Could not start CDP proxy:', err);
         }
       } else if (!proxyEnabled) {
-        logger.warn('CDP proxy is disabled; connecting directly without Metro MCP shared-debugger multiplexing.');
+        logger.warn(
+          'CDP proxy is disabled; connecting directly without Metro MCP shared-debugger multiplexing.',
+        );
       }
 
       await cdpSession.connectToTarget(target);
@@ -760,11 +830,16 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     // Use exponential backoff for the initial burst, then fall back to a slow
     // background probe so the server keeps trying indefinitely (e.g. app started
     // long after the MCP server).
-    const delay = reconnectAttempts < MAX_BURST_ATTEMPTS
-      ? RECONNECT_DELAYS[Math.min(reconnectAttempts, RECONNECT_DELAYS.length - 1)]
-      : 30000;
+    const delay =
+      reconnectAttempts < MAX_BURST_ATTEMPTS
+        ? RECONNECT_DELAYS[
+            Math.min(reconnectAttempts, RECONNECT_DELAYS.length - 1)
+          ]
+        : 30000;
     reconnectAttempts++;
-    logger.info(`Reconnecting to Metro in ${delay}ms (attempt ${reconnectAttempts})`);
+    logger.info(
+      `Reconnecting to Metro in ${delay}ms (attempt ${reconnectAttempts})`,
+    );
 
     isReconnecting = true;
     reconnectTimer = setTimeout(async () => {
@@ -788,73 +863,48 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     try {
       const stale = JSON.parse(fs.readFileSync(PROXY_LOCK_FILE, 'utf8'));
       if (stale.port) preferredProxyPort = stale.port;
-    } catch { /* no stale lock */ }
-  }
-
-  // Reload config + plugins from the first client's active project root. v1 shares
-  // one runtime across sessions, so later clients must target the same app.
-  async function reloadFromRoots(session: McpSession, suppressErrors = false): Promise<void> {
-    if (reloadInProgress) return;
-    reloadInProgress = true;
-    try {
-      const { roots } = await session.server.server.listRoots();
-      const firstRoot = roots[0];
-      if (!firstRoot) return;
-      const rootPath = new URL(firstRoot.uri).pathname;
-      if (projectRoot && projectRoot !== rootPath) {
-        logger.warn(
-          `Ignoring roots change for ${rootPath}; metro-mcp multiplexing is already bound to ${projectRoot}`
-        );
-        return;
-      }
-      if (projectRoot === rootPath) return;
-      projectRoot = rootPath;
-      logger.info(`Reloading plugins from: ${rootPath}`);
-      const newConfig = await loadConfig(args, rootPath);
-      config = newConfig;
-      await initPlugins(newConfig, rootPath);
-      logger.info(`Plugins reloaded for: ${rootPath}`);
-    } catch (err) {
-      if (!suppressErrors) logger.error('Failed to reload plugins on roots change:', err);
-    } finally {
-      reloadInProgress = false;
+    } catch {
+      /* no stale lock */
     }
   }
 
   async function connectSession(transport: Transport): Promise<McpSession> {
+    const server = createMcpServer();
     const session: McpSession = {
       id: randomUUID(),
-      server: createMcpServer(),
+      server,
       subscribedResources: new Set<string>(),
-      registrations: [],
+      registrations: materializeServer(server),
     };
 
-    session.server.server.setRequestHandler(SubscribeRequestSchema, async (req) => {
-      resourceSubscriptions.subscribe(session, req.params.uri);
+    server.server.setRequestHandler('resources/subscribe', async (req) => {
+      resourceSubscriptions.subscribe(
+        session,
+        String((req.params as { uri: string }).uri),
+      );
       logger.debug(`Client subscribed to resource: ${req.params.uri}`);
       return {};
     });
 
-    session.server.server.setRequestHandler(UnsubscribeRequestSchema, async (req) => {
-      resourceSubscriptions.unsubscribe(session, req.params.uri);
+    server.server.setRequestHandler('resources/unsubscribe', async (req) => {
+      resourceSubscriptions.unsubscribe(
+        session,
+        String((req.params as { uri: string }).uri),
+      );
       logger.debug(`Client unsubscribed from resource: ${req.params.uri}`);
       return {};
     });
-
-    session.server.server.setNotificationHandler(RootsListChangedNotificationSchema, () => reloadFromRoots(session));
-    session.server.server.oninitialized = () => reloadFromRoots(session, true);
 
     const previousClose = transport.onclose;
     transport.onclose = () => {
       previousClose?.();
       resourceSubscriptions.unsubscribeAll(session);
       resourceUpdates.removeTarget(session.id);
-      clearSessionRegistrations(session);
+      for (const registration of session.registrations) registration.remove();
       sessions.delete(session);
       logger.debug(`MCP session closed: ${session.id}`);
     };
 
-    materializeSession(session);
     sessions.add(session);
     await session.server.connect(transport);
     logger.info(`MCP session connected: ${session.id}`);
@@ -862,8 +912,19 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   }
 
   async function startStdio(): Promise<void> {
-    await connectSession(new StdioServerTransport());
-    logger.info('MCP stdio session started');
+    const handle = serveStdio(
+      () => {
+        const server = createMcpServer();
+        materializeServer(server);
+        return server;
+      },
+      {
+        legacy: 'serve',
+        onerror: (err) => logger.error('stdio server error:', err),
+      },
+    );
+    stdioHandle = handle;
+    logger.info('MCP stdio server started');
   }
 
   function closeRuntime(): void {
@@ -880,19 +941,29 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
     for (const session of sessions) {
       resourceSubscriptions.unsubscribeAll(session);
       resourceUpdates.removeTarget(session.id);
-      clearSessionRegistrations(session);
+      for (const registration of session.registrations) registration.remove();
       session.server.close().catch(() => {});
     }
     sessions.clear();
+    stdioHandle?.close().catch(() => {});
+    stdioHandle = null;
     resourceUpdates.close();
     eventsClient.disconnect();
     cleanProxyLock();
     cdpMultiplexer?.stop();
   }
 
-  const handleSigint = () => { closeRuntime(); process.exit(0); };
-  const handleSigterm = () => { closeRuntime(); process.exit(0); };
-  const handleExit = () => { closeRuntime(); };
+  const handleSigint = () => {
+    closeRuntime();
+    process.exit(0);
+  };
+  const handleSigterm = () => {
+    closeRuntime();
+    process.exit(0);
+  };
+  const handleExit = () => {
+    closeRuntime();
+  };
 
   // Clean up on shutdown
   process.on('SIGINT', handleSigint);
@@ -910,11 +981,22 @@ export async function createMetroRuntime(initialConfig: Required<MetroMCPConfig>
   return {
     connectSession,
     startStdio,
+    createServer: () => {
+      const server = createMcpServer();
+      materializeServer(server);
+      return server;
+    },
+    setModernResourceNotifier: (notifier: (uri: string) => void) => {
+      modernResourceNotifier = notifier;
+    },
     close: closeRuntime,
   };
 }
 
-export async function startServer(config: Required<MetroMCPConfig>, args: string[] = []): Promise<void> {
+export async function startServer(
+  config: Required<MetroMCPConfig>,
+  args: string[] = [],
+): Promise<void> {
   const runtime = await createMetroRuntime(config, args);
   await runtime.startStdio();
 }
@@ -923,23 +1005,41 @@ export async function startHttpServer(
   config: Required<MetroMCPConfig>,
   args: string[] = [],
   options: HttpServerOptions = {},
-): Promise<{ host: string; port: number; url: string; close: () => Promise<void> }> {
+): Promise<{
+  host: string;
+  port: number;
+  url: string;
+  close: () => Promise<void>;
+}> {
   const runtime = await createMetroRuntime(config, args);
   const host = options.host ?? '127.0.0.1';
   const requestedPort = options.port ?? 0;
   const daemonIdentity = options.daemon?.identity ?? createDaemonIdentity(args);
   const daemonKey = options.daemon?.key ?? getDaemonKey(args, daemonIdentity);
-  const streamableTransports = new Map<string, StreamableHTTPServerTransport>();
-  const sseTransports = new Map<string, SSEServerTransport>();
+  const streamableTransports = new Map<
+    string,
+    NodeStreamableHTTPServerTransport
+  >();
+
+  const modernHandler: McpHttpHandler = createMcpHandler(
+    () => runtime.createServer(),
+    { legacy: 'reject' },
+  );
+  runtime.setModernResourceNotifier((uri) =>
+    modernHandler.notify.resourceUpdated(uri),
+  );
+  const modernNodeHandler = toNodeHandler(modernHandler, {
+    onerror: (err) => logger.error('Modern MCP request failed:', err),
+  });
 
   function getSessionIdHeader(req: http.IncomingMessage): string | undefined {
     const sessionId = req.headers['mcp-session-id'];
     return Array.isArray(sessionId) ? sessionId[0] : sessionId;
   }
 
-  async function createStreamableTransport(): Promise<StreamableHTTPServerTransport> {
-    let transport: StreamableHTTPServerTransport;
-    transport = new StreamableHTTPServerTransport({
+  async function createStreamableTransport(): Promise<NodeStreamableHTTPServerTransport> {
+    let transport: NodeStreamableHTTPServerTransport;
+    transport = new NodeStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (initializedSessionId) => {
         streamableTransports.set(initializedSessionId, transport);
@@ -953,17 +1053,22 @@ export async function startHttpServer(
     return transport;
   }
 
-  async function handleStreamableMcpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  async function handleLegacyMcpRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    parsedBody: unknown,
+  ): Promise<void> {
     const sessionKey = getSessionIdHeader(req);
-    let transport = sessionKey ? streamableTransports.get(sessionKey) : undefined;
-    let parsedBody: unknown;
-
-    if (req.method === 'POST') {
-      parsedBody = await readJsonBody(req);
-    }
+    let transport = sessionKey
+      ? streamableTransports.get(sessionKey)
+      : undefined;
 
     if (!transport) {
-      if (req.method !== 'POST' || !parsedBody || !isInitializeRequest(parsedBody)) {
+      if (
+        req.method !== 'POST' ||
+        !parsedBody ||
+        !isInitializeRequest(parsedBody)
+      ) {
         sendJson(res, 400, {
           jsonrpc: '2.0',
           error: { code: -32000, message: 'Bad Request: No valid MCP session' },
@@ -995,28 +1100,21 @@ export async function startHttpServer(
       }
 
       if (url.pathname === '/mcp') {
-        await handleStreamableMcpRequest(req, res);
-        return;
-      }
-
-      if (url.pathname === '/sse' && req.method === 'GET') {
-        const transport = new SSEServerTransport('/messages', res);
-        sseTransports.set(transport.sessionId, transport);
-        transport.onclose = () => {
-          sseTransports.delete(transport.sessionId);
-        };
-        await runtime.connectSession(transport);
-        return;
-      }
-
-      if (url.pathname === '/messages' && req.method === 'POST') {
-        const sessionId = url.searchParams.get('sessionId');
-        const transport = sessionId ? sseTransports.get(sessionId) : undefined;
-        if (!transport) {
-          res.writeHead(404).end('No transport found for sessionId');
+        if (
+          !hostHeaderValidation(['localhost', '127.0.0.1', '[::1]'])(req, res)
+        )
           return;
+        if (!originValidation(['localhost', '127.0.0.1', '[::1]'])(req, res))
+          return;
+
+        const parsedBody =
+          req.method === 'POST' ? await readJsonBody(req) : undefined;
+        const probe = await toWebRequest(req, parsedBody);
+        if (await isLegacyRequest(probe, parsedBody)) {
+          await handleLegacyMcpRequest(req, res, parsedBody);
+        } else {
+          await modernNodeHandler(req, res, parsedBody);
         }
-        await transport.handlePostMessage(req, res);
         return;
       }
 
@@ -1044,7 +1142,8 @@ export async function startHttpServer(
   });
 
   const address = server.address();
-  const port = typeof address === 'object' && address ? address.port : requestedPort;
+  const port =
+    typeof address === 'object' && address ? address.port : requestedPort;
   const url = `http://${host}:${port}/mcp`;
   options.onListening?.({ host, port, url });
   logger.info(`MCP HTTP server listening on ${url}`);
@@ -1057,11 +1156,11 @@ export async function startHttpServer(
       for (const transport of streamableTransports.values()) {
         await closeQuietly(transport);
       }
-      for (const transport of sseTransports.values()) {
-        await closeQuietly(transport);
-      }
+      await modernHandler.close();
       runtime.close();
-      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+      await new Promise<void>((resolveClose) =>
+        server.close(() => resolveClose()),
+      );
     },
   };
 }

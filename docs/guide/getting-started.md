@@ -9,7 +9,7 @@ Works with **Expo**, **bare React Native**, and any project using **Metro + Herm
 - **Node.js** 18+ or **Bun** 1.0+
 - **iOS**: Xcode 14+ with Simulator (`xcrun simctl` is used for most operations)
 - **Android**: Android SDK with `adb` on your PATH
-- **IDB** *(optional)*: Some iOS operations fall back to [IDB (idb-companion)](https://github.com/facebook/idb) — install with `brew install idb-companion`. Tools will tell you when IDB is needed.
+- **IDB** _(optional)_: Some iOS operations fall back to [IDB (idb-companion)](https://github.com/facebook/idb) — install with `brew install idb-companion`. Tools will tell you when IDB is needed.
 
 ## Installation
 
@@ -105,17 +105,17 @@ npx add-mcp metro-mcp --all -g -y
 
 ### With a config file
 
-In Claude Code, Cursor, VS Code, and OpenCode, metro-mcp automatically discovers `metro-mcp.config.ts` (or `.js`) from your project root — no extra configuration needed. Just add the file and it will be picked up.
+metro-mcp automatically discovers `metro-mcp.config.ts` (or `.js`) from the effective project root. The root is `--project-root`, then `METRO_MCP_PROJECT_ROOT`, then the canonicalized working directory.
 
 ```bash
 # Install metro-mcp as usual
 claude mcp add metro-mcp -- bunx metro-mcp
 ```
 
-If your client doesn't support MCP roots, pass the config path explicitly:
+To point the MCP server at a different project, pass the project root explicitly:
 
 ```bash
-claude mcp add metro-mcp -- bunx metro-mcp --config /Users/you/my-project/metro-mcp.config.ts
+claude mcp add metro-mcp -- bunx metro-mcp --project-root /Users/you/my-project
 ```
 
 See [Configuration](/configuration) for all options.
@@ -146,13 +146,13 @@ metro-mcp connects to your running Metro dev server the same way Chrome DevTools
 
 ## Compatibility
 
-| | Supported |
-|---|---|
-| **React Native** | 0.70+ (Hermes required) |
-| **Expo** | SDK 49+ |
-| **Node.js** | 18+ |
-| **Bun** | 1.0+ |
-| **Platforms** | iOS Simulator, Android Emulator, physical devices via USB |
+|                  | Supported                                                 |
+| ---------------- | --------------------------------------------------------- |
+| **React Native** | 0.70+ (Hermes required)                                   |
+| **Expo**         | SDK 49+                                                   |
+| **Node.js**      | 18+                                                       |
+| **Bun**          | 1.0+                                                      |
+| **Platforms**    | iOS Simulator, Android Emulator, physical devices via USB |
 
 ## Chrome DevTools
 
@@ -180,11 +180,11 @@ Run `setup_statusline` in Claude Code — it writes a script to `~/.claude/metro
 /statusline add the script at ~/.claude/metro-mcp-statusline.sh
 ```
 
-| State | Display |
-|-------|---------|
-| Not running | `Metro ○` (dimmed) |
-| Running, not connected | `Metro ●` (red) |
-| Connected | `Metro ● localhost:8081` (green) |
+| State                  | Display                          |
+| ---------------------- | -------------------------------- |
+| Not running            | `Metro ○` (dimmed)               |
+| Running, not connected | `Metro ●` (red)                  |
+| Connected              | `Metro ● localhost:8081` (green) |
 
 ## Next Steps
 

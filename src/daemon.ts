@@ -3,11 +3,12 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+import type { JSONRPCMessage } from '@modelcontextprotocol/client';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { createLogger } from './utils/logger.js';
 import { version } from './version.js';
+import { resolveProjectRoot } from './config.js';
 
 const logger = createLogger('daemon');
 
@@ -21,6 +22,7 @@ const DAEMON_ENV_KEYS = [
   'METRO_PORT',
   'METRO_MCP_CONFIG',
   'METRO_MCP_PLUGINS',
+  'METRO_MCP_PROJECT_ROOT',
   'METRO_MCP_PROXY_PORT',
   'METRO_MCP_PROXY_ENABLED',
 ] as const;
@@ -28,6 +30,7 @@ const DAEMON_ENV_KEYS = [
 export interface DaemonIdentity {
   version: string;
   cwd: string;
+  projectRoot: string;
   args: string[];
   env: Record<string, string | undefined>;
   entrypoint: string;
@@ -81,10 +84,14 @@ function getConfigDir(): string {
   return process.env[DAEMON_CONFIG_DIR_ENV] || DEFAULT_CONFIG_DIR;
 }
 
-export function createDaemonIdentity(args: string[], overrides: Partial<DaemonIdentity> = {}): DaemonIdentity {
+export function createDaemonIdentity(
+  args: string[],
+  overrides: Partial<DaemonIdentity> = {},
+): DaemonIdentity {
   return {
     version: overrides.version ?? version,
     cwd: overrides.cwd ?? getDaemonCwd(),
+    projectRoot: overrides.projectRoot ?? getDaemonCwd(),
     args: overrides.args ?? [...args],
     env: overrides.env ?? selectedEnv(),
     entrypoint: overrides.entrypoint ?? resolvePath(process.argv[1]),
@@ -92,7 +99,10 @@ export function createDaemonIdentity(args: string[], overrides: Partial<DaemonId
   };
 }
 
-export function getDaemonKey(args: string[], identity = createDaemonIdentity(args)): string {
+export function getDaemonKey(
+  args: string[],
+  identity = createDaemonIdentity(args),
+): string {
   const hash = createHash('sha256');
   hash.update(JSON.stringify(identity));
   return hash.digest('hex').slice(0, 16);
@@ -116,7 +126,10 @@ function getDaemonLockPath(key: string): string {
 
 export function writeDaemonRecord(record: DaemonRecord): void {
   fs.mkdirSync(getConfigDir(), { recursive: true });
-  fs.writeFileSync(getDaemonRecordPath(record.key), JSON.stringify(record, null, 2));
+  fs.writeFileSync(
+    getDaemonRecordPath(record.key),
+    JSON.stringify(record, null, 2),
+  );
 }
 
 function removeDaemonRecord(key: string): void {
@@ -129,7 +142,9 @@ function removeDaemonRecord(key: string): void {
 
 export function removeDaemonRecordForProcess(key: string, pid: number): void {
   try {
-    const record = JSON.parse(fs.readFileSync(getDaemonRecordPath(key), 'utf8')) as DaemonRecord;
+    const record = JSON.parse(
+      fs.readFileSync(getDaemonRecordPath(key), 'utf8'),
+    ) as DaemonRecord;
     if (record.pid !== pid) return;
     removeDaemonRecord(key);
   } catch {
@@ -137,19 +152,27 @@ export function removeDaemonRecordForProcess(key: string, pid: number): void {
   }
 }
 
-function identityMatches(actual: DaemonIdentity | undefined, expected: DaemonIdentity): boolean {
+function identityMatches(
+  actual: DaemonIdentity | undefined,
+  expected: DaemonIdentity,
+): boolean {
   if (!actual) return false;
   return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
 async function readHealth(record: DaemonRecord): Promise<DaemonHealth | null> {
   const healthUrl = new URL('/health', record.url);
-  const response = await fetch(healthUrl, { signal: AbortSignal.timeout(1000) });
+  const response = await fetch(healthUrl, {
+    signal: AbortSignal.timeout(1000),
+  });
   if (!response.ok) return null;
-  return await response.json() as DaemonHealth;
+  return (await response.json()) as DaemonHealth;
 }
 
-async function isRecordLive(record: DaemonRecord, expectedIdentity?: DaemonIdentity): Promise<boolean> {
+async function isRecordLive(
+  record: DaemonRecord,
+  expectedIdentity?: DaemonIdentity,
+): Promise<boolean> {
   try {
     process.kill(record.pid, 0);
   } catch {
@@ -163,13 +186,18 @@ async function isRecordLive(record: DaemonRecord, expectedIdentity?: DaemonIdent
 
     if (health.version !== expectedIdentity.version) {
       logger.warn(
-        `Ignoring metro-mcp daemon ${record.url}: version ${health.version} does not match ${expectedIdentity.version}`
+        `Ignoring metro-mcp daemon ${record.url}: version ${health.version} does not match ${expectedIdentity.version}`,
       );
       return false;
     }
 
-    if (health.daemon?.key !== record.key || !identityMatches(health.daemon.identity, expectedIdentity)) {
-      logger.warn(`Ignoring metro-mcp daemon ${record.url}: daemon identity does not match current launch context`);
+    if (
+      health.daemon?.key !== record.key ||
+      !identityMatches(health.daemon.identity, expectedIdentity)
+    ) {
+      logger.warn(
+        `Ignoring metro-mcp daemon ${record.url}: daemon identity does not match current launch context`,
+      );
       return false;
     }
 
@@ -179,9 +207,14 @@ async function isRecordLive(record: DaemonRecord, expectedIdentity?: DaemonIdent
   }
 }
 
-export async function readLiveRecord(key: string, expectedIdentity?: DaemonIdentity): Promise<DaemonRecord | null> {
+export async function readLiveRecord(
+  key: string,
+  expectedIdentity?: DaemonIdentity,
+): Promise<DaemonRecord | null> {
   try {
-    const record = JSON.parse(fs.readFileSync(getDaemonRecordPath(key), 'utf8')) as DaemonRecord;
+    const record = JSON.parse(
+      fs.readFileSync(getDaemonRecordPath(key), 'utf8'),
+    ) as DaemonRecord;
     if (await isRecordLive(record, expectedIdentity)) return record;
   } catch {
     // Missing or corrupt record.
@@ -190,7 +223,10 @@ export async function readLiveRecord(key: string, expectedIdentity?: DaemonIdent
   return null;
 }
 
-async function waitForRecord(key: string, expectedIdentity: DaemonIdentity): Promise<DaemonRecord> {
+async function waitForRecord(
+  key: string,
+  expectedIdentity: DaemonIdentity,
+): Promise<DaemonRecord> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     const record = await readLiveRecord(key, expectedIdentity);
@@ -200,7 +236,10 @@ async function waitForRecord(key: string, expectedIdentity: DaemonIdentity): Pro
   throw new Error('Timed out waiting for metro-mcp daemon to start');
 }
 
-async function withStartupLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+async function withStartupLock<T>(
+  key: string,
+  fn: () => Promise<T>,
+): Promise<T> {
   fs.mkdirSync(getConfigDir(), { recursive: true });
   const lockPath = getDaemonLockPath(key);
   const deadline = Date.now() + STARTUP_LOCK_TIMEOUT_MS;
@@ -209,7 +248,13 @@ async function withStartupLock<T>(key: string, fn: () => Promise<T>): Promise<T>
     let fd: number | null = null;
     try {
       fd = fs.openSync(lockPath, 'wx');
-      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+      fs.writeFileSync(
+        fd,
+        JSON.stringify({
+          pid: process.pid,
+          createdAt: new Date().toISOString(),
+        }),
+      );
       return await fn();
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
@@ -225,8 +270,16 @@ async function withStartupLock<T>(key: string, fn: () => Promise<T>): Promise<T>
       await sleep(100);
     } finally {
       if (fd !== null) {
-        try { fs.closeSync(fd); } catch { /* ignore */ }
-        try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+        try {
+          fs.closeSync(fd);
+        } catch {
+          /* ignore */
+        }
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          /* ignore */
+        }
       }
     }
   }
@@ -242,23 +295,29 @@ export async function cleanupStaleDaemonRecords(): Promise<void> {
     return;
   }
 
-  await Promise.all(entries.map(async (entry) => {
-    const match = /^daemon-([a-f0-9]+)\.json$/.exec(entry);
-    if (!match) return;
+  await Promise.all(
+    entries.map(async (entry) => {
+      const match = /^daemon-([a-f0-9]+)\.json$/.exec(entry);
+      if (!match) return;
 
-    const key = match[1];
-    try {
-      const record = JSON.parse(fs.readFileSync(getDaemonRecordPath(key), 'utf8')) as DaemonRecord;
-      if (await isRecordLive(record)) return;
-    } catch {
-      // Corrupt records are stale.
-    }
-    removeDaemonRecord(key);
-  }));
+      const key = match[1];
+      try {
+        const record = JSON.parse(
+          fs.readFileSync(getDaemonRecordPath(key), 'utf8'),
+        ) as DaemonRecord;
+        if (await isRecordLive(record)) return;
+      } catch {
+        // Corrupt records are stale.
+      }
+      removeDaemonRecord(key);
+    }),
+  );
 }
 
 async function ensureDaemon(args: string[]): Promise<DaemonRecord> {
-  const identity = createDaemonIdentity(args);
+  const identity = createDaemonIdentity(args, {
+    projectRoot: resolveProjectRoot(args),
+  });
   const key = getDaemonKey(args, identity);
   await cleanupStaleDaemonRecords();
 
@@ -270,7 +329,8 @@ async function ensureDaemon(args: string[]): Promise<DaemonRecord> {
     if (lockedExisting) return lockedExisting;
 
     const entry = process.argv[1];
-    if (!entry) throw new Error('Cannot locate metro-mcp entrypoint for daemon startup');
+    if (!entry)
+      throw new Error('Cannot locate metro-mcp entrypoint for daemon startup');
 
     const child = spawn(process.execPath, [entry, 'serve', ...args], {
       detached: true,
@@ -287,27 +347,31 @@ async function ensureDaemon(args: string[]): Promise<DaemonRecord> {
   });
 }
 
-export function getDaemonKeyFromEnv(args: string[], identity = createDaemonIdentity(args)): string {
+export function getDaemonKeyFromEnv(
+  args: string[],
+  identity = createDaemonIdentity(args),
+): string {
   return process.env[DAEMON_KEY_ENV] || getDaemonKey(args, identity);
 }
 
 export async function startStdioProxy(args: string[]): Promise<void> {
   const record = await ensureDaemon(args);
   const stdio = new StdioServerTransport();
-  const daemonTransport = new StreamableHTTPClientTransport(new URL(record.url));
+  const daemonTransport = new StreamableHTTPClientTransport(
+    new URL(record.url),
+  );
   let closing = false;
 
-  async function closeQuietly(transport: { close(): Promise<void> }): Promise<void> {
+  async function closeQuietly(transport: {
+    close(): Promise<void>;
+  }): Promise<void> {
     await transport.close().catch(() => {});
   }
 
   async function close(): Promise<void> {
     if (closing) return;
     closing = true;
-    await Promise.all([
-      closeQuietly(stdio),
-      closeQuietly(daemonTransport),
-    ]);
+    await Promise.all([closeQuietly(stdio), closeQuietly(daemonTransport)]);
     process.exit(0);
   }
 
@@ -324,7 +388,8 @@ export async function startStdioProxy(args: string[]): Promise<void> {
     });
   };
   stdio.onerror = (err) => logger.error('stdio transport error:', err);
-  daemonTransport.onerror = (err) => logger.error('daemon transport error:', err);
+  daemonTransport.onerror = (err) =>
+    logger.error('daemon transport error:', err);
   stdio.onclose = () => void close();
   daemonTransport.onclose = () => void close();
 

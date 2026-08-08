@@ -47,10 +47,16 @@ export interface ToolAnnotations {
 
 export interface ToolHandlerContext {
   /** Send a progress notification to the client (only if client provided a progressToken) */
-  sendProgress?: (progress: number, total: number, message?: string) => Promise<void>;
+  sendProgress?: (
+    progress: number,
+    total: number,
+    message?: string,
+  ) => Promise<void>;
 }
 
-export interface ToolConfig<T extends z.ZodType = z.ZodType> {
+export interface ToolConfig<
+  T extends z.ZodObject<z.ZodRawShape> = z.ZodObject<z.ZodRawShape>,
+> {
   description: string;
   parameters: T;
   annotations?: ToolAnnotations;
@@ -93,7 +99,9 @@ export interface PromptConfig {
     description: string;
     required?: boolean;
   }>;
-  handler: (args: Record<string, string>) => Promise<Array<{ role: 'user' | 'assistant'; content: string }>>;
+  handler: (
+    args: Record<string, string>,
+  ) => Promise<Array<{ role: 'user' | 'assistant'; content: string }>>;
 }
 
 // ── Eval Options ──
@@ -124,7 +132,10 @@ export interface PluginContext {
   cdp: CDPConnection;
   /** Metro `/events` WebSocket — build progress, bundling errors, etc. */
   events: MetroEventsConnection;
-  registerTool<T extends z.ZodType>(name: string, config: ToolConfig<T>): void;
+  registerTool<T extends z.ZodObject<z.ZodRawShape>>(
+    name: string,
+    config: ToolConfig<T>,
+  ): void;
   registerResource(uri: string, config: ResourceConfig): void;
   registerPrompt(name: string, config: PromptConfig): void;
   config: Record<string, unknown>;
@@ -181,6 +192,8 @@ export function definePlugin(plugin: PluginDefinition): PluginDefinition {
 // ── Config ──
 
 export interface MetroMCPConfig {
+  /** Effective project root; resolved by the CLI and not configurable in a file. */
+  projectRoot?: string;
   metro?: {
     host?: string;
     port?: number;
