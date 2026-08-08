@@ -1,6 +1,6 @@
 {
   "name": "metro-mcp",
-  "version": "0.13.2",
+  "version": "0.14.0",
   "mcpName": "io.github.steve228uk/metro-mcp",
   "description": "Plugin-based MCP server for React Native/Expo runtime debugging, inspection, and automation via Metro/CDP",
   "homepage": "https://metromcp.dev",
@@ -40,8 +40,8 @@
     "prepare": "bun run build",
     "build": "bun run build:apps && bun run clean && bun run build:js && bun run build:bin && bun run build:types",
     "build:apps": "bun run scripts/build-apps.ts",
-    "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod --external ws && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod",
-    "build:bin": "bun build bin/metro-mcp.ts --outfile dist/bin/metro-mcp.js --target node --external @modelcontextprotocol/sdk --external @modelcontextprotocol/ext-apps --external zod --external ws && chmod +x dist/bin/metro-mcp.js",
+    "build:js": "bun build src/index.ts src/plugin.ts --outdir dist --target node --external @modelcontextprotocol/server --external @modelcontextprotocol/client --external @modelcontextprotocol/node --external zod --external ws && bun build src/plugin.ts --outfile dist/plugin.cjs --target node --format cjs --external @modelcontextprotocol/server --external @modelcontextprotocol/client --external @modelcontextprotocol/node --external zod",
+    "build:bin": "bun build bin/metro-mcp.ts --outfile dist/bin/metro-mcp.js --target node --external @modelcontextprotocol/server --external @modelcontextprotocol/client --external @modelcontextprotocol/node --external zod --external ws && chmod +x dist/bin/metro-mcp.js",
     "build:types": "bunx tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "docs:dev": "vitepress dev docs",
@@ -64,13 +64,14 @@
   "license": "MIT",
   "dependencies": {
     "@clack/prompts": "^1.2.0",
-    "@modelcontextprotocol/ext-apps": "^1.7.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
     "chrome-launcher": "^1.2.1",
     "chromium-edge-launcher": "^0.3.0",
     "metro-bridge": "^0.2.8",
     "ws": "^8.20.0",
-    "zod": "^4.0.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/bun": "^1.2.10",

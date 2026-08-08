@@ -45,7 +45,9 @@ async function main() {
 
   // Catch unknown subcommands (args that look like commands, not flags)
   if (subcommand && subcommand !== 'serve' && !subcommand.startsWith('-')) {
-    console.error(`Unknown command: ${subcommand}\nRun \`metro-mcp --help\` for usage.`);
+    console.error(
+      `Unknown command: ${subcommand}\nRun \`metro-mcp --help\` for usage.`,
+    );
     process.exit(1);
   }
 
@@ -68,6 +70,7 @@ Options:
   --port, -p <port>       Metro port (default: 8081, env: METRO_PORT)
   --config, -c <path>     Path to config file (env: METRO_MCP_CONFIG)
   --plugin <path>         Load a plugin (repeatable, env: METRO_MCP_PLUGINS)
+  --project-root <path>   Project root (env: METRO_MCP_PROJECT_ROOT)
   --mcp-port <port>       Port for \`serve\` mode (default: random, env: METRO_MCP_MCP_PORT)
   --stdio-direct          Run one legacy stdio server process without multiplexing
   --help                  Show this help message
@@ -77,6 +80,7 @@ Environment Variables:
   METRO_PORT              Metro bundler port
   METRO_MCP_CONFIG        Path to config file (absolute or relative to CWD)
   METRO_MCP_PLUGINS       Colon-separated plugin paths
+  METRO_MCP_PROJECT_ROOT  Project root for config, plugins, and daemon identity
   METRO_MCP_MCP_PORT      Port for the shared MCP HTTP server
   METRO_MCP_MULTIPLEX     Set to "false" to disable the stdio daemon/proxy
   DEBUG                   Enable debug logging
@@ -94,13 +98,18 @@ Examples:
 
   try {
     const config = await loadConfig(serverArgs);
-    logger.info(`Starting metro-mcp (Metro: ${config.metro.host}:${config.metro.port})`);
+    logger.info(
+      `Starting metro-mcp (Metro: ${config.metro.host}:${config.metro.port})`,
+    );
 
     if (subcommand === 'serve') {
       const mcpPort = resolveMcpPort(serverArgs);
-      const identity = createDaemonIdentity(serverArgs);
+      const identity = createDaemonIdentity(serverArgs, {
+        projectRoot: config.projectRoot,
+      });
       const key = getDaemonKeyFromEnv(serverArgs, identity);
-      const cleanupDaemonRecord = () => removeDaemonRecordForProcess(key, process.pid);
+      const cleanupDaemonRecord = () =>
+        removeDaemonRecordForProcess(key, process.pid);
       await startHttpServer(config, serverArgs, {
         port: mcpPort,
         daemon: { key, identity },
@@ -111,7 +120,7 @@ Examples:
             port,
             url,
             key,
-            cwd: getDaemonCwd(),
+            cwd: config.projectRoot ?? getDaemonCwd(),
             args: serverArgs,
             identity,
             startedAt: new Date().toISOString(),
@@ -122,8 +131,14 @@ Examples:
       return;
     }
 
-    if (serverArgs.includes('--stdio-direct') || process.env.METRO_MCP_MULTIPLEX === 'false') {
-      await startServer(config, serverArgs.filter((arg) => arg !== '--stdio-direct'));
+    if (
+      serverArgs.includes('--stdio-direct') ||
+      process.env.METRO_MCP_MULTIPLEX === 'false'
+    ) {
+      await startServer(
+        config,
+        serverArgs.filter((arg) => arg !== '--stdio-direct'),
+      );
       return;
     }
 
