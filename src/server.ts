@@ -56,6 +56,8 @@ import {
   createDaemonIdentity,
   DaemonLeaseRegistry,
   getDaemonKey,
+  getDaemonIdentityFingerprint,
+  getDaemonKeyFingerprint,
 } from './daemon.js';
 import type { DaemonIdentity } from './daemon.js';
 
@@ -1202,8 +1204,8 @@ export async function startHttpServer(
           name: 'metro-mcp',
           version,
           daemon: {
-            key: daemonKey,
-            identity: daemonIdentity,
+            keyHash: getDaemonKeyFingerprint(daemonKey),
+            identityHash: getDaemonIdentityFingerprint(daemonIdentity),
             managed: options.daemon?.managed === true,
           },
         });

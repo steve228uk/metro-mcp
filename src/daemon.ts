@@ -59,8 +59,8 @@ export interface DaemonHealth {
   name: string;
   version: string;
   daemon?: {
-    key: string;
-    identity: DaemonIdentity;
+    keyHash: string;
+    identityHash: string;
     managed?: boolean;
   };
 }
@@ -198,6 +198,22 @@ export function getDaemonKey(
   return hash.digest('hex').slice(0, 16);
 }
 
+export function getDaemonIdentityFingerprint(identity: DaemonIdentity): string {
+  return createHash('sha256').update(JSON.stringify(identity)).digest('hex');
+}
+
+export function getDaemonKeyFingerprint(key: string): string {
+  return createHash('sha256')
+    .update('metro-mcp-daemon-key\0')
+    .update(key)
+    .digest('hex');
+}
+
+function ensureConfigDir(): void {
+  fs.mkdirSync(getConfigDir(), { recursive: true, mode: 0o700 });
+  fs.chmodSync(getConfigDir(), 0o700);
+}
+
 export function getDaemonCwd(): string {
   try {
     return fs.realpathSync(process.cwd());
@@ -215,11 +231,13 @@ export function getDaemonLockPath(key: string): string {
 }
 
 export function writeDaemonRecord(record: DaemonRecord): void {
-  fs.mkdirSync(getConfigDir(), { recursive: true });
+  ensureConfigDir();
   fs.writeFileSync(
     getDaemonRecordPath(record.key),
     JSON.stringify(record, null, 2),
+    { mode: 0o600 },
   );
+  fs.chmodSync(getDaemonRecordPath(record.key), 0o600);
 }
 
 function removeDaemonRecord(key: string): void {
@@ -299,9 +317,12 @@ async function isRecordLive(
       return false;
     }
 
+    const daemon = health.daemon;
     if (
-      health.daemon?.key !== record.key ||
-      !identityMatches(health.daemon.identity, expectedIdentity)
+      !daemon ||
+      daemon.keyHash !== getDaemonKeyFingerprint(record.key) ||
+      daemon.identityHash !== getDaemonIdentityFingerprint(expectedIdentity) ||
+      !identityMatches(record.identity, expectedIdentity)
     ) {
       logger.warn(
         `Ignoring metro-mcp daemon ${record.url}: daemon identity does not match current launch context`,
@@ -309,7 +330,7 @@ async function isRecordLive(
       return false;
     }
 
-    record.managed = health.daemon.managed === true;
+    record.managed = daemon.managed === true;
     return true;
   } catch {
     return false;
@@ -349,7 +370,7 @@ export async function withStartupLock<T>(
   key: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  fs.mkdirSync(getConfigDir(), { recursive: true });
+  ensureConfigDir();
   const lockPath = getDaemonLockPath(key);
   const deadline = Date.now() + STARTUP_LOCK_TIMEOUT_MS;
 
@@ -358,7 +379,7 @@ export async function withStartupLock<T>(
     let lockToken: string | null = null;
     let heartbeat: ReturnType<typeof setInterval> | null = null;
     try {
-      fd = fs.openSync(lockPath, 'wx');
+      fd = fs.openSync(lockPath, 'wx', 0o600);
       lockToken = randomUUID();
       fs.writeFileSync(
         fd,
@@ -380,24 +401,11 @@ export async function withStartupLock<T>(
       return await fn();
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      try {
-        const contents = fs.readFileSync(lockPath, 'utf8');
-        const lock = JSON.parse(contents) as { pid?: number };
-        const stat = fs.statSync(lockPath);
-        if (
-          !isProcessAlive(lock.pid) ||
-          Date.now() - stat.mtimeMs > STARTUP_LOCK_STALE_MS
-        ) {
-          removeStartupLockIfUnchanged(lockPath, contents);
-          continue;
-        }
-      } catch {
-        try {
-          const contents = fs.readFileSync(lockPath, 'utf8');
-          removeStartupLockIfUnchanged(lockPath, contents);
-        } catch {
-          // The lock disappeared; retry acquisition.
-        }
+      const snapshot = readStartupLock(lockPath);
+      if (!snapshot) continue;
+      const stale = Date.now() - snapshot.mtimeMs > STARTUP_LOCK_STALE_MS;
+      if ((snapshot.valid && !isProcessAlive(snapshot.pid)) || stale) {
+        removeStartupLockIfUnchanged(lockPath, snapshot);
         continue;
       }
       await sleep(100);
@@ -447,12 +455,58 @@ function removeStartupLockIfOwned(lockPath: string, token: string): void {
   }
 }
 
+interface StartupLockSnapshot {
+  contents: string;
+  device: number;
+  inode: number;
+  mtimeMs: number;
+  size: number;
+  pid?: number;
+  valid: boolean;
+}
+
+function readStartupLock(lockPath: string): StartupLockSnapshot | null {
+  try {
+    const stat = fs.statSync(lockPath);
+    const contents = fs.readFileSync(lockPath, 'utf8');
+    let pid: number | undefined;
+    let valid = false;
+    try {
+      const lock = JSON.parse(contents) as { pid?: unknown; token?: unknown };
+      if (typeof lock.pid === 'number' && typeof lock.token === 'string') {
+        pid = lock.pid;
+        valid = true;
+      }
+    } catch {
+      // A process may have created the file and not written its payload yet.
+    }
+    return {
+      contents,
+      device: stat.dev,
+      inode: stat.ino,
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      pid,
+      valid,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function removeStartupLockIfUnchanged(
   lockPath: string,
-  expectedContents: string,
+  expected: StartupLockSnapshot,
 ): void {
   try {
-    if (fs.readFileSync(lockPath, 'utf8') !== expectedContents) return;
+    const current = fs.statSync(lockPath);
+    if (
+      current.dev !== expected.device ||
+      current.ino !== expected.inode ||
+      current.mtimeMs !== expected.mtimeMs ||
+      current.size !== expected.size ||
+      fs.readFileSync(lockPath, 'utf8') !== expected.contents
+    ) return;
     fs.unlinkSync(lockPath);
   } catch {
     // The lock may have been replaced or removed concurrently.
@@ -460,6 +514,7 @@ function removeStartupLockIfUnchanged(
 }
 
 export async function cleanupStaleDaemonRecords(): Promise<void> {
+  ensureConfigDir();
   let entries: string[];
   try {
     entries = fs.readdirSync(getConfigDir());
@@ -487,27 +542,11 @@ export async function cleanupStaleDaemonRecords(): Promise<void> {
       const lockMatch = /^daemon-([a-f0-9]+)\.lock$/.exec(entry);
       if (!lockMatch) return;
       const lockPath = getDaemonLockPath(lockMatch[1]);
-      let contents: string;
-      try {
-        contents = fs.readFileSync(lockPath, 'utf8');
-        const lock = JSON.parse(contents) as {
-          pid?: number;
-        };
-        const stat = fs.statSync(lockPath);
-        if (
-          isProcessAlive(lock.pid) &&
-          Date.now() - stat.mtimeMs <= STARTUP_LOCK_STALE_MS
-        ) {
-          return;
-        }
-      } catch {
-        try {
-          contents = fs.readFileSync(lockPath, 'utf8');
-        } catch {
-          return;
-        }
-      }
-      removeStartupLockIfUnchanged(lockPath, contents);
+      const snapshot = readStartupLock(lockPath);
+      if (!snapshot) return;
+      const stale = Date.now() - snapshot.mtimeMs > STARTUP_LOCK_STALE_MS;
+      if (!stale && (!snapshot.valid || isProcessAlive(snapshot.pid))) return;
+      removeStartupLockIfUnchanged(lockPath, snapshot);
     }),
   );
 }
