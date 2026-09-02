@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, readdir, readFile, stat, unlink } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  stat,
+  unlink,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -10,10 +20,40 @@ const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SCREENSHOT_FILE_PATTERN = /^metro-mcp-screenshot-[a-zA-Z0-9-]+\.png$/;
 const SCREENSHOT_DIRECTORY = join(tmpdir(), 'metro-mcp-screenshots');
 
-async function prepareScreenshotDirectory(): Promise<void> {
-  await mkdir(SCREENSHOT_DIRECTORY, { recursive: true, mode: 0o700 });
-  // mkdir's mode is affected by the umask and does not repair an existing directory.
-  await chmod(SCREENSHOT_DIRECTORY, 0o700);
+export async function prepareScreenshotDirectory(
+  directory = SCREENSHOT_DIRECTORY,
+): Promise<void> {
+  try {
+    await mkdir(directory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+
+  const pathMetadata = await lstat(directory);
+  if (!pathMetadata.isDirectory() || pathMetadata.isSymbolicLink()) {
+    throw new Error('Screenshot directory is not a real directory');
+  }
+
+  const handle = await open(
+    directory,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const openedMetadata = await handle.stat();
+    const currentUid = process.getuid?.();
+    if (
+      !openedMetadata.isDirectory() ||
+      openedMetadata.dev !== pathMetadata.dev ||
+      openedMetadata.ino !== pathMetadata.ino ||
+      (currentUid !== undefined && openedMetadata.uid !== currentUid)
+    ) {
+      throw new Error('Screenshot directory ownership changed');
+    }
+    // mkdir's mode is affected by the umask and does not repair an existing directory.
+    await handle.chmod(0o700);
+  } finally {
+    await handle.close();
+  }
 }
 
 async function cleanupOldScreenshots(now = Date.now()): Promise<void> {

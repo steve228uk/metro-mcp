@@ -1,7 +1,17 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { readFile, stat, unlink, utimes, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { z } from 'zod';
@@ -10,7 +20,7 @@ import type {
   PluginContext,
   ToolHandlerResult,
 } from '../plugin.js';
-import { simulatorPlugin } from './simulator.js';
+import { prepareScreenshotDirectory, simulatorPlugin } from './simulator.js';
 
 type RegisteredTool = {
   parameters: z.ZodType;
@@ -197,5 +207,21 @@ describe('take_screenshot', () => {
     await capture(tool, { platform: 'ios' });
 
     expect(existsSync(oldPath)).toBe(false);
+  });
+
+  test('refuses a pre-existing screenshot directory symlink', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'metro-mcp-symlink-test-'));
+    const target = join(root, 'target');
+    const linkedDirectory = join(root, 'screenshots');
+    await mkdir(target);
+    await symlink(target, linkedDirectory, 'dir');
+
+    try {
+      await expect(prepareScreenshotDirectory(linkedDirectory)).rejects.toThrow(
+        'Screenshot directory is not a real directory',
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });
