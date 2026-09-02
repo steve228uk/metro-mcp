@@ -20,6 +20,10 @@ const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SCREENSHOT_FILE_PATTERN = /^metro-mcp-screenshot-[a-zA-Z0-9-]+\.png$/;
 const SCREENSHOT_DIRECTORY = join(tmpdir(), 'metro-mcp-screenshots');
 
+export function quoteShellArgument(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
 export async function prepareScreenshotDirectory(
   directory = SCREENSHOT_DIRECTORY,
 ): Promise<void> {
@@ -120,9 +124,13 @@ export const simulatorPlugin = definePlugin({
 
         try {
           if (p === 'ios') {
-            await ctx.exec(`xcrun simctl io booted screenshot "${tmpFile}"`);
+            await ctx.exec(
+              `xcrun simctl io booted screenshot ${quoteShellArgument(tmpFile)}`,
+            );
           } else {
-            await ctx.exec(`adb exec-out screencap -p > "${tmpFile}"`);
+            await ctx.exec(
+              `adb exec-out screencap -p > ${quoteShellArgument(tmpFile)}`,
+            );
           }
 
           await chmod(tmpFile, 0o600);

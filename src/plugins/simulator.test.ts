@@ -20,7 +20,11 @@ import type {
   PluginContext,
   ToolHandlerResult,
 } from '../plugin.js';
-import { prepareScreenshotDirectory, simulatorPlugin } from './simulator.js';
+import {
+  prepareScreenshotDirectory,
+  quoteShellArgument,
+  simulatorPlugin,
+} from './simulator.js';
 
 type RegisteredTool = {
   parameters: z.ZodType;
@@ -81,7 +85,10 @@ async function createSimulatorHarness(
       fetch: async () => new Response(),
     },
     exec: async (command) => {
-      const path = command.match(/"([^"]+)"$/)?.[1];
+      const quotedPath = command.match(/('(?:[^']|'\\'')*')$/)?.[1];
+      const path = quotedPath
+        ?.slice(1, -1)
+        .replaceAll(`'\\''`, "'");
       if (writeCapture && path) {
         createdFiles.add(path);
         await writeFile(path, png);
@@ -115,6 +122,12 @@ async function capture(
 }
 
 describe('take_screenshot', () => {
+  test('shell-quotes environment-derived screenshot paths', () => {
+    expect(quoteShellArgument("/tmp/path with 'quotes'/$HOME;$(id).png")).toBe(
+      "'/tmp/path with '\\''quotes'\\''/$HOME;$(id).png'",
+    );
+  });
+
   test('defaults to a retained temporary path with structured metadata', async () => {
     const tool = await createSimulatorHarness();
     const result = await capture(tool, { platform: 'ios' });
