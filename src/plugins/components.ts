@@ -235,13 +235,9 @@ export const componentsPlugin = definePlugin({
         const expression = buildFiberReadExpression(
           `
             var elements = [];
-            var seen = new Set();
             var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber, context) {
               var element = metroElementFromFiber(fiber);
               if (!element || (!element.testID && !element.accessibilityLabel)) return;
-              var key = element.testID || element.accessibilityLabel;
-              if (seen.has(key)) return;
-              seen.add(key);
               element.depth = context.depth;
               elements.push(element);
             });

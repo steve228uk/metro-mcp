@@ -85,16 +85,12 @@ export const uiInteractPlugin = definePlugin({
               'LongPressGestureHandler','TapGestureHandler',
               'Chip','FAB','IconButton','ListItem','MenuItem',
             ]);
-            var seen = new Set();
             var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber, context) {
               var element = metroElementFromFiber(fiber);
               if (!element) return;
               element.interactive = element.interactive || INTERACTIVE.has(element.name);
               if (${interactiveOnly} && !element.interactive) return;
               if (!element.label && !element.testID && !element.interactive) return;
-              var key = element.testID || element.label;
-              if (key && seen.has(key)) return;
-              if (key) seen.add(key);
               element.depth = context.depth;
               elements.push(element);
             });

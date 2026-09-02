@@ -196,6 +196,49 @@ describe('fiber read tools', () => {
     expect(first.traversal.complete).toBe(true);
   });
 
+  test('bounds nested component props before returning them', async () => {
+    const root = fiber('LargeProps', {
+      payload: {
+        items: Array.from({ length: 500 }, (_, index) => ({
+          index,
+          value: 'x'.repeat(2_000),
+        })),
+      },
+    });
+    const call = await createHarness(runtimeFor([root]), [componentsPlugin]);
+    const result = (await call('get_component_tree', {
+      structureOnly: false,
+    })) as {
+      nodes: Array<{ props: { payload: { items: unknown[] } } }>;
+    };
+
+    expect(result.nodes[0].props.payload.items).toHaveLength(21);
+    expect(result.nodes[0].props.payload.items.at(-1)).toBe('[truncated]');
+    expect(JSON.stringify(result).length).toBeLessThan(25_000);
+  });
+
+  test('keeps distinct sibling controls that share a label', async () => {
+    const root = append(
+      fiber('Root'),
+      fiber('Pressable', { accessibilityLabel: 'Option', onPress: () => {} }),
+      fiber('Pressable', { accessibilityLabel: 'Option', onPress: () => {} }),
+    );
+    const call = await createHarness(runtimeFor([root]), [
+      componentsPlugin,
+      uiInteractPlugin,
+    ]);
+
+    const testable = (await call('get_testable_elements')) as {
+      elements: Array<{ accessibilityLabel: string }>;
+    };
+    const listed = (await call('list_elements', { interactiveOnly: true })) as {
+      elements: Array<{ label: string }>;
+    };
+
+    expect(testable.elements).toHaveLength(2);
+    expect(listed.elements).toHaveLength(2);
+  });
+
   test('list_elements returns an explicit envelope and deep elements', async () => {
     const root = fiber('Root');
     let current = root;

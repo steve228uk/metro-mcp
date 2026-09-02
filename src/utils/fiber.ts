@@ -173,16 +173,67 @@ export const FIBER_WALKER_JS = `
     var source = fiber && fiber.memoizedProps;
     var result = {};
     if (!source || typeof source !== 'object') return result;
-    var keys = Object.keys(source);
+    var budget = { remaining: 100 };
+    var seen = [];
+
+    function safeValue(value, depth) {
+      if (typeof value === 'function') return '[function]';
+      if (typeof value === 'string') return value.slice(0, 1000);
+      if (
+        value === null ||
+        typeof value === 'number' ||
+        typeof value === 'boolean'
+      ) return value;
+      if (typeof value !== 'object') return String(value).slice(0, 1000);
+      if (depth >= 3) return Array.isArray(value) ? '[array]' : '[object]';
+      if (seen.indexOf(value) !== -1) return '[circular]';
+      if (budget.remaining <= 0) return '[truncated]';
+
+      seen.push(value);
+      var output;
+      if (Array.isArray(value)) {
+        output = [];
+        var itemLimit = Math.min(value.length, 20);
+        for (var itemIndex = 0; itemIndex < itemLimit; itemIndex++) {
+          if (budget.remaining <= 0) break;
+          budget.remaining--;
+          output.push(safeValue(value[itemIndex], depth + 1));
+        }
+        if (value.length > output.length) output.push('[truncated]');
+      } else {
+        output = {};
+        var nestedKeys;
+        try { nestedKeys = Object.keys(value); }
+        catch (_) {
+          seen.pop();
+          return '[object]';
+        }
+        var propertyLimit = Math.min(nestedKeys.length, 20);
+        var copied = 0;
+        for (var propertyIndex = 0; propertyIndex < propertyLimit; propertyIndex++) {
+          if (budget.remaining <= 0) break;
+          var nestedKey = nestedKeys[propertyIndex];
+          var safeNestedKey = String(nestedKey).slice(0, 200);
+          budget.remaining--;
+          try { output[safeNestedKey] = safeValue(value[nestedKey], depth + 1); }
+          catch (_) { output[safeNestedKey] = '[unavailable]'; }
+          copied++;
+        }
+        if (nestedKeys.length > copied) output.__truncated__ = true;
+      }
+      seen.pop();
+      return output;
+    }
+
+    var keys;
+    try { keys = Object.keys(source); }
+    catch (_) { return result; }
     for (var index = 0; index < Math.min(keys.length, limit || 20); index++) {
       var key = keys[index];
       if (key === 'children') continue;
-      var value = source[key];
-      if (typeof value === 'function') result[key] = '[function]';
-      else if (value && typeof value === 'object') {
-        try { result[key] = JSON.parse(JSON.stringify(value)); }
-        catch (_) { result[key] = '[object]'; }
-      } else result[key] = value;
+      var safeKey = String(key).slice(0, 200);
+      try { result[safeKey] = safeValue(source[key], 0); }
+      catch (_) { result[safeKey] = '[unavailable]'; }
     }
     return result;
   }
@@ -357,14 +408,10 @@ export const FIBER_ROOT_JS = `
 
 export const COLLECT_ELEMENTS_JS = buildFiberReadExpression(`
   var elements = [];
-  var seen = new Set();
   var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber) {
     var element = metroElementFromFiber(fiber);
     if (!element) return;
-    var key = element.testID || element.accessibilityLabel;
     if (!(element.testID || element.accessibilityLabel || element.text)) return;
-    if (key && seen.has(key)) return;
-    if (key) seen.add(key);
     elements.push(element);
   });
   return { elements: elements, traversal: traversal };
