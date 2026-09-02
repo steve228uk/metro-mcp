@@ -69,9 +69,12 @@ function resolveConfigPath(value: string, projectRoot: string): string {
 function resolvePluginPath(value: string, projectRoot: string): string {
   if (
     isAbsolute(value) ||
-    value.startsWith('.') ||
-    value.includes('/') ||
-    value.includes('\\')
+    value === '.' ||
+    value === '..' ||
+    value.startsWith('./') ||
+    value.startsWith('../') ||
+    value.startsWith('.\\') ||
+    value.startsWith('..\\')
   ) {
     return resolve(projectRoot, value);
   }

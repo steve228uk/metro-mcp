@@ -136,7 +136,7 @@ interface HttpServerOptions {
 }
 
 function createMcpServer(): McpServer {
-  return new McpServer(
+  const server = new McpServer(
     {
       name: 'metro-mcp',
       version,
@@ -145,6 +145,8 @@ function createMcpServer(): McpServer {
       instructions: `React Native runtime debugging MCP server. Connects to Metro bundler via Chrome DevTools Protocol to provide console logs, network requests, component tree inspection, state management debugging, device control, and more. Use list_devices to see connected targets, then use other tools to inspect and interact with the running app.`,
     },
   );
+  server.server.registerCapabilities({ resources: { subscribe: true } });
+  return server;
 }
 
 function sendJson(
@@ -180,6 +182,7 @@ export async function createMetroRuntime(
   const eventsClient = new MetroEventsClient();
   const formatUtils = createFormatUtils();
   const sessions = new Set<McpSession>();
+  const modernStdioServers = new Set<McpServer>();
   const runtimeRegistrations: RuntimeRegistration[] = [];
   const resourceSubscriptions = new ResourceSubscriptionManager();
   let isInitializingPlugins = false;
@@ -202,6 +205,11 @@ export async function createMetroRuntime(
   function notifyResourceUpdated(uri: string): void {
     resourceUpdates.notify(uri);
     modernResourceNotifier?.(uri);
+    for (const server of modernStdioServers) {
+      server.server
+        .sendResourceUpdated({ uri })
+        .catch((err) => logger.warn('Failed to send stdio resource update:', err));
+    }
   }
 
   // Active device tracking — used by plugins to key per-device buffers.
@@ -911,15 +919,63 @@ export async function createMetroRuntime(
     return session;
   }
 
-  async function startStdio(): Promise<void> {
+  async function startStdio(transport?: Transport): Promise<void> {
     const handle = serveStdio(
-      () => {
+      ({ era }) => {
         const server = createMcpServer();
-        materializeServer(server);
+        const registrations = materializeServer(server);
+        const previousClose = server.close.bind(server);
+        let closed = false;
+
+        if (era === 'modern') {
+          modernStdioServers.add(server);
+        } else {
+          const session: McpSession = {
+            id: randomUUID(),
+            server,
+            subscribedResources: new Set<string>(),
+            registrations,
+          };
+          server.server.setRequestHandler('resources/subscribe', async (req) => {
+            resourceSubscriptions.subscribe(
+              session,
+              String((req.params as { uri: string }).uri),
+            );
+            return {};
+          });
+          server.server.setRequestHandler(
+            'resources/unsubscribe',
+            async (req) => {
+              resourceSubscriptions.unsubscribe(
+                session,
+                String((req.params as { uri: string }).uri),
+              );
+              return {};
+            },
+          );
+          sessions.add(session);
+        }
+
+        server.close = async () => {
+          if (!closed) {
+            closed = true;
+            modernStdioServers.delete(server);
+            const session = [...sessions].find(
+              (candidate) => candidate.server === server,
+            );
+            if (session) {
+              resourceSubscriptions.unsubscribeAll(session);
+              resourceUpdates.removeTarget(session.id);
+              sessions.delete(session);
+            }
+          }
+          await previousClose();
+        };
         return server;
       },
       {
         legacy: 'serve',
+        ...(transport ? { transport } : {}),
         onerror: (err) => logger.error('stdio server error:', err),
       },
     );
@@ -945,6 +1001,7 @@ export async function createMetroRuntime(
       session.server.close().catch(() => {});
     }
     sessions.clear();
+    modernStdioServers.clear();
     stdioHandle?.close().catch(() => {});
     stdioHandle = null;
     resourceUpdates.close();
@@ -989,6 +1046,7 @@ export async function createMetroRuntime(
     setModernResourceNotifier: (notifier: (uri: string) => void) => {
       modernResourceNotifier = notifier;
     },
+    notifyResourceUpdated,
     close: closeRuntime,
   };
 }

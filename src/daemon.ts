@@ -88,10 +88,14 @@ export function createDaemonIdentity(
   args: string[],
   overrides: Partial<DaemonIdentity> = {},
 ): DaemonIdentity {
+  const projectRoot =
+    overrides.projectRoot ?? overrides.cwd ?? getDaemonCwd();
   return {
     version: overrides.version ?? version,
-    cwd: overrides.cwd ?? getDaemonCwd(),
-    projectRoot: overrides.projectRoot ?? getDaemonCwd(),
+    // Daemon ownership is project-scoped. The launcher's incidental working
+    // directory must not split one project across multiple daemon keys.
+    cwd: projectRoot,
+    projectRoot,
     args: overrides.args ?? [...args],
     env: overrides.env ?? selectedEnv(),
     entrypoint: overrides.entrypoint ?? resolvePath(process.argv[1]),

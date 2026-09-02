@@ -3,8 +3,9 @@ import {
   Client,
   StreamableHTTPClientTransport,
 } from '@modelcontextprotocol/client';
+import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { loadConfig } from '../src/config.js';
-import { startHttpServer } from '../src/server.js';
+import { createMetroRuntime, startHttpServer } from '../src/server.js';
 
 const clients: Client[] = [];
 let server: Awaited<ReturnType<typeof startHttpServer>> | undefined;
@@ -38,6 +39,55 @@ function createClient(url: string, modern: boolean): Client {
   clients.push(client);
   void url;
   return client;
+}
+
+async function expectDirectStdioResourceUpdate(modern: boolean) {
+  const config = await loadConfig(['--project-root', process.cwd()]);
+  config.metro.host = '127.0.0.1';
+  config.metro.port = 65535;
+  config.metro.autoDiscover = false;
+  config.proxy.enabled = false;
+  const runtime = await createMetroRuntime(config, [
+    '--project-root',
+    process.cwd(),
+  ]);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = createClient('stdio', modern);
+  let receivedUpdate: ((uri: string) => void) | undefined;
+  const update = new Promise<string>((resolve) => {
+    receivedUpdate = resolve;
+  });
+  client.setNotificationHandler('notifications/resources/updated', (notification) => {
+    receivedUpdate?.(notification.params.uri);
+  });
+
+  try {
+    await runtime.startStdio(serverTransport);
+    await client.connect(clientTransport);
+    if (modern) {
+      const subscription = await client.listen({
+        resourceSubscriptions: ['metro://logs'],
+      });
+      expect(subscription.honoredFilter.resourceSubscriptions).toEqual([
+        'metro://logs',
+      ]);
+    } else {
+      await client.subscribeResource({ uri: 'metro://logs' });
+    }
+
+    runtime.notifyResourceUpdated('metro://logs');
+    expect(
+      await Promise.race([
+        update,
+        new Promise<string>((_, reject) =>
+          setTimeout(() => reject(new Error('resource update timed out')), 1000),
+        ),
+      ]),
+    ).toBe('metro://logs');
+  } finally {
+    await client.close().catch(() => {});
+    runtime.close();
+  }
 }
 
 describe('V2 HTTP compatibility', () => {
@@ -95,5 +145,15 @@ describe('V2 HTTP compatibility', () => {
     expect(client.getProtocolEra()).toBe('legacy');
     expect((await client.listTools()).tools.length).toBeGreaterThan(20);
     await client.subscribeResource({ uri: 'metro://logs' });
+  });
+});
+
+describe('direct stdio compatibility', () => {
+  test('delivers modern resource updates through subscriptions/listen', async () => {
+    await expectDirectStdioResourceUpdate(true);
+  });
+
+  test('delivers legacy resource updates through resources/subscribe', async () => {
+    await expectDirectStdioResourceUpdate(false);
   });
 });

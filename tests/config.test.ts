@@ -73,9 +73,46 @@ describe('project-root configuration', () => {
     ]);
   });
 
+  test('preserves package plugin specifiers while resolving explicit paths', async () => {
+    const root = tempProject();
+    const config = await loadConfig(
+      [
+        '--plugin',
+        '@scope/plugin',
+        '--plugin',
+        'plugin/subpath',
+        '--plugin',
+        './plugins/local.ts',
+      ],
+      root,
+    );
+
+    expect(config.plugins).toEqual([
+      '@scope/plugin',
+      'plugin/subpath',
+      path.join(fs.realpathSync(root), 'plugins', 'local.ts'),
+    ]);
+  });
+
   test('separates daemon identities by effective project root', () => {
     const first = createDaemonIdentity([], { projectRoot: '/tmp/project-a' });
     const second = createDaemonIdentity([], { projectRoot: '/tmp/project-b' });
     expect(getDaemonKey([], first)).not.toBe(getDaemonKey([], second));
+  });
+
+  test('reuses a daemon identity across incidental launcher directories', () => {
+    const projectRoot = tempProject();
+    const first = createDaemonIdentity([], {
+      cwd: '/tmp/launcher-a',
+      projectRoot,
+    });
+    const second = createDaemonIdentity([], {
+      cwd: '/tmp/launcher-b',
+      projectRoot,
+    });
+
+    expect(first.cwd).toBe(projectRoot);
+    expect(second.cwd).toBe(projectRoot);
+    expect(getDaemonKey([], first)).toBe(getDaemonKey([], second));
   });
 });
