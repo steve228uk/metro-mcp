@@ -261,6 +261,28 @@ describe('stdio daemon lease client', () => {
     expect(methods).toEqual(['PUT', 'PUT', 'DELETE']);
   });
 
+  test('waits for an in-flight initial acquisition before releasing', async () => {
+    const methods: string[] = [];
+    const acquisition = deferred();
+    const client = new DaemonLeaseClient(leaseRecord(true), {
+      renewIntervalMs: 5,
+      update: async (_record, _clientId, method) => {
+        methods.push(method);
+        if (method === 'PUT') await acquisition.promise;
+      },
+    });
+
+    const starting = client.start();
+    await waitUntil(() => methods.length === 1);
+    const stopping = client.stop();
+    await expectPending(stopping, 10);
+    acquisition.resolve();
+    await Promise.all([starting, stopping]);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(methods).toEqual(['PUT', 'DELETE']);
+  });
+
   test('refuses to send a daemon key to a non-local URL', async () => {
     const client = new DaemonLeaseClient(
       leaseRecord(true, 'http://example.com:8765/mcp'),

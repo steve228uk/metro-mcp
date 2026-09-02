@@ -630,12 +630,13 @@ export interface DaemonLeaseClientOptions {
   update?: DaemonLeaseUpdater;
 }
 
-/** Serializes lease shutdown behind any in-flight renewal. */
+/** Serializes lease shutdown behind initial acquisition and any renewal. */
 export class DaemonLeaseClient {
   private readonly clientId: string;
   private readonly renewIntervalMs: number;
   private readonly update: DaemonLeaseUpdater;
   private renewalTimer: ReturnType<typeof setInterval> | null = null;
+  private startPromise: Promise<void> | null = null;
   private renewalRequest: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
   private acquired = false;
@@ -651,14 +652,18 @@ export class DaemonLeaseClient {
     this.update = options.update ?? updateDaemonLease;
   }
 
-  async start(): Promise<void> {
-    if (this.record.managed !== true) return;
+  start(): Promise<void> {
+    if (this.record.managed !== true || this.stopping) {
+      return Promise.resolve();
+    }
+    if (!this.startPromise) this.startPromise = this.acquire();
+    return this.startPromise;
+  }
+
+  private async acquire(): Promise<void> {
     await this.update(this.record, this.clientId, 'PUT');
     this.acquired = true;
-    if (this.stopping) {
-      await this.release();
-      return;
-    }
+    if (this.stopping) return;
     this.renewalTimer = setInterval(
       () => this.renew(),
       this.renewIntervalMs,
@@ -672,6 +677,7 @@ export class DaemonLeaseClient {
     if (this.renewalTimer) clearInterval(this.renewalTimer);
     this.renewalTimer = null;
     this.stopPromise = (async () => {
+      await this.startPromise?.catch(() => {});
       await this.renewalRequest?.catch(() => {});
       await this.release();
     })();
