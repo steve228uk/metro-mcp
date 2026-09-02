@@ -52,8 +52,16 @@ export function selectPinnedTarget(
 
   if (pin.appId && pin.deviceName) {
     const deviceMatch = attachable.find(
-      (target) =>
-        target.appId === pin.appId && target.deviceName === pin.deviceName,
+      (target) => {
+        const logicalDeviceId = target.reactNative?.logicalDeviceId;
+        return (
+          target.appId === pin.appId &&
+          target.deviceName === pin.deviceName &&
+          (!pin.logicalDeviceId ||
+            !logicalDeviceId ||
+            logicalDeviceId === pin.logicalDeviceId)
+        );
+      },
     );
     if (deviceMatch) return deviceMatch;
   }

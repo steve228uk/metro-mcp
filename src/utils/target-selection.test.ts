@@ -43,10 +43,20 @@ describe('pinned Metro target selection', () => {
     const originalServer = server([target('page-1')]);
     const pin = createMetroTargetPin(originalServer, originalServer.targets[0]);
     const reloaded = target('page-2', {
-      reactNative: { logicalDeviceId: 'replacement-device-id' },
+      reactNative: undefined,
     });
 
     expect(selectPinnedTarget([reloaded], pin)).toBe(reloaded);
+  });
+
+  test('rejects the device-name fallback when its logical id conflicts', () => {
+    const originalServer = server([target('page-1')]);
+    const pin = createMetroTargetPin(originalServer, originalServer.targets[0]);
+    const otherDevice = target('page-2', {
+      reactNative: { logicalDeviceId: 'device-2' },
+    });
+
+    expect(selectPinnedTarget([otherDevice], pin)).toBeNull();
   });
 
   test('refuses auxiliary runtimes and another device', () => {
