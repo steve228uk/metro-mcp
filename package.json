@@ -69,7 +69,7 @@
     "@modelcontextprotocol/server": "^2.0.0",
     "chrome-launcher": "^1.2.1",
     "chromium-edge-launcher": "^0.3.0",
-    "metro-bridge": "github:steve228uk/metro-bridge#53fae7c",
+    "metro-bridge": "github:steve228uk/metro-bridge#065571a",
     "ws": "^8.20.0",
     "zod": "^4.4.3"
   },

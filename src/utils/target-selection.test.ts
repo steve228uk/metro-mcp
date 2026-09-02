@@ -64,6 +64,18 @@ describe('pinned Metro target selection', () => {
     expect(selectPinnedTarget([worklet, otherDevice], pin)).toBeNull();
   });
 
+  test('rejects a recycled target id with conflicting app identity', () => {
+    const originalServer = server([target('page-1')]);
+    const pin = createMetroTargetPin(originalServer, originalServer.targets[0]);
+    const replacement = target('page-1', {
+      appId: 'com.example.other',
+      deviceName: 'iPhone 18',
+      reactNative: { logicalDeviceId: 'device-2' },
+    });
+
+    expect(selectPinnedTarget([replacement], pin)).toBeNull();
+  });
+
   test('stays on the same Metro server', () => {
     const originalServer = server([target('page-1')]);
     const pin = createMetroTargetPin(originalServer, originalServer.targets[0]);

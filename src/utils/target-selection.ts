@@ -58,7 +58,17 @@ export function selectPinnedTarget(
     if (deviceMatch) return deviceMatch;
   }
 
-  return attachable.find((target) => target.id === pin.targetId) ?? null;
+  const idMatch = attachable.find((target) => target.id === pin.targetId);
+  if (!idMatch) return null;
+  if (pin.appId && idMatch.appId !== pin.appId) return null;
+  if (
+    pin.logicalDeviceId &&
+    idMatch.reactNative?.logicalDeviceId !== pin.logicalDeviceId
+  ) {
+    return null;
+  }
+  if (pin.deviceName && idMatch.deviceName !== pin.deviceName) return null;
+  return idMatch;
 }
 
 export function selectMetroTarget(
