@@ -1,6 +1,25 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { scanMetroPorts, fetchTargets, checkMetroStatus } from 'metro-bridge';
+import {
+  scanMetroPorts,
+  fetchTargets,
+  checkMetroStatus,
+  classifyMetroTarget,
+  type MetroTarget,
+} from 'metro-bridge';
+
+export function describeMetroTarget(target: MetroTarget) {
+  return {
+    id: target.id,
+    appId: target.appId,
+    title: target.title,
+    type: target.type,
+    deviceName: target.deviceName,
+    logicalDeviceId: target.reactNative?.logicalDeviceId,
+    vm: target.vm,
+    ...classifyMetroTarget(target),
+  };
+}
 
 export const devicePlugin = definePlugin({
   name: 'device',
@@ -23,25 +42,13 @@ export const devicePlugin = definePlugin({
           const servers = await scanMetroPorts(host);
           return servers.map((s) => ({
             port: s.port,
-            targets: s.targets.map((t) => ({
-              id: t.id,
-              title: t.title,
-              type: t.type,
-              deviceName: t.deviceName,
-              vm: t.vm,
-            })),
+            targets: s.targets.map(describeMetroTarget),
           }));
         }
 
         const port = metroConfig?.port || 8081;
         const targets = await fetchTargets(host, port);
-        return targets.map((t) => ({
-          id: t.id,
-          title: t.title,
-          type: t.type,
-          deviceName: t.deviceName,
-          vm: t.vm,
-        }));
+        return targets.map(describeMetroTarget);
       },
     });
 
