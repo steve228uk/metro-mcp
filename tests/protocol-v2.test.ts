@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { resolve } from 'node:path';
 import {
   Client,
   StreamableHTTPClientTransport,
@@ -16,16 +17,41 @@ afterEach(async () => {
   server = undefined;
 });
 
-async function startTestServer() {
+async function startTestServer(plugins: string[] = []) {
   const config = await loadConfig(['--project-root', process.cwd()]);
   config.metro.host = '127.0.0.1';
   config.metro.port = 65535;
   config.metro.autoDiscover = false;
   config.proxy.enabled = false;
+  config.plugins = plugins;
   server = await startHttpServer(config, ['--project-root', process.cwd()], {
     port: 0,
   });
   return server;
+}
+
+const nativeResultPlugin = resolve(
+  import.meta.dir,
+  'fixtures/native-result-plugin.ts',
+);
+
+async function expectNativeImageResult(modern: boolean): Promise<void> {
+  const running = await startTestServer([nativeResultPlugin]);
+  const client = createClient(running.url, modern);
+  await client.connect(new StreamableHTTPClientTransport(new URL(running.url)));
+
+  const result = await client.callTool({
+    name: 'test_native_image',
+    arguments: {},
+  });
+  expect(result.content).toEqual([
+    {
+      type: 'image',
+      data: 'iVBORw0KGgo=',
+      mimeType: 'image/png',
+    },
+  ]);
+  expect(result.structuredContent).toEqual({ source: 'fixture' });
 }
 
 function createClient(url: string, modern: boolean): Client {
@@ -145,6 +171,14 @@ describe('V2 HTTP compatibility', () => {
     expect(client.getProtocolEra()).toBe('legacy');
     expect((await client.listTools()).tools.length).toBeGreaterThan(20);
     await client.subscribeResource({ uri: 'metro://logs' });
+  });
+
+  test('passes native image content through modern protocol negotiation', async () => {
+    await expectNativeImageResult(true);
+  });
+
+  test('passes native image content through legacy protocol negotiation', async () => {
+    await expectNativeImageResult(false);
   });
 });
 

@@ -57,6 +57,7 @@ import {
   selectPinnedTarget,
   type MetroTargetPin,
 } from './utils/target-selection.js';
+import { normalizeToolResult } from './utils/tool-results.js';
 import { version } from './version.js';
 import {
   createDaemonIdentity,
@@ -399,11 +400,7 @@ export async function createMetroRuntime(
               const result = await toolConfig.handler(args as z.infer<T>, {
                 sendProgress,
               });
-              const content =
-                typeof result === 'string' ? result : JSON.stringify(result);
-              return {
-                content: [{ type: 'text' as const, text: content }],
-              };
+              return normalizeToolResult(result);
             } catch (err) {
               const message = err instanceof Error ? err.message : String(err);
               return {

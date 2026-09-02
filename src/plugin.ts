@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { CallToolResult, ContentBlock } from '@modelcontextprotocol/server';
 import type { CircularBuffer } from './utils/buffer.js';
 import type { MetroTarget } from 'metro-bridge';
 
@@ -54,6 +55,19 @@ export interface ToolHandlerContext {
   ) => Promise<void>;
 }
 
+/** A native MCP content block returned directly by a plugin tool. */
+export type NativeToolContentBlock = ContentBlock;
+
+/** A validated native MCP tool result, including image/audio/resource blocks. */
+export type NativeToolResult = CallToolResult;
+
+/**
+ * Plugin handlers may return a native MCP result or any JSON-serializable value.
+ * Native results are validated before being passed through; other values are
+ * preserved as the existing JSON text response.
+ */
+export type ToolHandlerResult = NativeToolResult | unknown;
+
 export interface ToolConfig<
   T extends z.ZodObject<z.ZodRawShape> = z.ZodObject<z.ZodRawShape>,
 > {
@@ -68,7 +82,7 @@ export interface ToolConfig<
    * Example: `'ui://metro/network'`
    */
   appUri?: string;
-  handler: (args: z.infer<T>, ctx: ToolHandlerContext) => Promise<unknown>;
+  handler: (args: z.infer<T>, ctx: ToolHandlerContext) => Promise<ToolHandlerResult>;
 }
 
 export interface ResourceConfig {

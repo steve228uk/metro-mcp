@@ -1,7 +1,36 @@
-import { readFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { randomUUID } from 'node:crypto';
+import { readdir, readFile, stat, unlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+
+const SCREENSHOT_PREFIX = 'metro-mcp-screenshot-';
+const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SCREENSHOT_FILE_PATTERN = /^metro-mcp-screenshot-[a-zA-Z0-9-]+\.png$/;
+
+async function cleanupOldScreenshots(now = Date.now()): Promise<void> {
+  try {
+    const files = await readdir(tmpdir());
+    await Promise.all(
+      files
+        .filter((file) => SCREENSHOT_FILE_PATTERN.test(file))
+        .map(async (file) => {
+          const path = join(tmpdir(), file);
+          try {
+            const metadata = await stat(path);
+            if (metadata.isFile() && now - metadata.mtimeMs > SCREENSHOT_MAX_AGE_MS) {
+              await unlink(path);
+            }
+          } catch {
+            // The file may have been removed concurrently.
+          }
+        }),
+    );
+  } catch {
+    // Screenshot cleanup is opportunistic and must not block a capture.
+  }
+}
 
 export const simulatorPlugin = definePlugin({
   name: 'simulator',
@@ -26,32 +55,55 @@ export const simulatorPlugin = definePlugin({
       annotations: { readOnlyHint: true, openWorldHint: true },
       parameters: z.object({
         platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
+        delivery: z
+          .enum(['path', 'inline'])
+          .default('path')
+          .describe('Return a retained temporary file path or an inline MCP image'),
       }),
-      handler: async ({ platform }) => {
+      handler: async ({ platform, delivery }) => {
         const p = platform === 'auto' ? await detectPlatform() : platform;
         if (!p) return 'No simulator/emulator detected.';
 
-        const tmpFile = `/tmp/metro-mcp-screenshot-${Date.now()}.png`;
+        await cleanupOldScreenshots();
+        const tmpFile = join(tmpdir(), `${SCREENSHOT_PREFIX}${randomUUID()}.png`);
 
-        if (p === 'ios') {
-          await ctx.exec(`xcrun simctl io booted screenshot "${tmpFile}"`);
-        } else {
-          await ctx.exec(`adb exec-out screencap -p > "${tmpFile}"`);
+        try {
+          if (p === 'ios') {
+            await ctx.exec(`xcrun simctl io booted screenshot "${tmpFile}"`);
+          } else {
+            await ctx.exec(`adb exec-out screencap -p > "${tmpFile}"`);
+          }
+
+          const metadata = await stat(tmpFile);
+          if (!metadata.isFile()) {
+            throw new Error('capture did not produce a regular file');
+          }
+        } catch (error) {
+          await unlink(tmpFile).catch(() => {});
+          throw new Error(
+            `Failed to capture screenshot: ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
 
-        // Read file and return as base64
-        if (existsSync(tmpFile)) {
-          const buffer = await readFile(tmpFile);
-          const base64 = buffer.toString('base64');
-          await ctx.exec(`rm -f "${tmpFile}"`);
+        if (delivery === 'path') {
           return {
-            type: 'image',
-            format: 'png',
-            data: base64,
-            note: 'Screenshot captured successfully',
+            content: [{ type: 'text', text: `Screenshot saved to ${tmpFile}` }],
+            structuredContent: {
+              path: tmpFile,
+              mimeType: 'image/png',
+              platform: p,
+            },
           };
         }
-        return 'Failed to capture screenshot.';
+
+        try {
+          const data = (await readFile(tmpFile)).toString('base64');
+          return {
+            content: [{ type: 'image', data, mimeType: 'image/png' }],
+          };
+        } finally {
+          await unlink(tmpFile).catch(() => {});
+        }
       },
     });
 
