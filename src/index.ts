@@ -5,6 +5,7 @@ import {
   createDaemonIdentity,
   getDaemonCwd,
   getDaemonKeyFromEnv,
+  isManagedDaemonProcess,
   removeDaemonRecordForProcess,
   startStdioProxy,
   writeDaemonRecord,
@@ -112,7 +113,7 @@ Examples:
         removeDaemonRecordForProcess(key, process.pid);
       await startHttpServer(config, serverArgs, {
         port: mcpPort,
-        daemon: { key, identity },
+        daemon: { key, identity, managed: isManagedDaemonProcess() },
         onListening: ({ host, port, url }) => {
           writeDaemonRecord({
             pid: process.pid,

@@ -7,6 +7,7 @@ import {
   cleanupStaleDaemonRecords,
   createDaemonIdentity,
   getDaemonKey,
+  getDaemonLockPath,
   getDaemonRecordPath,
   readLiveRecord,
   removeDaemonRecordForProcess,
@@ -247,6 +248,23 @@ describe('daemon records', () => {
 
     expect(fs.existsSync(getDaemonRecordPath(ownedKey))).toBe(false);
     expect(fs.existsSync(getDaemonRecordPath(otherKey))).toBe(true);
+  });
+
+  test('cleans dead and stale startup locks while preserving a fresh live lock', async () => {
+    const deadPath = getDaemonLockPath('deadbeefdeadbeef');
+    const stalePath = getDaemonLockPath('aaaaaaaaaaaaaaaa');
+    const livePath = getDaemonLockPath('bbbbbbbbbbbbbbbb');
+    fs.writeFileSync(deadPath, JSON.stringify({ pid: 2_147_483_647 }));
+    fs.writeFileSync(stalePath, JSON.stringify({ pid: process.pid }));
+    fs.writeFileSync(livePath, JSON.stringify({ pid: process.pid }));
+    const staleDate = new Date(Date.now() - 31_000);
+    fs.utimesSync(stalePath, staleDate, staleDate);
+
+    await cleanupStaleDaemonRecords();
+
+    expect(fs.existsSync(deadPath)).toBe(false);
+    expect(fs.existsSync(stalePath)).toBe(false);
+    expect(fs.existsSync(livePath)).toBe(true);
   });
 });
 

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,6 +17,9 @@ const DAEMON_KEY_ENV = 'METRO_MCP_DAEMON_KEY';
 const DAEMON_CONFIG_DIR_ENV = 'METRO_MCP_DAEMON_CONFIG_DIR';
 const STARTUP_LOCK_TIMEOUT_MS = 10_000;
 const STARTUP_LOCK_STALE_MS = 30_000;
+const DAEMON_LEASE_RENEW_MS = 10_000;
+export const DAEMON_LEASE_TTL_MS = 30_000;
+export const DAEMON_IDLE_GRACE_MS = 30_000;
 const DAEMON_ENV_KEYS = [
   'METRO_HOST',
   'METRO_PORT',
@@ -57,6 +60,85 @@ export interface DaemonHealth {
     key: string;
     identity: DaemonIdentity;
   };
+}
+
+export interface DaemonLeaseRegistryOptions {
+  leaseTtlMs?: number;
+  idleGraceMs?: number;
+  onIdle: () => void | Promise<void>;
+}
+
+export class DaemonLeaseRegistry {
+  private leases = new Map<string, ReturnType<typeof setTimeout>>();
+  private graceTimer: ReturnType<typeof setTimeout> | null = null;
+  private closed = false;
+  private idleTriggered = false;
+  private readonly leaseTtlMs: number;
+  private readonly idleGraceMs: number;
+
+  constructor(private readonly options: DaemonLeaseRegistryOptions) {
+    this.leaseTtlMs = options.leaseTtlMs ?? DAEMON_LEASE_TTL_MS;
+    this.idleGraceMs = options.idleGraceMs ?? DAEMON_IDLE_GRACE_MS;
+    this.scheduleGrace();
+  }
+
+  renew(clientId: string): void {
+    if (this.closed || this.idleTriggered) return;
+    const existing = this.leases.get(clientId);
+    if (existing) clearTimeout(existing);
+    if (this.graceTimer) {
+      clearTimeout(this.graceTimer);
+      this.graceTimer = null;
+    }
+    const expiry = setTimeout(() => {
+      this.leases.delete(clientId);
+      this.scheduleGrace();
+    }, this.leaseTtlMs);
+    expiry.unref?.();
+    this.leases.set(clientId, expiry);
+  }
+
+  release(clientId: string): void {
+    if (this.closed || this.idleTriggered) return;
+    const expiry = this.leases.get(clientId);
+    if (!expiry) return;
+    clearTimeout(expiry);
+    this.leases.delete(clientId);
+    this.scheduleGrace();
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    for (const expiry of this.leases.values()) clearTimeout(expiry);
+    this.leases.clear();
+    if (this.graceTimer) clearTimeout(this.graceTimer);
+    this.graceTimer = null;
+  }
+
+  get size(): number {
+    return this.leases.size;
+  }
+
+  private scheduleGrace(): void {
+    if (
+      this.closed ||
+      this.idleTriggered ||
+      this.leases.size > 0 ||
+      this.graceTimer
+    ) {
+      return;
+    }
+    this.graceTimer = setTimeout(() => {
+      this.graceTimer = null;
+      if (this.closed || this.leases.size > 0 || this.idleTriggered) return;
+      this.idleTriggered = true;
+      Promise.resolve(this.options.onIdle()).catch((err) => {
+        logger.error('Managed daemon idle shutdown failed:', err);
+      });
+    }, this.idleGraceMs);
+    this.graceTimer.unref?.();
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -124,7 +206,7 @@ export function getDaemonRecordPath(key: string): string {
   return path.join(getConfigDir(), `daemon-${key}.json`);
 }
 
-function getDaemonLockPath(key: string): string {
+export function getDaemonLockPath(key: string): string {
   return path.join(getConfigDir(), `daemon-${key}.lock`);
 }
 
@@ -301,19 +383,52 @@ export async function cleanupStaleDaemonRecords(): Promise<void> {
 
   await Promise.all(
     entries.map(async (entry) => {
-      const match = /^daemon-([a-f0-9]+)\.json$/.exec(entry);
-      if (!match) return;
-
-      const key = match[1];
-      try {
-        const record = JSON.parse(
-          fs.readFileSync(getDaemonRecordPath(key), 'utf8'),
-        ) as DaemonRecord;
-        if (await isRecordLive(record)) return;
-      } catch {
-        // Corrupt records are stale.
+      const recordMatch = /^daemon-([a-f0-9]+)\.json$/.exec(entry);
+      if (recordMatch) {
+        const key = recordMatch[1];
+        try {
+          const record = JSON.parse(
+            fs.readFileSync(getDaemonRecordPath(key), 'utf8'),
+          ) as DaemonRecord;
+          if (await isRecordLive(record)) return;
+        } catch {
+          // Corrupt records are stale.
+        }
+        removeDaemonRecord(key);
+        return;
       }
-      removeDaemonRecord(key);
+
+      const lockMatch = /^daemon-([a-f0-9]+)\.lock$/.exec(entry);
+      if (!lockMatch) return;
+      const lockPath = getDaemonLockPath(lockMatch[1]);
+      try {
+        const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as {
+          pid?: number;
+        };
+        const stat = fs.statSync(lockPath);
+        let processAlive = false;
+        if (typeof lock.pid === 'number') {
+          try {
+            process.kill(lock.pid, 0);
+            processAlive = true;
+          } catch {
+            processAlive = false;
+          }
+        }
+        if (
+          processAlive &&
+          Date.now() - stat.mtimeMs <= STARTUP_LOCK_STALE_MS
+        ) {
+          return;
+        }
+      } catch {
+        // Corrupt locks are stale.
+      }
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        // Already removed.
+      }
     }),
   );
 }
@@ -358,13 +473,38 @@ export function getDaemonKeyFromEnv(
   return process.env[DAEMON_KEY_ENV] || getDaemonKey(args, identity);
 }
 
+export function isManagedDaemonProcess(): boolean {
+  return Boolean(process.env[DAEMON_KEY_ENV]);
+}
+
+async function updateDaemonLease(
+  record: DaemonRecord,
+  clientId: string,
+  method: 'PUT' | 'DELETE',
+): Promise<void> {
+  const leaseUrl = new URL(
+    `/_metro-mcp/clients/${encodeURIComponent(clientId)}`,
+    record.url,
+  );
+  const response = await fetch(leaseUrl, {
+    method,
+    headers: { 'x-metro-mcp-daemon-key': record.key },
+    signal: AbortSignal.timeout(2000),
+  });
+  if (!response.ok) {
+    throw new Error(`Daemon lease ${method} failed with HTTP ${response.status}`);
+  }
+}
+
 export async function startStdioProxy(args: string[]): Promise<void> {
   const record = await ensureDaemon(args);
+  const clientId = randomUUID();
   const stdio = new StdioServerTransport();
   const daemonTransport = new StreamableHTTPClientTransport(
     new URL(record.url),
   );
   let closing = false;
+  let leaseTimer: ReturnType<typeof setInterval> | null = null;
 
   async function closeQuietly(transport: {
     close(): Promise<void>;
@@ -375,6 +515,9 @@ export async function startStdioProxy(args: string[]): Promise<void> {
   async function close(): Promise<void> {
     if (closing) return;
     closing = true;
+    if (leaseTimer) clearInterval(leaseTimer);
+    leaseTimer = null;
+    await updateDaemonLease(record, clientId, 'DELETE').catch(() => {});
     await Promise.all([closeQuietly(stdio), closeQuietly(daemonTransport)]);
     process.exit(0);
   }
@@ -396,6 +539,14 @@ export async function startStdioProxy(args: string[]): Promise<void> {
     logger.error('daemon transport error:', err);
   stdio.onclose = () => void close();
   daemonTransport.onclose = () => void close();
+
+  await updateDaemonLease(record, clientId, 'PUT');
+  leaseTimer = setInterval(() => {
+    updateDaemonLease(record, clientId, 'PUT').catch((err) => {
+      logger.warn('Failed to renew daemon lease:', err);
+    });
+  }, DAEMON_LEASE_RENEW_MS);
+  leaseTimer.unref?.();
 
   await daemonTransport.start();
   await stdio.start();

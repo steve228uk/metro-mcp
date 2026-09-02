@@ -52,7 +52,11 @@ import { createPreferredFrameSizeMeta, withAppSizing } from './utils/apps.js';
 import { ResourceSubscriptionManager } from './utils/resource-subscriptions.js';
 import { createResourceUpdateScheduler } from './utils/resource-updates.js';
 import { version } from './version.js';
-import { createDaemonIdentity, getDaemonKey } from './daemon.js';
+import {
+  createDaemonIdentity,
+  DaemonLeaseRegistry,
+  getDaemonKey,
+} from './daemon.js';
 import type { DaemonIdentity } from './daemon.js';
 
 // Built-in plugins
@@ -131,7 +135,11 @@ interface HttpServerOptions {
   daemon?: {
     key: string;
     identity: DaemonIdentity;
+    managed?: boolean;
+    leaseTtlMs?: number;
+    idleGraceMs?: number;
   };
+  onManagedDaemonIdle?: () => void | Promise<void>;
   onListening?: (info: { host: string; port: number; url: string }) => void;
 }
 
@@ -187,6 +195,7 @@ export async function createMetroRuntime(
   const resourceSubscriptions = new ResourceSubscriptionManager();
   let isInitializingPlugins = false;
   let runtimeClosed = false;
+  let runtimeClosePromise: Promise<void> | null = null;
   let modernResourceNotifier: ((uri: string) => void) | null = null;
   let stdioHandle: { close(): Promise<void> } | null = null;
 
@@ -983,8 +992,8 @@ export async function createMetroRuntime(
     logger.info('MCP stdio server started');
   }
 
-  function closeRuntime(): void {
-    if (runtimeClosed) return;
+  function closeRuntime(): Promise<void> {
+    if (runtimeClosePromise) return runtimeClosePromise;
     runtimeClosed = true;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -994,32 +1003,38 @@ export async function createMetroRuntime(
     process.off('SIGINT', handleSigint);
     process.off('SIGTERM', handleSigterm);
     process.off('exit', handleExit);
-    for (const session of sessions) {
-      resourceSubscriptions.unsubscribeAll(session);
-      resourceUpdates.removeTarget(session.id);
-      for (const registration of session.registrations) registration.remove();
-      session.server.close().catch(() => {});
-    }
-    sessions.clear();
-    modernStdioServers.clear();
-    stdioHandle?.close().catch(() => {});
+    const sessionsToClose = [...sessions];
+    const stdioToClose = stdioHandle;
     stdioHandle = null;
     resourceUpdates.close();
-    eventsClient.disconnect();
-    cleanProxyLock();
-    cdpMultiplexer?.stop();
+    runtimeClosePromise = (async () => {
+      for (const session of sessionsToClose) {
+        resourceSubscriptions.unsubscribeAll(session);
+        resourceUpdates.removeTarget(session.id);
+        for (const registration of session.registrations) registration.remove();
+      }
+      sessions.clear();
+      modernStdioServers.clear();
+      await Promise.all(
+        sessionsToClose.map((session) => session.server.close().catch(() => {})),
+      );
+      await stdioToClose?.close().catch(() => {});
+      eventsClient.disconnect();
+      cleanProxyLock();
+      await cdpMultiplexer?.stop().catch(() => {});
+      cdpSession.disconnect();
+    })();
+    return runtimeClosePromise;
   }
 
   const handleSigint = () => {
-    closeRuntime();
-    process.exit(0);
+    void closeRuntime().finally(() => process.exit(0));
   };
   const handleSigterm = () => {
-    closeRuntime();
-    process.exit(0);
+    void closeRuntime().finally(() => process.exit(0));
   };
   const handleExit = () => {
-    closeRuntime();
+    void closeRuntime();
   };
 
   // Clean up on shutdown
@@ -1078,6 +1093,8 @@ export async function startHttpServer(
     string,
     NodeStreamableHTTPServerTransport
   >();
+  let leaseRegistry: DaemonLeaseRegistry | null = null;
+  let shutdownPromise: Promise<void> | null = null;
 
   const modernHandler: McpHttpHandler = createMcpHandler(
     () => runtime.createServer(),
@@ -1144,6 +1161,38 @@ export async function startHttpServer(
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? host}`);
 
     try {
+      const leaseMatch =
+        /^\/_metro-mcp\/clients\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(
+          url.pathname,
+        );
+      if (leaseMatch) {
+        if (!leaseRegistry) {
+          res.writeHead(404).end('Not found');
+          return;
+        }
+        const suppliedKey = req.headers['x-metro-mcp-daemon-key'];
+        if (
+          typeof suppliedKey !== 'string' ||
+          suppliedKey !== options.daemon?.key
+        ) {
+          res.writeHead(403).end('Forbidden');
+          return;
+        }
+        if (req.method === 'PUT') {
+          leaseRegistry.renew(leaseMatch[1]);
+          res.writeHead(204).end();
+          return;
+        }
+        if (req.method === 'DELETE') {
+          leaseRegistry.release(leaseMatch[1]);
+          res.writeHead(204).end();
+          return;
+        }
+        res.setHeader('allow', 'PUT, DELETE');
+        res.writeHead(405).end('Method not allowed');
+        return;
+      }
+
       if (url.pathname === '/health') {
         sendJson(res, 200, {
           ok: true,
@@ -1206,19 +1255,45 @@ export async function startHttpServer(
   options.onListening?.({ host, port, url });
   logger.info(`MCP HTTP server listening on ${url}`);
 
+  async function shutdown(): Promise<void> {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      leaseRegistry?.close();
+      leaseRegistry = null;
+      for (const transport of streamableTransports.values()) {
+        await closeQuietly(transport);
+      }
+      streamableTransports.clear();
+      await modernHandler.close();
+      await runtime.close();
+      if (!server.listening) return;
+      await new Promise<void>((resolveClose) =>
+        server.close(() => resolveClose()),
+      );
+    })();
+    return shutdownPromise;
+  }
+
+  if (options.daemon?.managed) {
+    leaseRegistry = new DaemonLeaseRegistry({
+      leaseTtlMs: options.daemon.leaseTtlMs,
+      idleGraceMs: options.daemon.idleGraceMs,
+      onIdle: async () => {
+        logger.info('Managed daemon is idle; shutting down');
+        if (options.onManagedDaemonIdle) {
+          await options.onManagedDaemonIdle();
+          return;
+        }
+        await shutdown();
+        process.exit(0);
+      },
+    });
+  }
+
   return {
     host,
     port,
     url,
-    close: async () => {
-      for (const transport of streamableTransports.values()) {
-        await closeQuietly(transport);
-      }
-      await modernHandler.close();
-      runtime.close();
-      await new Promise<void>((resolveClose) =>
-        server.close(() => resolveClose()),
-      );
-    },
+    close: shutdown,
   };
 }
