@@ -299,11 +299,7 @@ async function isRecordLive(
   record: DaemonRecord,
   expectedIdentity?: DaemonIdentity,
 ): Promise<boolean> {
-  try {
-    process.kill(record.pid, 0);
-  } catch {
-    return false;
-  }
+  if (!isProcessAlive(record.pid)) return false;
 
   try {
     const health = await readHealth(record);
@@ -426,12 +422,13 @@ export async function withStartupLock<T>(
 }
 
 function isProcessAlive(pid: number | undefined): boolean {
-  if (typeof pid !== 'number') return false;
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    // A process we cannot signal still exists; only a missing/invalid PID is dead.
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
 

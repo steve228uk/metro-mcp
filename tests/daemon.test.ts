@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -303,6 +303,40 @@ describe('daemon records', () => {
     expect(fs.existsSync(deadPath)).toBe(false);
     expect(fs.existsSync(stalePath)).toBe(false);
     expect(fs.existsSync(livePath)).toBe(true);
+  });
+
+  test('preserves live records and fresh locks when PID probing returns EPERM', async () => {
+    const expected = identity();
+    const key = getDaemonKey(expected.args, expected);
+    const lockPath = getDaemonLockPath(key);
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token: 'live' }));
+
+    await withHealthServer(
+      {
+        ok: true,
+        name: 'metro-mcp',
+        version: expected.version,
+        daemon: {
+          keyHash: getDaemonKeyFingerprint(key),
+          identityHash: getDaemonIdentityFingerprint(expected),
+          managed: true,
+        },
+      },
+      async (url) => {
+        writeDaemonRecord(record(key, url, expected));
+        const kill = spyOn(process, 'kill').mockImplementation(() => {
+          throw Object.assign(new Error('Operation not permitted'), { code: 'EPERM' });
+        });
+        try {
+          await cleanupStaleDaemonRecords();
+          expect(fs.existsSync(lockPath)).toBe(true);
+          expect(fs.existsSync(getDaemonRecordPath(key))).toBe(true);
+          expect((await readLiveRecord(key, expected))?.managed).toBe(true);
+        } finally {
+          kill.mockRestore();
+        }
+      },
+    );
   });
 
   test('preserves a fresh startup lock while its payload is being written', async () => {
