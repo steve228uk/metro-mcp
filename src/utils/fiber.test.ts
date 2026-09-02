@@ -145,6 +145,32 @@ describe('shared fiber walker', () => {
     });
   });
 
+  test('does not perform an unreported focus-discovery prepass', async () => {
+    const root = fiber('Root');
+    const child = fiber('Child');
+    let childReads = 0;
+    Object.defineProperty(root, 'child', {
+      configurable: true,
+      get: () => {
+        childReads++;
+        return child;
+      },
+    });
+
+    const result = await evaluate<{
+      names: string[];
+      traversal: Record<string, unknown>;
+    }>(collectExpression({ maxNodes: 1 }), sandbox([root]));
+
+    expect(result.names).toEqual(['Root']);
+    expect(result.traversal).toMatchObject({
+      complete: false,
+      scannedNodes: 1,
+      truncationReason: 'max-nodes',
+    });
+    expect(childReads).toBe(1);
+  });
+
   test('distinguishes a genuinely complete empty traversal', async () => {
     const result = await evaluate<{
       names: string[];

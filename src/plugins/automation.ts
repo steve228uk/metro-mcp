@@ -1,6 +1,12 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { collectElements } from '../utils/fiber.js';
+import {
+  collectElements,
+  DEFAULT_FIBER_MAX_DEPTH,
+  DEFAULT_FIBER_MAX_NODES,
+  MAX_FIBER_DEPTH,
+  MAX_FIBER_NODES,
+} from '../utils/fiber.js';
 
 const CURRENT_ROUTE_JS = `(function() {
   try {
@@ -20,7 +26,8 @@ export const automationPlugin = definePlugin({
       description:
         'Poll the component tree until an element matching the given testID or accessibilityLabel appears. ' +
         'Returns element info on success. Use after tap_element, navigate(), or any action that triggers ' +
-        'async screen transitions or data loading — instead of immediately calling the next tool.',
+        'async screen transitions or data loading — instead of immediately calling the next tool. ' +
+        'Returns traversal metadata immediately when the bounded search is incomplete.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
         selector: z.string().describe('testID or accessibilityLabel to wait for'),
@@ -28,17 +35,43 @@ export const automationPlugin = definePlugin({
           .describe('Maximum wait time in milliseconds (default 10000)'),
         pollInterval: z.number().int().min(100).max(5000).default(500)
           .describe('How often to check in milliseconds (default 500)'),
+        maxDepth: z.number().int().min(0).max(MAX_FIBER_DEPTH)
+          .default(DEFAULT_FIBER_MAX_DEPTH)
+          .describe('Maximum fiber depth inspected per poll'),
+        maxNodes: z.number().int().min(1).max(MAX_FIBER_NODES)
+          .default(DEFAULT_FIBER_MAX_NODES)
+          .describe('Maximum fibers inspected per poll'),
       }),
-      handler: async ({ selector, timeout, pollInterval }, { sendProgress }) => {
+      handler: async (
+        { selector, timeout, pollInterval, maxDepth, maxNodes },
+        { sendProgress },
+      ) => {
         const start = Date.now();
         while (Date.now() - start < timeout) {
           try {
-            const elements = await collectElements(ctx.evalInApp);
-            const match = elements.find(
+            const collection = await collectElements(ctx.evalInApp, {
+              maxDepth,
+              maxNodes,
+            });
+            const match = collection.elements.find(
               (el) => el.testID === selector || el.accessibilityLabel === selector,
             );
             if (match) {
-              return { found: true, element: match, elapsedMs: Date.now() - start };
+              return {
+                found: true,
+                element: match,
+                traversal: collection.traversal,
+                elapsedMs: Date.now() - start,
+              };
+            }
+            if (!collection.traversal.complete) {
+              return {
+                found: false,
+                traversal: collection.traversal,
+                elapsedMs: Date.now() - start,
+                reason:
+                  'Fiber traversal was incomplete; raise maxDepth or maxNodes before treating the element as absent.',
+              };
             }
           } catch {
             // CDP may not be ready yet — keep polling

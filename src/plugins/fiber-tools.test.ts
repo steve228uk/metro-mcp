@@ -5,6 +5,7 @@ import type {
   PluginContext,
   PluginDefinition,
 } from '../plugin.js';
+import { automationPlugin } from './automation.js';
 import { componentsPlugin } from './components.js';
 import { inspectPointPlugin } from './inspect-point.js';
 import { uiInteractPlugin } from './ui-interact.js';
@@ -237,6 +238,61 @@ describe('fiber read tools', () => {
 
     expect(testable.elements).toHaveLength(2);
     expect(listed.elements).toHaveLength(2);
+  });
+
+  test('bounds primitive child-array text extraction', async () => {
+    const values = new Proxy(
+      Array.from({ length: 10_000 }, () => 'x'),
+      {
+        get(target, property, receiver) {
+          if (typeof property === 'string' && /^\d+$/.test(property)) {
+            if (Number(property) >= 100) {
+              throw new Error('text extraction exceeded its item budget');
+            }
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    const root = fiber('Text', {
+      accessibilityLabel: 'Bounded text',
+      children: values,
+    });
+    const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
+
+    const result = (await call('list_elements')) as {
+      elements: Array<{ text: string }>;
+    };
+
+    expect(result.elements[0].text.length).toBeLessThanOrEqual(300);
+  });
+
+  test('reports incomplete traversal from wait_for_element', async () => {
+    const root = append(
+      fiber('Root'),
+      ...Array.from({ length: 10 }, (_, index) =>
+        fiber('Item', index === 9 ? { testID: 'late-item' } : {}),
+      ),
+    );
+    const call = await createHarness(runtimeFor([root]), [automationPlugin]);
+
+    const result = (await call('wait_for_element', {
+      selector: 'late-item',
+      timeout: 100,
+      pollInterval: 100,
+      maxNodes: 3,
+    })) as {
+      found: boolean;
+      traversal: { complete: boolean; truncationReason?: string };
+    };
+
+    expect(result).toMatchObject({
+      found: false,
+      traversal: {
+        complete: false,
+        truncationReason: 'max-nodes',
+      },
+    });
   });
 
   test('list_elements returns an explicit envelope and deep elements', async () => {

@@ -89,7 +89,7 @@ export const FIBER_WALKER_JS = `
     return entries;
   }
 
-  function metroNavigationState(rootEntries) {
+  function metroNavigationState() {
     try {
       var bridge = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
       if (bridge && bridge.navigation && bridge.navigation.getState) {
@@ -106,50 +106,40 @@ export const FIBER_WALKER_JS = `
       if (expoState && expoState.routes) return expoState;
     } catch (_) {}
 
-    var stack = [];
-    for (var rootIndex = rootEntries.length - 1; rootIndex >= 0; rootIndex--) {
-      stack.push({ fiber: rootEntries[rootIndex].fiber, depth: 0 });
-    }
-    var inspected = 0;
-    while (stack.length && inspected < 5000) {
-      var entry = stack.pop();
-      var fiber = entry && entry.fiber;
-      var depth = entry && entry.depth;
-      if (!fiber || depth > 600) continue;
-      inspected++;
-      var name = metroFiberName(fiber);
-      var found = null;
-      if (
-        name === 'NavigationContainer' ||
-        name === 'NavigationContainerInner' ||
-        name === 'BaseNavigationContainer'
-      ) {
-        var hookState = fiber.memoizedState;
-        while (hookState && !found) {
-          if (hookState.memoizedState && hookState.memoizedState.routes) {
-            found = hookState.memoizedState;
-          } else if (
-            hookState.queue &&
-            hookState.queue.lastRenderedState &&
-            hookState.queue.lastRenderedState.routes
-          ) {
-            found = hookState.queue.lastRenderedState;
-          }
-          hookState = hookState.next;
-        }
-        if (!found && fiber.memoizedProps && fiber.memoizedProps.state && fiber.memoizedProps.state.routes) {
-          found = fiber.memoizedProps.state;
-        }
-      }
-      if (found) return found;
-      var children = [];
-      var child = fiber.child;
-      while (child) { children.push(child); child = child.sibling; }
-      for (var childIndex = children.length - 1; childIndex >= 0; childIndex--) {
-        stack.push({ fiber: children[childIndex], depth: depth + 1 });
-      }
-    }
     return null;
+  }
+
+  function metroNavigationStateFromFiber(fiber) {
+    var name = metroFiberName(fiber);
+    if (
+      name !== 'NavigationContainer' &&
+      name !== 'NavigationContainerInner' &&
+      name !== 'BaseNavigationContainer'
+    ) return null;
+
+    var found = null;
+    var hookState = fiber.memoizedState;
+    while (hookState && !found) {
+      if (hookState.memoizedState && hookState.memoizedState.routes) {
+        found = hookState.memoizedState;
+      } else if (
+        hookState.queue &&
+        hookState.queue.lastRenderedState &&
+        hookState.queue.lastRenderedState.routes
+      ) {
+        found = hookState.queue.lastRenderedState;
+      }
+      hookState = hookState.next;
+    }
+    if (
+      !found &&
+      fiber.memoizedProps &&
+      fiber.memoizedProps.state &&
+      fiber.memoizedProps.state.routes
+    ) {
+      found = fiber.memoizedProps.state;
+    }
+    return found;
   }
 
   function metroFocusedRoutes(state) {
@@ -243,12 +233,19 @@ export const FIBER_WALKER_JS = `
       return String(value).slice(0, 300);
     }
     if (!Array.isArray(value)) return null;
-    var text = value
-      .filter(function(item) {
-        return typeof item === 'string' || typeof item === 'number';
-      })
-      .join(' ');
-    return text ? text.slice(0, 300) : null;
+    var parts = [];
+    var length = 0;
+    for (var index = 0; index < value.length && index < 100 && length < 300; index++) {
+      var item = value[index];
+      if (typeof item !== 'string' && typeof item !== 'number') continue;
+      var separatorLength = parts.length ? 1 : 0;
+      var remaining = 300 - length - separatorLength;
+      if (remaining <= 0) break;
+      var part = String(item).slice(0, remaining);
+      parts.push(part);
+      length += separatorLength + part.length;
+    }
+    return parts.length ? parts.join(' ') : null;
   }
 
   function metroElementFromFiber(fiber) {
@@ -292,10 +289,8 @@ export const FIBER_WALKER_JS = `
       1,
       Number.isFinite(requestedNodes) ? requestedNodes : 1200
     ));
-    var focus = metroFocusedRoutes(metroNavigationState(roots));
-    var focused = focus.keys.length > 0 || focus.names.length > 0;
     var state = {
-      scope: focused ? 'focused-scene' : 'all-scenes',
+      scope: 'all-scenes',
       complete: roots.length > 0,
       depthReached: 0,
       scannedNodes: 0
@@ -306,12 +301,6 @@ export const FIBER_WALKER_JS = `
       return state;
     }
 
-    function inactiveScene(route) {
-      if (!focused || !route) return false;
-      if (typeof route.key === 'string') return focus.keys.indexOf(route.key) === -1;
-      return typeof route.name === 'string' && focus.names.indexOf(route.name) === -1;
-    }
-
     var stack = [];
     for (var rootIndex = roots.length - 1; rootIndex >= 0; rootIndex--) {
       stack.push({
@@ -320,10 +309,12 @@ export const FIBER_WALKER_JS = `
         rendererId: roots[rootIndex].rendererId,
         rootIndex: rootIndex,
         depth: 0,
-        parentContext: null
+        parentIndex: null
       });
     }
 
+    var entries = [];
+    var navigationState = metroNavigationState();
     while (stack.length) {
       if (state.scannedNodes >= maxNodes) {
         state.complete = false;
@@ -341,35 +332,81 @@ export const FIBER_WALKER_JS = `
 
       state.scannedNodes++;
       state.depthReached = Math.max(state.depthReached, entry.depth);
-      var name = metroFiberName(fiber);
-      var props = fiber.memoizedProps || {};
-      if (name === 'SceneView' && inactiveScene(props.route)) continue;
+      var entryIndex = entries.length;
+      entries.push(entry);
+      if (!navigationState) {
+        navigationState = metroNavigationStateFromFiber(fiber);
+      }
 
-      var visitResult = visitor(fiber, {
-        depth: entry.depth,
-        parentContext: entry.parentContext,
-        renderer: entry.renderer,
-        rendererId: entry.rendererId,
-        rootIndex: entry.rootIndex
+      var collectionFocus = metroFocusedRoutes(navigationState);
+      var entryName = metroFiberName(fiber);
+      var entryRoute = fiber.memoizedProps && fiber.memoizedProps.route;
+      var pruneInactiveScene = entryName === 'SceneView' && entryRoute && (
+        (typeof entryRoute.key === 'string' && collectionFocus.keys.length > 0 &&
+          collectionFocus.keys.indexOf(entryRoute.key) === -1) ||
+        (typeof entryRoute.key !== 'string' && typeof entryRoute.name === 'string' &&
+          collectionFocus.names.length > 0 &&
+          collectionFocus.names.indexOf(entryRoute.name) === -1)
+      );
+      if (!pruneInactiveScene) {
+        var children = [];
+        var child = fiber.child;
+        while (child) { children.push(child); child = child.sibling; }
+        for (var index = children.length - 1; index >= 0; index--) {
+          stack.push({
+            fiber: children[index],
+            renderer: entry.renderer,
+            rendererId: entry.rendererId,
+            rootIndex: entry.rootIndex,
+            depth: entry.depth + 1,
+            parentIndex: entryIndex
+          });
+        }
+      }
+    }
+
+    var focus = metroFocusedRoutes(navigationState);
+    var focused = focus.keys.length > 0 || focus.names.length > 0;
+    state.scope = focused ? 'focused-scene' : 'all-scenes';
+
+    function inactiveScene(route) {
+      if (!focused || !route) return false;
+      if (typeof route.key === 'string') return focus.keys.indexOf(route.key) === -1;
+      return typeof route.name === 'string' && focus.names.indexOf(route.name) === -1;
+    }
+
+    var visitStates = [];
+    for (var visitIndex = 0; visitIndex < entries.length; visitIndex++) {
+      var visitEntry = entries[visitIndex];
+      var parentState = visitEntry.parentIndex === null
+        ? null
+        : visitStates[visitEntry.parentIndex];
+      if (parentState && parentState.pruned) {
+        visitStates.push({ pruned: true, childContext: parentState.childContext });
+        continue;
+      }
+      var visitFiber = visitEntry.fiber;
+      var visitName = metroFiberName(visitFiber);
+      var visitProps = visitFiber.memoizedProps || {};
+      if (visitName === 'SceneView' && inactiveScene(visitProps.route)) {
+        visitStates.push({ pruned: true, childContext: parentState && parentState.childContext });
+        continue;
+      }
+      var parentContext = parentState ? parentState.childContext : null;
+      var visitResult = visitor(visitFiber, {
+        depth: visitEntry.depth,
+        parentContext: parentContext,
+        renderer: visitEntry.renderer,
+        rendererId: visitEntry.rendererId,
+        rootIndex: visitEntry.rootIndex
       });
       var childContext = visitResult && Object.prototype.hasOwnProperty.call(visitResult, 'childContext')
         ? visitResult.childContext
-        : entry.parentContext;
-      if (visitResult && visitResult.prune) continue;
-
-      var children = [];
-      var child = fiber.child;
-      while (child) { children.push(child); child = child.sibling; }
-      for (var index = children.length - 1; index >= 0; index--) {
-        stack.push({
-          fiber: children[index],
-          renderer: entry.renderer,
-          rendererId: entry.rendererId,
-          rootIndex: entry.rootIndex,
-          depth: entry.depth + 1,
-          parentContext: childContext
-        });
-      }
+        : parentContext;
+      visitStates.push({
+        pruned: !!(visitResult && visitResult.prune),
+        childContext: childContext
+      });
     }
     return state;
   }
@@ -406,7 +443,7 @@ export const FIBER_ROOT_JS = `
   var rootFiber = Array.from(fiberRoots)[0].current;
 `;
 
-export const COLLECT_ELEMENTS_JS = buildFiberReadExpression(`
+const COLLECT_ELEMENTS_BODY = `
   var elements = [];
   var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber) {
     var element = metroElementFromFiber(fiber);
@@ -415,7 +452,11 @@ export const COLLECT_ELEMENTS_JS = buildFiberReadExpression(`
     elements.push(element);
   });
   return { elements: elements, traversal: traversal };
-`);
+`;
+
+export const COLLECT_ELEMENTS_JS = buildFiberReadExpression(
+  COLLECT_ELEMENTS_BODY,
+);
 
 /**
  * Swipe coordinates [startX, startY, endX, endY] — assumes ~1080×1920 viewport.
@@ -478,9 +519,27 @@ type EvalFn = (
   opts?: { timeout?: number; awaitPromise?: boolean },
 ) => Promise<unknown>;
 
-export async function collectElements(evalInApp: EvalFn): Promise<TestableElement[]> {
-  const result = (await evalInApp(COLLECT_ELEMENTS_JS, {
+export interface CollectedElements {
+  elements: TestableElement[];
+  traversal: FiberTraversalMetadata;
+}
+
+export async function collectElements(
+  evalInApp: EvalFn,
+  options: FiberTraversalOptions = {},
+): Promise<CollectedElements> {
+  const expression = buildFiberReadExpression(COLLECT_ELEMENTS_BODY, options);
+  const result = (await evalInApp(expression, {
     timeout: 5000,
-  })) as { elements?: TestableElement[] } | null;
-  return result?.elements ?? [];
+  })) as CollectedElements | null;
+  return result ?? {
+    elements: [],
+    traversal: {
+      scope: 'all-scenes',
+      complete: false,
+      depthReached: 0,
+      scannedNodes: 0,
+      truncationReason: 'fiber-roots-unavailable',
+    },
+  };
 }
