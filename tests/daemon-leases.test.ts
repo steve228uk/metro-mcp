@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from '../src/config.js';
-import { createDaemonIdentity, getDaemonKey } from '../src/daemon.js';
+import {
+  DaemonLeaseClient,
+  createDaemonIdentity,
+  getDaemonKey,
+  type DaemonRecord,
+} from '../src/daemon.js';
 import { startHttpServer } from '../src/server.js';
 
 const servers: Array<Awaited<ReturnType<typeof startHttpServer>>> = [];
@@ -168,5 +173,101 @@ describe('managed daemon leases', () => {
     });
 
     await expectPending(idle.promise, 60);
+  });
+
+  test('rejects new leases after idle shutdown becomes irrevocable', async () => {
+    const idle = deferred();
+    const { server, key } = await startLeaseServer({
+      idleGraceMs: 20,
+      onIdle: idle.resolve,
+    });
+    await idle.promise;
+
+    const response = await updateLease(
+      server,
+      key,
+      randomUUID(),
+      'PUT',
+    );
+
+    expect(response.status).toBe(409);
+  });
+});
+
+function leaseRecord(
+  managed: boolean,
+  url = 'http://127.0.0.1:8765/mcp',
+): DaemonRecord {
+  const daemonIdentity = createDaemonIdentity([], {
+    projectRoot: process.cwd(),
+  });
+  return {
+    pid: process.pid,
+    host: new URL(url).hostname,
+    port: Number(new URL(url).port),
+    url,
+    key: getDaemonKey([], daemonIdentity),
+    cwd: process.cwd(),
+    args: [],
+    identity: daemonIdentity,
+    managed,
+    startedAt: new Date().toISOString(),
+  };
+}
+
+async function waitUntil(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 500;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Condition timed out');
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+describe('stdio daemon lease client', () => {
+  test('does not lease an explicit foreground server', async () => {
+    const methods: string[] = [];
+    const client = new DaemonLeaseClient(leaseRecord(false), {
+      update: async (_record, _clientId, method) => {
+        methods.push(method);
+      },
+    });
+
+    await client.start();
+    await client.stop();
+
+    expect(methods).toEqual([]);
+  });
+
+  test('waits for an in-flight renewal before releasing the lease', async () => {
+    const methods: string[] = [];
+    const renewal = deferred();
+    let putCount = 0;
+    const client = new DaemonLeaseClient(leaseRecord(true), {
+      renewIntervalMs: 5,
+      update: async (_record, _clientId, method) => {
+        methods.push(method);
+        if (method === 'PUT' && ++putCount === 2) await renewal.promise;
+      },
+    });
+    await client.start();
+    await waitUntil(() => putCount === 2);
+
+    const stopping = client.stop();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(methods).toEqual(['PUT', 'PUT']);
+    renewal.resolve();
+    await stopping;
+
+    expect(methods).toEqual(['PUT', 'PUT', 'DELETE']);
+  });
+
+  test('refuses to send a daemon key to a non-local URL', async () => {
+    const client = new DaemonLeaseClient(
+      leaseRecord(true, 'http://example.com:8765/mcp'),
+    );
+
+    await expect(client.start()).rejects.toThrow(
+      'Refusing daemon lease request to non-local URL',
+    );
   });
 });

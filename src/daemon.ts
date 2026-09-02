@@ -49,6 +49,8 @@ export interface DaemonRecord {
   cwd: string;
   args: string[];
   identity?: DaemonIdentity;
+  /** Whether the server was auto-spawned and requires client leases. */
+  managed?: boolean;
   startedAt: string;
 }
 
@@ -59,6 +61,7 @@ export interface DaemonHealth {
   daemon?: {
     key: string;
     identity: DaemonIdentity;
+    managed?: boolean;
   };
 }
 
@@ -82,8 +85,8 @@ export class DaemonLeaseRegistry {
     this.scheduleGrace();
   }
 
-  renew(clientId: string): void {
-    if (this.closed || this.idleTriggered) return;
+  renew(clientId: string): boolean {
+    if (this.closed || this.idleTriggered) return false;
     const existing = this.leases.get(clientId);
     if (existing) clearTimeout(existing);
     if (this.graceTimer) {
@@ -96,6 +99,7 @@ export class DaemonLeaseRegistry {
     }, this.leaseTtlMs);
     expiry.unref?.();
     this.leases.set(clientId, expiry);
+    return true;
   }
 
   release(clientId: string): void {
@@ -246,8 +250,26 @@ function identityMatches(
   return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
+function parseLocalDaemonUrl(value: string): URL | null {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    if (
+      url.protocol !== 'http:' ||
+      !['localhost', '127.0.0.1', '[::1]', '::1'].includes(hostname)
+    ) {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+}
+
 async function readHealth(record: DaemonRecord): Promise<DaemonHealth | null> {
-  const healthUrl = new URL('/health', record.url);
+  const daemonUrl = parseLocalDaemonUrl(record.url);
+  if (!daemonUrl) return null;
+  const healthUrl = new URL('/health', daemonUrl);
   const response = await fetch(healthUrl, {
     signal: AbortSignal.timeout(1000),
   });
@@ -287,6 +309,7 @@ async function isRecordLive(
       return false;
     }
 
+    record.managed = health.daemon.managed === true;
     return true;
   } catch {
     return false;
@@ -322,7 +345,7 @@ async function waitForRecord(
   throw new Error('Timed out waiting for metro-mcp daemon to start');
 }
 
-async function withStartupLock<T>(
+export async function withStartupLock<T>(
   key: string,
   fn: () => Promise<T>,
 ): Promise<T> {
@@ -332,45 +355,108 @@ async function withStartupLock<T>(
 
   while (Date.now() < deadline) {
     let fd: number | null = null;
+    let lockToken: string | null = null;
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
     try {
       fd = fs.openSync(lockPath, 'wx');
+      lockToken = randomUUID();
       fs.writeFileSync(
         fd,
         JSON.stringify({
           pid: process.pid,
           createdAt: new Date().toISOString(),
+          token: lockToken,
         }),
       );
+      heartbeat = setInterval(() => {
+        try {
+          const now = new Date();
+          fs.futimesSync(fd!, now, now);
+        } catch {
+          // The owned lock descriptor may already be closing.
+        }
+      }, Math.floor(STARTUP_LOCK_STALE_MS / 3));
+      heartbeat.unref?.();
       return await fn();
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
       try {
+        const contents = fs.readFileSync(lockPath, 'utf8');
+        const lock = JSON.parse(contents) as { pid?: number };
         const stat = fs.statSync(lockPath);
-        if (Date.now() - stat.mtimeMs > STARTUP_LOCK_STALE_MS) {
-          fs.unlinkSync(lockPath);
+        if (
+          !isProcessAlive(lock.pid) ||
+          Date.now() - stat.mtimeMs > STARTUP_LOCK_STALE_MS
+        ) {
+          removeStartupLockIfUnchanged(lockPath, contents);
           continue;
         }
       } catch {
+        try {
+          const contents = fs.readFileSync(lockPath, 'utf8');
+          removeStartupLockIfUnchanged(lockPath, contents);
+        } catch {
+          // The lock disappeared; retry acquisition.
+        }
         continue;
       }
       await sleep(100);
     } finally {
+      if (heartbeat) clearInterval(heartbeat);
       if (fd !== null) {
         try {
           fs.closeSync(fd);
         } catch {
           /* ignore */
         }
-        try {
-          fs.unlinkSync(lockPath);
-        } catch {
-          /* ignore */
-        }
+        if (lockToken) removeStartupLockIfOwned(lockPath, lockToken);
       }
     }
   }
 
   throw new Error('Timed out waiting for metro-mcp daemon startup lock');
+}
+
+function isProcessAlive(pid: number | undefined): boolean {
+  if (typeof pid !== 'number') return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readStartupLockToken(lockPath: string): string | null {
+  try {
+    const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as {
+      token?: unknown;
+    };
+    return typeof lock.token === 'string' ? lock.token : null;
+  } catch {
+    return null;
+  }
+}
+
+function removeStartupLockIfOwned(lockPath: string, token: string): void {
+  if (readStartupLockToken(lockPath) !== token) return;
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // The lock may have been removed concurrently.
+  }
+}
+
+function removeStartupLockIfUnchanged(
+  lockPath: string,
+  expectedContents: string,
+): void {
+  try {
+    if (fs.readFileSync(lockPath, 'utf8') !== expectedContents) return;
+    fs.unlinkSync(lockPath);
+  } catch {
+    // The lock may have been replaced or removed concurrently.
+  }
 }
 
 export async function cleanupStaleDaemonRecords(): Promise<void> {
@@ -401,34 +487,27 @@ export async function cleanupStaleDaemonRecords(): Promise<void> {
       const lockMatch = /^daemon-([a-f0-9]+)\.lock$/.exec(entry);
       if (!lockMatch) return;
       const lockPath = getDaemonLockPath(lockMatch[1]);
+      let contents: string;
       try {
-        const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as {
+        contents = fs.readFileSync(lockPath, 'utf8');
+        const lock = JSON.parse(contents) as {
           pid?: number;
         };
         const stat = fs.statSync(lockPath);
-        let processAlive = false;
-        if (typeof lock.pid === 'number') {
-          try {
-            process.kill(lock.pid, 0);
-            processAlive = true;
-          } catch {
-            processAlive = false;
-          }
-        }
         if (
-          processAlive &&
+          isProcessAlive(lock.pid) &&
           Date.now() - stat.mtimeMs <= STARTUP_LOCK_STALE_MS
         ) {
           return;
         }
       } catch {
-        // Corrupt locks are stale.
+        try {
+          contents = fs.readFileSync(lockPath, 'utf8');
+        } catch {
+          return;
+        }
       }
-      try {
-        fs.unlinkSync(lockPath);
-      } catch {
-        // Already removed.
-      }
+      removeStartupLockIfUnchanged(lockPath, contents);
     }),
   );
 }
@@ -482,9 +561,13 @@ async function updateDaemonLease(
   clientId: string,
   method: 'PUT' | 'DELETE',
 ): Promise<void> {
+  const daemonUrl = parseLocalDaemonUrl(record.url);
+  if (!daemonUrl) {
+    throw new Error(`Refusing daemon lease request to non-local URL: ${record.url}`);
+  }
   const leaseUrl = new URL(
     `/_metro-mcp/clients/${encodeURIComponent(clientId)}`,
-    record.url,
+    daemonUrl,
   );
   const response = await fetch(leaseUrl, {
     method,
@@ -496,15 +579,92 @@ async function updateDaemonLease(
   }
 }
 
+type DaemonLeaseUpdater = (
+  record: DaemonRecord,
+  clientId: string,
+  method: 'PUT' | 'DELETE',
+) => Promise<void>;
+
+export interface DaemonLeaseClientOptions {
+  clientId?: string;
+  renewIntervalMs?: number;
+  update?: DaemonLeaseUpdater;
+}
+
+/** Serializes lease shutdown behind any in-flight renewal. */
+export class DaemonLeaseClient {
+  private readonly clientId: string;
+  private readonly renewIntervalMs: number;
+  private readonly update: DaemonLeaseUpdater;
+  private renewalTimer: ReturnType<typeof setInterval> | null = null;
+  private renewalRequest: Promise<void> | null = null;
+  private stopPromise: Promise<void> | null = null;
+  private acquired = false;
+  private stopping = false;
+
+  constructor(
+    private readonly record: DaemonRecord,
+    options: DaemonLeaseClientOptions = {},
+  ) {
+    this.clientId = options.clientId ?? randomUUID();
+    this.renewIntervalMs =
+      options.renewIntervalMs ?? DAEMON_LEASE_RENEW_MS;
+    this.update = options.update ?? updateDaemonLease;
+  }
+
+  async start(): Promise<void> {
+    if (this.record.managed !== true) return;
+    await this.update(this.record, this.clientId, 'PUT');
+    this.acquired = true;
+    if (this.stopping) {
+      await this.release();
+      return;
+    }
+    this.renewalTimer = setInterval(
+      () => this.renew(),
+      this.renewIntervalMs,
+    );
+    this.renewalTimer.unref?.();
+  }
+
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopping = true;
+    if (this.renewalTimer) clearInterval(this.renewalTimer);
+    this.renewalTimer = null;
+    this.stopPromise = (async () => {
+      await this.renewalRequest?.catch(() => {});
+      await this.release();
+    })();
+    return this.stopPromise;
+  }
+
+  private renew(): void {
+    if (this.stopping || !this.acquired || this.renewalRequest) return;
+    const request = this.update(this.record, this.clientId, 'PUT');
+    this.renewalRequest = request;
+    void request
+      .catch((err) => logger.warn('Failed to renew daemon lease:', err))
+      .finally(() => {
+        if (this.renewalRequest === request) this.renewalRequest = null;
+      });
+  }
+
+  private async release(): Promise<void> {
+    if (!this.acquired) return;
+    this.acquired = false;
+    await this.update(this.record, this.clientId, 'DELETE');
+  }
+}
+
 export async function startStdioProxy(args: string[]): Promise<void> {
   const record = await ensureDaemon(args);
-  const clientId = randomUUID();
+  const lease = new DaemonLeaseClient(record);
   const stdio = new StdioServerTransport();
   const daemonTransport = new StreamableHTTPClientTransport(
     new URL(record.url),
   );
   let closing = false;
-  let leaseTimer: ReturnType<typeof setInterval> | null = null;
 
   async function closeQuietly(transport: {
     close(): Promise<void>;
@@ -515,9 +675,7 @@ export async function startStdioProxy(args: string[]): Promise<void> {
   async function close(): Promise<void> {
     if (closing) return;
     closing = true;
-    if (leaseTimer) clearInterval(leaseTimer);
-    leaseTimer = null;
-    await updateDaemonLease(record, clientId, 'DELETE').catch(() => {});
+    await lease.stop().catch(() => {});
     await Promise.all([closeQuietly(stdio), closeQuietly(daemonTransport)]);
     process.exit(0);
   }
@@ -540,13 +698,7 @@ export async function startStdioProxy(args: string[]): Promise<void> {
   stdio.onclose = () => void close();
   daemonTransport.onclose = () => void close();
 
-  await updateDaemonLease(record, clientId, 'PUT');
-  leaseTimer = setInterval(() => {
-    updateDaemonLease(record, clientId, 'PUT').catch((err) => {
-      logger.warn('Failed to renew daemon lease:', err);
-    });
-  }, DAEMON_LEASE_RENEW_MS);
-  leaseTimer.unref?.();
+  await lease.start();
 
   await daemonTransport.start();
   await stdio.start();

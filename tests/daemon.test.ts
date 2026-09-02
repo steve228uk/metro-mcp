@@ -11,6 +11,7 @@ import {
   getDaemonRecordPath,
   readLiveRecord,
   removeDaemonRecordForProcess,
+  withStartupLock,
   writeDaemonRecord,
 } from '../src/daemon.js';
 import { loadConfig } from '../src/config.js';
@@ -147,13 +148,14 @@ describe('daemon records', () => {
     const key = getDaemonKey(expected.args, expected);
 
     await withHealthServer(
-      { ok: true, name: 'metro-mcp', version: expected.version, daemon: { key, identity: expected } },
+      { ok: true, name: 'metro-mcp', version: expected.version, daemon: { key, identity: expected, managed: true } },
       async (url) => {
         writeDaemonRecord(record(key, url, expected));
 
         const live = await readLiveRecord(key, expected);
 
         expect(live?.url).toBe(url);
+        expect(live?.managed).toBe(true);
         expect(fs.existsSync(getDaemonRecordPath(key))).toBe(true);
       },
     );
@@ -266,6 +268,36 @@ describe('daemon records', () => {
     expect(fs.existsSync(stalePath)).toBe(false);
     expect(fs.existsSync(livePath)).toBe(true);
   });
+
+  test('does not remove a replacement lock when the previous owner finishes', async () => {
+    const key = 'cccccccccccccccc';
+    const lockPath = getDaemonLockPath(key);
+    await withStartupLock(key, async () => {
+      fs.unlinkSync(lockPath);
+      fs.writeFileSync(
+        lockPath,
+        JSON.stringify({
+          pid: process.pid,
+          createdAt: new Date().toISOString(),
+          token: 'replacement-owner',
+        }),
+      );
+    });
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).token).toBe(
+      'replacement-owner',
+    );
+  });
+
+  test('rejects daemon records that point outside localhost', async () => {
+    const expected = identity();
+    const key = getDaemonKey(expected.args, expected);
+    writeDaemonRecord(record(key, 'http://example.com:8080/mcp', expected));
+
+    await expect(readLiveRecord(key, expected)).resolves.toBeNull();
+    expect(fs.existsSync(getDaemonRecordPath(key))).toBe(false);
+  });
 });
 
 describe('HTTP health', () => {
@@ -292,6 +324,7 @@ describe('HTTP health', () => {
       expect(body.version).toBe(version);
       expect(body.daemon?.key).toBe(key);
       expect(body.daemon?.identity).toEqual(daemonIdentity);
+      expect(body.daemon?.managed).toBe(false);
     } finally {
       await server.close();
     }

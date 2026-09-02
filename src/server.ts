@@ -1179,7 +1179,10 @@ export async function startHttpServer(
           return;
         }
         if (req.method === 'PUT') {
-          leaseRegistry.renew(leaseMatch[1]);
+          if (!leaseRegistry.renew(leaseMatch[1])) {
+            res.writeHead(409).end('Daemon is shutting down');
+            return;
+          }
           res.writeHead(204).end();
           return;
         }
@@ -1201,6 +1204,7 @@ export async function startHttpServer(
           daemon: {
             key: daemonKey,
             identity: daemonIdentity,
+            managed: options.daemon?.managed === true,
           },
         });
         return;
