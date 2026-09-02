@@ -77,7 +77,7 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 
 ## Simulator
 
-- **`take_screenshot`** — Capture a simulator/device screenshot. Returns a retained temporary PNG path by default; set `delivery` to `inline` for a native MCP image block.
+- **`take_screenshot`** — Capture a simulator/device screenshot. Returns a retained temporary PNG path by default; set `delivery` to `inline` for a native MCP image block. Captures larger than 64 MiB are rejected and removed.
 - **`list_simulators`** — List iOS simulators and Android emulators.
 - **`install_certificate`** — Add root certificate to device.
 - **`get_native_logs`** — Native logs (iOS syslog / Android logcat).

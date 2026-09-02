@@ -8,6 +8,7 @@ import {
   rm,
   stat,
   symlink,
+  truncate,
   unlink,
   utimes,
   writeFile,
@@ -45,6 +46,7 @@ async function createSimulatorHarness(
   options: {
     writeCapture?: boolean;
     execError?: Error;
+    captureSize?: number;
     execFileCalls?: Array<{ command: string; args: string[] }>;
   } = {},
 ) {
@@ -94,6 +96,9 @@ async function createSimulatorHarness(
       if (writeCapture && path) {
         createdFiles.add(path);
         await writeFile(path, png);
+        if (options.captureSize !== undefined) {
+          await truncate(path, options.captureSize);
+        }
       }
       if (options.execError) throw options.execError;
       return Buffer.from(png);
@@ -209,6 +214,15 @@ describe('take_screenshot', () => {
     await expect(
       capture(tool, { platform: 'ios', delivery: 'path' }),
     ).rejects.toThrow('Failed to capture screenshot');
+  });
+
+  test('rejects and removes oversized iOS captures before delivery', async () => {
+    const tool = await createSimulatorHarness({ captureSize: 65 * 1024 * 1024 });
+
+    await expect(capture(tool, { platform: 'ios' })).rejects.toThrow(
+      '64 MiB screenshot limit',
+    );
+    for (const path of createdFiles) expect(existsSync(path)).toBe(false);
   });
 
   test('removes a partial capture when the platform command fails', async () => {

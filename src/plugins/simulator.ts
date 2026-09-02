@@ -144,6 +144,9 @@ export const simulatorPlugin = definePlugin({
           if (!metadata.isFile()) {
             throw new Error('capture did not produce a regular file');
           }
+          if (metadata.size > SCREENSHOT_MAX_BYTES) {
+            throw new Error('capture exceeds the 64 MiB screenshot limit');
+          }
         } catch (error) {
           await unlink(tmpFile).catch(() => {});
           throw new Error(
