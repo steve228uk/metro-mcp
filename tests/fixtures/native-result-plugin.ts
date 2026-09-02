@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { definePlugin } from '../../src/plugin.js';
+import { definePlugin, nativeToolResult } from '../../src/plugin.js';
 
 export default definePlugin({
   name: 'native-result-fixture',
@@ -7,7 +7,7 @@ export default definePlugin({
     ctx.registerTool('test_native_image', {
       description: 'Return a native MCP image block for protocol tests.',
       parameters: z.object({}),
-      handler: async () => ({
+      handler: async () => nativeToolResult({
         content: [
           {
             type: 'image',

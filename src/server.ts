@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
@@ -97,6 +97,7 @@ import { filesystemPlugin } from './plugins/filesystem.js';
 import { environmentPlugin } from './plugins/environment.js';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const logger = createLogger('server');
 const RESOURCE_UPDATE_COALESCE_MS = 250;
 
@@ -607,6 +608,13 @@ export async function createMetroRuntime(
       exec: async (command: string) => {
         const { stdout } = await execAsync(command);
         return stdout;
+      },
+      execFile: async (command, args, options) => {
+        const { stdout } = await execFileAsync(command, args, {
+          encoding: 'buffer',
+          maxBuffer: options?.maxBuffer,
+        });
+        return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
       },
       format: formatUtils,
       getActiveDeviceKey: () => activeDeviceKey,

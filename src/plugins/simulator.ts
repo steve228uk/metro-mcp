@@ -9,23 +9,21 @@ import {
   readFile,
   stat,
   unlink,
+  writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
-import { definePlugin } from '../plugin.js';
+import { definePlugin, nativeToolResult } from '../plugin.js';
 
 const SCREENSHOT_PREFIX = 'metro-mcp-screenshot-';
 const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SCREENSHOT_MAX_BYTES = 64 * 1024 * 1024;
 const SCREENSHOT_FILE_PATTERN = /^metro-mcp-screenshot-[a-zA-Z0-9-]+\.png$/;
 const SCREENSHOT_DIRECTORY = join(
   tmpdir(),
   `metro-mcp-screenshots-${process.getuid?.() ?? 'user'}`,
 );
-
-export function quoteShellArgument(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
 
 export async function prepareScreenshotDirectory(
   directory = SCREENSHOT_DIRECTORY,
@@ -127,13 +125,18 @@ export const simulatorPlugin = definePlugin({
 
         try {
           if (p === 'ios') {
-            await ctx.exec(
-              `xcrun simctl io booted screenshot ${quoteShellArgument(tmpFile)}`,
+            await ctx.execFile(
+              'xcrun',
+              ['simctl', 'io', 'booted', 'screenshot', tmpFile],
+              { maxBuffer: SCREENSHOT_MAX_BYTES },
             );
           } else {
-            await ctx.exec(
-              `adb exec-out screencap -p > ${quoteShellArgument(tmpFile)}`,
+            const capture = await ctx.execFile(
+              'adb',
+              ['exec-out', 'screencap', '-p'],
+              { maxBuffer: SCREENSHOT_MAX_BYTES },
             );
+            await writeFile(tmpFile, capture, { flag: 'wx', mode: 0o600 });
           }
 
           await chmod(tmpFile, 0o600);
@@ -149,21 +152,21 @@ export const simulatorPlugin = definePlugin({
         }
 
         if (delivery === 'path') {
-          return {
+          return nativeToolResult({
             content: [{ type: 'text', text: `Screenshot saved to ${tmpFile}` }],
             structuredContent: {
               path: tmpFile,
               mimeType: 'image/png',
               platform: p,
             },
-          };
+          });
         }
 
         try {
           const data = (await readFile(tmpFile)).toString('base64');
-          return {
+          return nativeToolResult({
             content: [{ type: 'image', data, mimeType: 'image/png' }],
-          };
+          });
         } finally {
           await unlink(tmpFile).catch(() => {});
         }

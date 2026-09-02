@@ -97,6 +97,27 @@ handler: async ({ items }, { sendProgress }) => {
 },
 ```
 
+### Native MCP tool results
+
+Ordinary objects returned by handlers are JSON-serialized into a text content
+block. To deliberately return native MCP content such as an image, validate and
+mark the result with `nativeToolResult()`:
+
+```typescript
+import { definePlugin, nativeToolResult } from 'metro-mcp';
+
+handler: async () => nativeToolResult({
+  content: [{
+    type: 'image',
+    data: pngBuffer.toString('base64'),
+    mimeType: 'image/png',
+  }],
+}),
+```
+
+The explicit helper prevents an existing plugin object that merely has a
+`content` property from being reinterpreted as MCP protocol output.
+
 ## Registering resources
 
 Resources expose readable data to AI clients (component trees, logs, state snapshots, etc.).
@@ -228,6 +249,15 @@ Run shell commands and capture output:
 ```typescript
 const devices = await ctx.exec('xcrun simctl list devices --json');
 const parsed = JSON.parse(devices);
+```
+
+Use `ctx.execFile()` when arguments must be passed literally or stdout is
+binary. It does not invoke a shell and returns a `Buffer`:
+
+```typescript
+const png = await ctx.execFile('adb', ['exec-out', 'screencap', '-p'], {
+  maxBuffer: 64 * 1024 * 1024,
+});
 ```
 
 ### `ctx.format` — Formatting helpers

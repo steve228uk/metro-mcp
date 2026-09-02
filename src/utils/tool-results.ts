@@ -1,11 +1,11 @@
+import type { CallToolResult } from '@modelcontextprotocol/server';
 import {
-  isCallToolResult,
-  type CallToolResult,
-} from '@modelcontextprotocol/server';
-import type { ToolHandlerResult } from '../plugin.js';
+  isNativeToolResult,
+  type ToolHandlerResult,
+} from '../plugin.js';
 
 export function normalizeToolResult(result: ToolHandlerResult): CallToolResult {
-  if (isCallToolResult(result)) return result;
+  if (isNativeToolResult(result)) return result;
   const text =
     typeof result === 'string'
       ? result

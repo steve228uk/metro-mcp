@@ -22,7 +22,6 @@ import type {
 } from '../plugin.js';
 import {
   prepareScreenshotDirectory,
-  quoteShellArgument,
   simulatorPlugin,
 } from './simulator.js';
 
@@ -43,7 +42,11 @@ afterEach(async () => {
 });
 
 async function createSimulatorHarness(
-  options: { writeCapture?: boolean; execError?: Error } = {},
+  options: {
+    writeCapture?: boolean;
+    execError?: Error;
+    execFileCalls?: Array<{ command: string; args: string[] }>;
+  } = {},
 ) {
   const tools = new Map<string, RegisteredTool>();
   const registerTool: PluginContext['registerTool'] = (name, config) => {
@@ -84,17 +87,16 @@ async function createSimulatorHarness(
       port: 8081,
       fetch: async () => new Response(),
     },
-    exec: async (command) => {
-      const quotedPath = command.match(/('(?:[^']|'\\'')*')$/)?.[1];
-      const path = quotedPath
-        ?.slice(1, -1)
-        .replaceAll(`'\\''`, "'");
+    exec: async () => '',
+    execFile: async (command, args) => {
+      options.execFileCalls?.push({ command, args });
+      const path = command === 'xcrun' ? args.at(-1) : undefined;
       if (writeCapture && path) {
         createdFiles.add(path);
         await writeFile(path, png);
       }
       if (options.execError) throw options.execError;
-      return '';
+      return Buffer.from(png);
     },
     format: {
       summarize: () => '',
@@ -122,10 +124,25 @@ async function capture(
 }
 
 describe('take_screenshot', () => {
-  test('shell-quotes environment-derived screenshot paths', () => {
-    expect(quoteShellArgument("/tmp/path with 'quotes'/$HOME;$(id).png")).toBe(
-      "'/tmp/path with '\\''quotes'\\''/$HOME;$(id).png'",
-    );
+  test('uses direct executable arguments instead of shell path quoting', async () => {
+    const execFileCalls: Array<{ command: string; args: string[] }> = [];
+    const tool = await createSimulatorHarness({ execFileCalls });
+
+    await capture(tool, { platform: 'ios' });
+    await capture(tool, { platform: 'android' });
+
+    expect(execFileCalls[0].command).toBe('xcrun');
+    expect(execFileCalls[0].args.slice(0, -1)).toEqual([
+      'simctl',
+      'io',
+      'booted',
+      'screenshot',
+    ]);
+    expect(execFileCalls[0].args.at(-1)?.startsWith(tmpdir())).toBe(true);
+    expect(execFileCalls[1]).toEqual({
+      command: 'adb',
+      args: ['exec-out', 'screencap', '-p'],
+    });
   });
 
   test('defaults to a retained temporary path with structured metadata', async () => {

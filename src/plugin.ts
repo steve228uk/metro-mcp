@@ -1,5 +1,9 @@
 import { z } from 'zod';
-import type { CallToolResult, ContentBlock } from '@modelcontextprotocol/server';
+import {
+  isCallToolResult,
+  type CallToolResult,
+  type ContentBlock,
+} from '@modelcontextprotocol/server';
 import type { CircularBuffer } from './utils/buffer.js';
 import type { MetroTarget } from 'metro-bridge';
 
@@ -58,8 +62,41 @@ export interface ToolHandlerContext {
 /** A native MCP content block returned directly by a plugin tool. */
 export type NativeToolContentBlock = ContentBlock;
 
+const NATIVE_TOOL_RESULT_BRAND = Symbol.for(
+  'io.github.steve228uk.metro-mcp.native-tool-result',
+);
+declare const nativeToolResultTypeBrand: unique symbol;
+
 /** A validated native MCP tool result, including image/audio/resource blocks. */
-export type NativeToolResult = CallToolResult;
+export type NativeToolResult = CallToolResult & {
+  readonly [nativeToolResultTypeBrand]: true;
+};
+
+/**
+ * Validate and explicitly opt a plugin result into native MCP delivery.
+ * Ordinary objects remain JSON text, even when they happen to be shaped like
+ * a CallToolResult.
+ */
+export function nativeToolResult(result: CallToolResult): NativeToolResult {
+  if (!isCallToolResult(result)) {
+    throw new TypeError('Invalid native MCP tool result');
+  }
+
+  const brandedResult = { ...result };
+  Object.defineProperty(brandedResult, NATIVE_TOOL_RESULT_BRAND, {
+    value: true,
+  });
+  return brandedResult as NativeToolResult;
+}
+
+export function isNativeToolResult(result: unknown): result is NativeToolResult {
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    (result as Record<PropertyKey, unknown>)[NATIVE_TOOL_RESULT_BRAND] === true &&
+    isCallToolResult(result)
+  );
+}
 
 /**
  * Plugin handlers may return a native MCP result or any JSON-serializable value.
@@ -160,6 +197,12 @@ export interface PluginContext {
     fetch(path: string): Promise<Response>;
   };
   exec(command: string): Promise<string>;
+  /** Run an executable with literal arguments and return its binary stdout. */
+  execFile(
+    command: string,
+    args: string[],
+    options?: { maxBuffer?: number },
+  ): Promise<Buffer>;
   format: FormatUtils;
   /** Evaluate a JavaScript expression in the connected app runtime */
   evalInApp(expression: string, options?: EvalOptions): Promise<unknown>;

@@ -60,6 +60,7 @@ async function createNetworkHarness(responseBody: string) {
       fetch: async () => new Response(),
     },
     exec: async () => '',
+    execFile: async () => Buffer.alloc(0),
     format: {
       summarize: () => '',
       compact: (value: unknown) => JSON.stringify(value),
