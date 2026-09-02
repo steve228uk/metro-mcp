@@ -57,10 +57,12 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 
 > No app changes needed.
 
-- **`get_component_tree`** — Get the React component tree. Use `structureOnly=true` for compact output (~1-3KB).
-- **`find_components`** — Search by component name pattern.
+- **`get_component_tree`** — Get a paged flat React component snapshot. Follow `nextCursor` to retrieve all nodes, then reconstruct hierarchy from `id` and `parentId`.
+- **`find_components`** — Search by component name pattern inside the app runtime.
 - **`inspect_component`** — Get detailed props, state, and hooks for a specific component.
 - **`get_testable_elements`** — List all elements with `testID` or `accessibilityLabel`.
+
+All component read tools return `traversal` metadata. Check `complete` before interpreting an empty result as “not found”; `depthReached`, `scannedNodes`, and `truncationReason` explain bounded results. Traversal defaults to `maxDepth=200` and `maxNodes=1200`, supports depths up to 600, and reports whether it inspected the `focused-scene` or `all-scenes`.
 
 ## Storage
 
@@ -121,7 +123,7 @@ Inspect and manage app permissions on iOS Simulator and Android Emulator without
 
 All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB as a last resort. IDB is optional — tools will prompt you to install it when needed.
 
-- **`list_elements`** — Get interactive elements from the React component tree (labels, testIDs, roles). No IDB needed.
+- **`list_elements`** — Get interactive elements from the React component tree (labels, testIDs, roles) with traversal completeness metadata. No IDB needed.
 - **`tap_element`** — Tap by label/testID (CDP fiber tree) or coordinates (simctl/adb → IDB fallback).
 - **`type_text`** — Type into a TextInput by testID/label or the first visible input (CDP → adb → IDB).
 - **`long_press`** — Long press by label/testID (CDP) or coordinates (adb → IDB).

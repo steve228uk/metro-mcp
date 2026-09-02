@@ -1,286 +1,255 @@
 import { z } from 'zod';
-import { definePlugin } from '../plugin.js';
-import { escapeJsString } from '../utils/format.js';
 import { buildComponentsHtml } from '../apps/components.js';
+import { definePlugin } from '../plugin.js';
+import {
+  DEFAULT_FIBER_MAX_DEPTH,
+  DEFAULT_FIBER_MAX_NODES,
+  MAX_FIBER_DEPTH,
+  MAX_FIBER_NODES,
+  buildFiberReadExpression,
+  type FiberTraversalMetadata,
+} from '../utils/fiber.js';
+import {
+  FiberSnapshotStore,
+  type FlatFiberNode,
+} from '../utils/fiber-snapshots.js';
 
-// JS expression to walk the React fiber tree
-const WALK_FIBER_EXPR = `
-(function() {
-  var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-  if (!hook || !hook.getFiberRoots) return null;
+const traversalParameters = {
+  maxDepth: z
+    .number()
+    .int()
+    .min(0)
+    .max(MAX_FIBER_DEPTH)
+    .default(DEFAULT_FIBER_MAX_DEPTH)
+    .describe('Maximum fiber depth to traverse (default 200, maximum 600)'),
+  maxNodes: z
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_FIBER_NODES)
+    .default(DEFAULT_FIBER_MAX_NODES)
+    .describe('Maximum fibers to scan (default 1200)'),
+};
 
-  var roots = [];
-  try {
-    var fiberRoots = hook.getFiberRoots(1);
-    if (!fiberRoots || fiberRoots.size === 0) {
-      // Try renderer IDs 1-5
-      for (var i = 1; i <= 5; i++) {
-        fiberRoots = hook.getFiberRoots(i);
-        if (fiberRoots && fiberRoots.size > 0) break;
-      }
-    }
-    if (!fiberRoots || fiberRoots.size === 0) return null;
-    roots = Array.from(fiberRoots);
-  } catch(e) { return null; }
-
-  var OPTIONS = __OPTIONS__;
-
-  function getName(fiber) {
-    if (!fiber || !fiber.type) return null;
-    if (typeof fiber.type === 'string') return fiber.type;
-    return fiber.type.displayName || fiber.type.name || null;
-  }
-
-  function walkFiber(fiber, depth) {
-    if (!fiber || depth > (OPTIONS.maxDepth || 200)) return null;
-
-    var name = getName(fiber);
-    var node = null;
-
-    if (name) {
-      node = { name: name };
-
-      if (!OPTIONS.structureOnly) {
-        if (fiber.memoizedProps && Object.keys(fiber.memoizedProps).length > 0) {
-          try {
-            var props = {};
-            var propKeys = Object.keys(fiber.memoizedProps);
-            for (var i = 0; i < Math.min(propKeys.length, 20); i++) {
-              var key = propKeys[i];
-              var val = fiber.memoizedProps[key];
-              if (key === 'children') continue;
-              if (typeof val === 'function') { props[key] = '[function]'; }
-              else if (typeof val === 'object' && val !== null) { props[key] = '[object]'; }
-              else { props[key] = val; }
-            }
-            if (Object.keys(props).length > 0) node.props = props;
-          } catch(e) {}
-        }
-      }
-
-      if (OPTIONS.includeTestIds) {
-        var testID = fiber.memoizedProps?.testID;
-        var accessibilityLabel = fiber.memoizedProps?.accessibilityLabel;
-        var accessibilityRole = fiber.memoizedProps?.accessibilityRole;
-        if (testID) node.testID = testID;
-        if (accessibilityLabel) node.accessibilityLabel = accessibilityLabel;
-        if (accessibilityRole) node.accessibilityRole = accessibilityRole;
-      }
-    }
-
-    var children = [];
-    var child = fiber.child;
-    while (child) {
-      var childNode = walkFiber(child, depth + 1);
-      if (childNode) children.push(childNode);
-      child = child.sibling;
-    }
-
-    if (node) {
-      if (children.length > 0) node.children = children;
-      return node;
-    }
-
-    if (children.length === 1) return children[0];
-    if (children.length > 1) return { name: 'Fragment', children: children };
-    return null;
-  }
-
-  var rootFiber = roots[0].current;
-  return walkFiber(rootFiber, 0);
-})()
-`;
+interface RuntimeTreeResult {
+  nodes: FlatFiberNode[];
+  traversal: FiberTraversalMetadata;
+}
 
 export const componentsPlugin = definePlugin({
   name: 'components',
-
-  description: 'React component tree inspection via fiber tree walking',
+  description: 'React component tree inspection via bounded fiber traversal',
 
   async setup(ctx) {
+    const snapshots = new FiberSnapshotStore();
+
     ctx.registerAppResource('ui://metro/components', {
       name: 'Component Tree',
-      description: 'Interactive React fiber tree explorer with props, state, and testID viewer',
+      description:
+        'Interactive React fiber tree explorer with props, state, and testID viewer',
       handler: async () => buildComponentsHtml(),
     });
 
     ctx.registerTool('get_component_tree', {
       description:
-        'Get the React component tree of the running app. Use structureOnly=true for a compact view (~1-3KB).',
+        'Get a paged flat React component tree. Follow nextCursor to complete the snapshot and check traversal.complete before treating an empty page as authoritative.',
       annotations: { readOnlyHint: true },
       appUri: 'ui://metro/components',
       parameters: z.object({
-        structureOnly: z.boolean().default(false).describe('Return only component names without props/state'),
-        maxDepth: z.number().default(30).describe('Maximum depth to traverse'),
-        compact: z.boolean().default(false).describe('Return compact single-line format'),
+        structureOnly: z
+          .boolean()
+          .default(false)
+          .describe('Return component names and selectors without props'),
+        pageSize: z
+          .number()
+          .int()
+          .min(1)
+          .max(250)
+          .default(100)
+          .describe('Nodes per page (default 100, maximum 250)'),
+        cursor: z
+          .string()
+          .optional()
+          .describe('Opaque nextCursor returned by the previous page'),
+        ...traversalParameters,
       }),
-      handler: async ({ structureOnly, maxDepth, compact: isCompact }) => {
-        const options = JSON.stringify({ structureOnly, maxDepth, includeTestIds: true });
-        const expr = WALK_FIBER_EXPR.replace('__OPTIONS__', options);
-        const tree = await ctx.evalInApp(expr, { timeout: 5000 });
-        if (!tree) return 'Component tree not available. Ensure React DevTools hook is present.';
-        if (isCompact) return ctx.format.compact(tree);
-        return tree;
+      handler: async ({
+        structureOnly,
+        pageSize,
+        cursor,
+        maxDepth,
+        maxNodes,
+      }) => {
+        if (cursor) return snapshots.read(cursor, pageSize);
+
+        const expression = buildFiberReadExpression(
+          `
+            var nodes = [];
+            var nextId = 1;
+            var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber, context) {
+              var name = metroFiberName(fiber);
+              if (!name) return;
+              var props = fiber.memoizedProps || {};
+              var id = 'fiber-' + nextId++;
+              var node = {
+                id: id,
+                parentId: context.parentContext || null,
+                depth: context.depth,
+                name: name
+              };
+              if (!${structureOnly}) {
+                var safeProps = metroSafeProps(fiber, 20);
+                if (Object.keys(safeProps).length) node.props = safeProps;
+              }
+              if (typeof props.testID === 'string') node.testID = props.testID;
+              if (typeof props.accessibilityLabel === 'string') {
+                node.accessibilityLabel = props.accessibilityLabel;
+              }
+              if (typeof props.accessibilityRole === 'string') {
+                node.accessibilityRole = props.accessibilityRole;
+              }
+              nodes.push(node);
+              return { childContext: id };
+            });
+            return { nodes: nodes, traversal: traversal };
+          `,
+          { maxDepth, maxNodes },
+        );
+        const result = (await ctx.evalInApp(expression, {
+          timeout: 10_000,
+        })) as RuntimeTreeResult | null;
+        if (!result) {
+          return snapshots.create(
+            [],
+            {
+              scope: 'all-scenes',
+              complete: false,
+              depthReached: 0,
+              scannedNodes: 0,
+              truncationReason: 'fiber-roots-unavailable',
+            },
+            pageSize,
+          );
+        }
+        return snapshots.create(result.nodes, result.traversal, pageSize);
       },
     });
 
     ctx.registerTool('find_components', {
-      description: 'Search for components by name pattern in the React tree.',
+      description:
+        'Search for components by name inside the app runtime. Check traversal.complete before treating no matches as definitive.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
-        pattern: z.string().describe('Component name or pattern to search for'),
-        includeProps: z.boolean().default(true).describe('Include component props in results'),
+        pattern: z.string().describe('Case-insensitive component name pattern'),
+        includeProps: z
+          .boolean()
+          .default(true)
+          .describe('Include component props in matches'),
+        ...traversalParameters,
       }),
-      handler: async ({ pattern, includeProps }) => {
-        const options = JSON.stringify({
-          structureOnly: !includeProps,
-          maxDepth: 50,
-          includeTestIds: true,
-        });
-        const expr = WALK_FIBER_EXPR.replace('__OPTIONS__', options);
-        const tree = await ctx.evalInApp(expr, { timeout: 5000 });
-        if (!tree) return 'Component tree not available.';
-
-        const matches: unknown[] = [];
-        const regex = new RegExp(pattern, 'i');
-
-        function search(node: Record<string, unknown>) {
-          if (typeof node.name === 'string' && regex.test(node.name)) {
-            matches.push(node);
-          }
-          if (Array.isArray(node.children)) {
-            for (const child of node.children) {
-              search(child as Record<string, unknown>);
-            }
-          }
-        }
-
-        search(tree as Record<string, unknown>);
-        return matches.length > 0
-          ? matches
-          : `No components matching "${pattern}" found.`;
+      handler: async ({ pattern, includeProps, maxDepth, maxNodes }) => {
+        // Validate here for a concise tool error; matching itself stays in-app.
+        new RegExp(pattern, 'i');
+        const expression = buildFiberReadExpression(
+          `
+            var matches = [];
+            var matcher = new RegExp(${JSON.stringify(pattern)}, 'i');
+            var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber, context) {
+              var name = metroFiberName(fiber);
+              if (!name || !matcher.test(name)) return;
+              var props = fiber.memoizedProps || {};
+              var match = { name: name, depth: context.depth };
+              if (${includeProps}) match.props = metroSafeProps(fiber, 20);
+              if (typeof props.testID === 'string') match.testID = props.testID;
+              if (typeof props.accessibilityLabel === 'string') {
+                match.accessibilityLabel = props.accessibilityLabel;
+              }
+              if (typeof props.accessibilityRole === 'string') {
+                match.accessibilityRole = props.accessibilityRole;
+              }
+              matches.push(match);
+            });
+            return { matches: matches, traversal: traversal };
+          `,
+          { maxDepth, maxNodes },
+        );
+        return ctx.evalInApp(expression, { timeout: 10_000 });
       },
     });
 
     ctx.registerTool('inspect_component', {
-      description: 'Get detailed props, state, and hooks info for a specific component.',
+      description:
+        'Get props, state, and hooks for the first exact component-name match, with traversal completeness metadata.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
         name: z.string().describe('Exact component name to inspect'),
+        ...traversalParameters,
       }),
-      handler: async ({ name }) => {
-        const expr = `
-          (function() {
-            var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-            if (!hook || !hook.getFiberRoots) return null;
-
-            var fiberRoots;
-            for (var i = 1; i <= 5; i++) {
-              fiberRoots = hook.getFiberRoots(i);
-              if (fiberRoots && fiberRoots.size > 0) break;
-            }
-            if (!fiberRoots || fiberRoots.size === 0) return null;
-
-            var rootFiber = Array.from(fiberRoots)[0].current;
-            var target = null;
-
-            function find(fiber) {
-              if (!fiber) return;
-              var n = fiber.type?.displayName || fiber.type?.name;
-              if (n === '${escapeJsString(name)}') { target = fiber; return; }
-              find(fiber.child);
-              if (!target) find(fiber.sibling);
-            }
-            find(rootFiber);
-
-            if (!target) return null;
-
-            var result = {
-              name: '${name}',
-              props: {},
-              state: null,
-              hooks: [],
-            };
-
-            // Props
-            if (target.memoizedProps) {
-              var pkeys = Object.keys(target.memoizedProps);
-              for (var i = 0; i < pkeys.length; i++) {
-                var k = pkeys[i];
-                var v = target.memoizedProps[k];
-                if (typeof v === 'function') result.props[k] = '[function]';
-                else if (typeof v === 'object' && v !== null) {
-                  try { result.props[k] = JSON.parse(JSON.stringify(v)); }
-                  catch(e) { result.props[k] = '[object]'; }
-                }
-                else result.props[k] = v;
-              }
-            }
-
-            // State (hooks)
-            var hookState = target.memoizedState;
-            var hookIdx = 0;
-            while (hookState && hookIdx < 20) {
-              try {
-                var val = hookState.memoizedState;
-                if (val !== undefined) {
-                  if (typeof val === 'function') result.hooks.push({ index: hookIdx, value: '[function]' });
-                  else if (typeof val === 'object' && val !== null) {
-                    try { result.hooks.push({ index: hookIdx, value: JSON.parse(JSON.stringify(val)) }); }
-                    catch(e) { result.hooks.push({ index: hookIdx, value: '[object]' }); }
+      handler: async ({ name, maxDepth, maxNodes }) => {
+        const expression = buildFiberReadExpression(
+          `
+            var result = null;
+            var targetName = ${JSON.stringify(name)};
+            var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber, context) {
+              if (result || metroFiberName(fiber) !== targetName) return;
+              var hooks = [];
+              var hookState = fiber.memoizedState;
+              var hookIndex = 0;
+              while (hookState && hookIndex < 20) {
+                try {
+                  var value = hookState.memoizedState;
+                  if (value !== undefined) {
+                    if (typeof value === 'function') value = '[function]';
+                    else if (value && typeof value === 'object') {
+                      try { value = JSON.parse(JSON.stringify(value)); }
+                      catch (_) { value = '[object]'; }
+                    }
+                    hooks.push({ index: hookIndex, value: value });
                   }
-                  else result.hooks.push({ index: hookIdx, value: val });
-                }
-              } catch(e) {}
-              hookState = hookState.next;
-              hookIdx++;
-            }
-
-            return result;
-          })()
-        `;
-        const result = await ctx.evalInApp(expr, { timeout: 5000 });
-        if (!result) return `Component "${name}" not found in the tree.`;
-        return result;
+                } catch (_) {}
+                hookState = hookState.next;
+                hookIndex++;
+              }
+              result = {
+                name: targetName,
+                depth: context.depth,
+                props: metroSafeProps(fiber, 50),
+                state: null,
+                hooks: hooks
+              };
+            });
+            return { result: result, traversal: traversal };
+          `,
+          { maxDepth, maxNodes },
+        );
+        return ctx.evalInApp(expression, { timeout: 10_000 });
       },
     });
 
     ctx.registerTool('get_testable_elements', {
       description:
-        'Get all elements with testID or accessibilityLabel — useful for test generation.',
+        'Get elements with testID or accessibilityLabel. Check traversal.complete before treating an empty elements array as definitive.',
       annotations: { readOnlyHint: true },
-      parameters: z.object({}),
-      handler: async () => {
-        const options = JSON.stringify({
-          structureOnly: true,
-          maxDepth: 50,
-          includeTestIds: true,
-        });
-        const expr = WALK_FIBER_EXPR.replace('__OPTIONS__', options);
-        const tree = await ctx.evalInApp(expr, { timeout: 5000 });
-        if (!tree) return 'Component tree not available.';
-
-        const elements: Array<{ name: string; testID?: string; accessibilityLabel?: string; accessibilityRole?: string }> = [];
-
-        function collect(node: Record<string, unknown>) {
-          if (node.testID || node.accessibilityLabel) {
-            elements.push({
-              name: node.name as string,
-              testID: node.testID as string | undefined,
-              accessibilityLabel: node.accessibilityLabel as string | undefined,
-              accessibilityRole: node.accessibilityRole as string | undefined,
+      parameters: z.object({ ...traversalParameters }),
+      handler: async ({ maxDepth, maxNodes }) => {
+        const expression = buildFiberReadExpression(
+          `
+            var elements = [];
+            var seen = new Set();
+            var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber, context) {
+              var element = metroElementFromFiber(fiber);
+              if (!element || (!element.testID && !element.accessibilityLabel)) return;
+              var key = element.testID || element.accessibilityLabel;
+              if (seen.has(key)) return;
+              seen.add(key);
+              element.depth = context.depth;
+              elements.push(element);
             });
-          }
-          if (Array.isArray(node.children)) {
-            for (const child of node.children) {
-              collect(child as Record<string, unknown>);
-            }
-          }
-        }
-
-        collect(tree as Record<string, unknown>);
-        return elements.length > 0
-          ? elements
-          : 'No elements with testID or accessibilityLabel found.';
+            return { elements: elements, traversal: traversal };
+          `,
+          { maxDepth, maxNodes },
+        );
+        return ctx.evalInApp(expression, { timeout: 10_000 });
       },
     });
   },
