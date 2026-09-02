@@ -142,6 +142,9 @@ describe('take_screenshot', () => {
     const path = (result as { structuredContent: { path: string } })
       .structuredContent.path;
     expect(path.startsWith(tmpdir())).toBe(true);
+    if (process.getuid) {
+      expect(dirname(path).endsWith(`-${process.getuid()}`)).toBe(true);
+    }
     expect(existsSync(path)).toBe(true);
     expect(await readFile(path)).toEqual(Buffer.from(png));
     expect((await stat(path)).mode & 0o777).toBe(0o600);

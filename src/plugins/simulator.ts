@@ -18,7 +18,10 @@ import { definePlugin } from '../plugin.js';
 const SCREENSHOT_PREFIX = 'metro-mcp-screenshot-';
 const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SCREENSHOT_FILE_PATTERN = /^metro-mcp-screenshot-[a-zA-Z0-9-]+\.png$/;
-const SCREENSHOT_DIRECTORY = join(tmpdir(), 'metro-mcp-screenshots');
+const SCREENSHOT_DIRECTORY = join(
+  tmpdir(),
+  `metro-mcp-screenshots-${process.getuid?.() ?? 'user'}`,
+);
 
 export function quoteShellArgument(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
