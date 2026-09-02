@@ -1004,6 +1004,7 @@ export async function createMetroRuntime(
     clearReconnectStabilityTimer();
     process.off('SIGINT', handleSigint);
     process.off('SIGTERM', handleSigterm);
+    process.off('beforeExit', handleBeforeExit);
     process.off('exit', handleExit);
     const sessionsToClose = [...sessions];
     const stdioToClose = stdioHandle;
@@ -1035,13 +1036,23 @@ export async function createMetroRuntime(
   const handleSigterm = () => {
     void closeRuntime().finally(() => process.exit(0));
   };
+  const handleBeforeExit = () => {
+    void closeRuntime().catch((err) => {
+      logger.error('Runtime shutdown failed:', err);
+    });
+  };
   const handleExit = () => {
-    void closeRuntime();
+    // The exit event cannot await promises. Limit this fallback to synchronous
+    // cleanup; normal signals and beforeExit use the complete async path above.
+    eventsClient.disconnect();
+    cleanProxyLock();
+    cdpSession.disconnect();
   };
 
   // Clean up on shutdown
   process.on('SIGINT', handleSigint);
   process.on('SIGTERM', handleSigterm);
+  process.on('beforeExit', handleBeforeExit);
   process.on('exit', handleExit);
 
   // Try connecting to Metro (non-blocking — server works without connection).
