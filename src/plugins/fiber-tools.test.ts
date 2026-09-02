@@ -9,6 +9,7 @@ import { automationPlugin } from './automation.js';
 import { componentsPlugin } from './components.js';
 import { inspectPointPlugin } from './inspect-point.js';
 import { uiInteractPlugin } from './ui-interact.js';
+import { MAX_FIBER_PROP_BYTES } from '../utils/fiber.js';
 
 interface Fiber {
   type: string | { displayName: string } | null;
@@ -216,6 +217,49 @@ describe('fiber read tools', () => {
     expect(result.nodes[0].props.payload.items).toHaveLength(21);
     expect(result.nodes[0].props.payload.items.at(-1)).toBe('[truncated]');
     expect(JSON.stringify(result).length).toBeLessThan(25_000);
+  });
+
+  test('shares a UTF-8 prop-byte budget across the entire paged snapshot', async () => {
+    const sharedProps = Object.fromEntries(
+      Array.from({ length: 20 }, (_, index) => [
+        `value${index}`,
+        '😀'.repeat(1_000),
+      ]),
+    );
+    const root = append(
+      fiber('Root'),
+      ...Array.from({ length: 300 }, (_, index) => fiber(`Item${index}`, sharedProps)),
+    );
+    const call = await createHarness(runtimeFor([root]), [componentsPlugin]);
+    type Page = {
+      nodes: Array<{ props?: Record<string, unknown> }>;
+      nextCursor?: string;
+      traversal: Record<string, unknown>;
+    };
+    let page = (await call('get_component_tree', {
+      structureOnly: false,
+      pageSize: 100,
+    })) as Page;
+    const nodes = [...page.nodes];
+    while (page.nextCursor) {
+      page = (await call('get_component_tree', { cursor: page.nextCursor })) as Page;
+      nodes.push(...page.nodes);
+    }
+
+    const propBytes = nodes.reduce(
+      (total, node) => total + (node.props
+        ? Buffer.byteLength(JSON.stringify(node.props), 'utf8')
+        : 0),
+      0,
+    );
+    expect(nodes).toHaveLength(301);
+    expect(propBytes).toBeGreaterThan(0);
+    expect(propBytes).toBeLessThanOrEqual(MAX_FIBER_PROP_BYTES);
+    expect(page.traversal).toMatchObject({
+      complete: false,
+      scannedNodes: 301,
+      truncationReason: 'max-prop-bytes',
+    });
   });
 
   test('keeps distinct sibling controls that share a label', async () => {

@@ -64,6 +64,12 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 
 All component read tools return `traversal` metadata. Check `complete` before interpreting an empty result as “not found”; `depthReached`, `scannedNodes`, and `truncationReason` explain bounded results. Traversal defaults to `maxDepth=200` and `maxNodes=1200`, supports depths up to 600, and reports whether it inspected the `focused-scene` or `all-scenes`.
 
+Projected props share a 256 KiB UTF-8 JSON budget across each runtime capture,
+including all pages of a component-tree snapshot. Once it is exhausted, later
+props are omitted and `truncationReason` is `max-prop-bytes` (unless a traversal
+limit was already reached). Use `structureOnly=true` when only hierarchy and
+selectors are needed.
+
 ## Storage
 
 > No app changes needed.

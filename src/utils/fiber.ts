@@ -9,6 +9,7 @@ export const DEFAULT_FIBER_MAX_DEPTH = 200;
 export const MAX_FIBER_DEPTH = 600;
 export const DEFAULT_FIBER_MAX_NODES = 1200;
 export const MAX_FIBER_NODES = 5000;
+export const MAX_FIBER_PROP_BYTES = 256 * 1024;
 
 export interface FiberTraversalOptions {
   maxDepth?: number;
@@ -23,6 +24,7 @@ export interface FiberTraversalMetadata {
   truncationReason?:
     | 'max-depth'
     | 'max-nodes'
+    | 'max-prop-bytes'
     | 'fiber-roots-unavailable'
     | 'cursor-expired';
 }
@@ -60,13 +62,25 @@ export function normalizeFiberTraversalOptions(
  * navigation route can be resolved, leaving sibling overlays visible.
  */
 export const FIBER_WALKER_JS = `
+  var metroPropByteBudget = {
+    remaining: ${MAX_FIBER_PROP_BYTES},
+    traversal: null
+  };
+
+  function metroMarkPropsTruncated() {
+    var traversal = metroPropByteBudget.traversal;
+    if (!traversal) return;
+    traversal.complete = false;
+    if (!traversal.truncationReason) traversal.truncationReason = 'max-prop-bytes';
+  }
+
   function metroFiberName(fiber) {
     if (!fiber || !fiber.type) return null;
     if (typeof fiber.type === 'string') return fiber.type;
     return fiber.type.displayName || fiber.type.name || null;
   }
 
-  function metroFiberRoots() {
+  function metroFiberRoots(limit) {
     var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
     var entries = [];
     var seen = new Set();
@@ -78,12 +92,16 @@ export const FIBER_WALKER_JS = `
         var renderer = hook.renderers && hook.renderers.get
           ? hook.renderers.get(rendererId)
           : null;
-        Array.from(roots).forEach(function(root) {
+        var iterator = roots.values();
+        var nextRoot;
+        while (!(nextRoot = iterator.next()).done) {
+          var root = nextRoot.value;
           var fiber = root && root.current;
-          if (!fiber || seen.has(fiber)) return;
+          if (!fiber || seen.has(fiber)) continue;
           seen.add(fiber);
           entries.push({ fiber: fiber, renderer: renderer, rendererId: rendererId });
-        });
+          if (entries.length >= limit) return entries;
+        }
       } catch (_) {}
     }
     return entries;
@@ -163,6 +181,10 @@ export const FIBER_WALKER_JS = `
     var source = fiber && fiber.memoizedProps;
     var result = {};
     if (!source || typeof source !== 'object') return result;
+    if (metroPropByteBudget.remaining <= 0) {
+      metroMarkPropsTruncated();
+      return result;
+    }
     var budget = { remaining: 100 };
     var seen = [];
 
@@ -225,6 +247,30 @@ export const FIBER_WALKER_JS = `
       try { result[safeKey] = safeValue(source[key], 0); }
       catch (_) { result[safeKey] = '[unavailable]'; }
     }
+    if (!Object.keys(result).length) return result;
+
+    var json = JSON.stringify(result);
+    var bytes = 0;
+    for (var byteIndex = 0; byteIndex < json.length; byteIndex++) {
+      var code = json.charCodeAt(byteIndex);
+      if (code <= 0x7f) bytes++;
+      else if (code <= 0x7ff) bytes += 2;
+      else if (
+        code >= 0xd800 && code <= 0xdbff &&
+        byteIndex + 1 < json.length &&
+        json.charCodeAt(byteIndex + 1) >= 0xdc00 &&
+        json.charCodeAt(byteIndex + 1) <= 0xdfff
+      ) {
+        bytes += 4;
+        byteIndex++;
+      } else bytes += 3;
+    }
+    if (bytes > metroPropByteBudget.remaining) {
+      metroPropByteBudget.remaining = 0;
+      metroMarkPropsTruncated();
+      return {};
+    }
+    metroPropByteBudget.remaining -= bytes;
     return result;
   }
 
@@ -278,7 +324,6 @@ export const FIBER_WALKER_JS = `
   }
 
   function metroWalkFibers(options, visitor) {
-    var roots = metroFiberRoots();
     var requestedDepth = Number(options.maxDepth);
     var requestedNodes = Number(options.maxNodes);
     var maxDepth = Math.min(600, Math.max(
@@ -289,12 +334,14 @@ export const FIBER_WALKER_JS = `
       1,
       Number.isFinite(requestedNodes) ? requestedNodes : 1200
     ));
+    var roots = metroFiberRoots(maxNodes + 1);
     var state = {
       scope: 'all-scenes',
       complete: roots.length > 0,
       depthReached: 0,
       scannedNodes: 0
     };
+    metroPropByteBudget.traversal = state;
     if (!roots.length) {
       state.complete = false;
       state.truncationReason = 'fiber-roots-unavailable';
@@ -309,7 +356,8 @@ export const FIBER_WALKER_JS = `
         rendererId: roots[rootIndex].rendererId,
         rootIndex: rootIndex,
         depth: 0,
-        parentIndex: null
+        parentIndex: null,
+        includeSiblings: false
       });
     }
 
@@ -334,6 +382,18 @@ export const FIBER_WALKER_JS = `
       state.depthReached = Math.max(state.depthReached, entry.depth);
       var entryIndex = entries.length;
       entries.push(entry);
+      var sibling = entry.includeSiblings ? fiber.sibling : null;
+      if (sibling) {
+        stack.push({
+          fiber: sibling,
+          renderer: entry.renderer,
+          rendererId: entry.rendererId,
+          rootIndex: entry.rootIndex,
+          depth: entry.depth,
+          parentIndex: entry.parentIndex,
+          includeSiblings: true
+        });
+      }
       if (!navigationState) {
         navigationState = metroNavigationStateFromFiber(fiber);
       }
@@ -349,17 +409,16 @@ export const FIBER_WALKER_JS = `
           collectionFocus.names.indexOf(entryRoute.name) === -1)
       );
       if (!pruneInactiveScene) {
-        var children = [];
         var child = fiber.child;
-        while (child) { children.push(child); child = child.sibling; }
-        for (var index = children.length - 1; index >= 0; index--) {
+        if (child) {
           stack.push({
-            fiber: children[index],
+            fiber: child,
             renderer: entry.renderer,
             rendererId: entry.rendererId,
             rootIndex: entry.rootIndex,
             depth: entry.depth + 1,
-            parentIndex: entryIndex
+            parentIndex: entryIndex,
+            includeSiblings: true
           });
         }
       }

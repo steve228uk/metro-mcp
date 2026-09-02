@@ -145,6 +145,36 @@ describe('shared fiber walker', () => {
     });
   });
 
+  test('enumerates wide sibling lists only as their nodes are scanned', async () => {
+    let siblingReads = 0;
+    function child(index: number): Fiber {
+      const item = fiber(`Child${index}`);
+      Object.defineProperty(item, 'sibling', {
+        get: () => {
+          siblingReads++;
+          if (siblingReads > 4) throw new Error('Exceeded sibling-read budget');
+          return child(index + 1);
+        },
+      });
+      return item;
+    }
+    const root = fiber('Root');
+    root.child = child(0);
+
+    const result = await evaluate<{
+      names: string[];
+      traversal: Record<string, unknown>;
+    }>(collectExpression({ maxNodes: 5 }), sandbox([root]));
+
+    expect(result.names).toEqual(['Root', 'Child0', 'Child1', 'Child2', 'Child3']);
+    expect(siblingReads).toBe(4);
+    expect(result.traversal).toMatchObject({
+      complete: false,
+      scannedNodes: 5,
+      truncationReason: 'max-nodes',
+    });
+  });
+
   test('does not perform an unreported focus-discovery prepass', async () => {
     const root = fiber('Root');
     const child = fiber('Child');
