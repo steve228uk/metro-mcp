@@ -21,3 +21,11 @@ test('serializes ordinary plugin results as text', () => {
     content: [{ type: 'text', text: '{"ok":true}' }],
   });
 });
+
+test('serializes content-shaped objects that are not valid MCP results', () => {
+  const result = { content: [{ type: 'custom', value: 42 }] };
+
+  expect(normalizeToolResult(result)).toEqual({
+    content: [{ type: 'text', text: JSON.stringify(result) }],
+  });
+});

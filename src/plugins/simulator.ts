@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { readdir, readFile, stat, unlink } from 'node:fs/promises';
+import { chmod, mkdir, readdir, readFile, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
@@ -8,15 +8,22 @@ import { definePlugin } from '../plugin.js';
 const SCREENSHOT_PREFIX = 'metro-mcp-screenshot-';
 const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const SCREENSHOT_FILE_PATTERN = /^metro-mcp-screenshot-[a-zA-Z0-9-]+\.png$/;
+const SCREENSHOT_DIRECTORY = join(tmpdir(), 'metro-mcp-screenshots');
+
+async function prepareScreenshotDirectory(): Promise<void> {
+  await mkdir(SCREENSHOT_DIRECTORY, { recursive: true, mode: 0o700 });
+  // mkdir's mode is affected by the umask and does not repair an existing directory.
+  await chmod(SCREENSHOT_DIRECTORY, 0o700);
+}
 
 async function cleanupOldScreenshots(now = Date.now()): Promise<void> {
   try {
-    const files = await readdir(tmpdir());
+    const files = await readdir(SCREENSHOT_DIRECTORY);
     await Promise.all(
       files
         .filter((file) => SCREENSHOT_FILE_PATTERN.test(file))
         .map(async (file) => {
-          const path = join(tmpdir(), file);
+          const path = join(SCREENSHOT_DIRECTORY, file);
           try {
             const metadata = await stat(path);
             if (metadata.isFile() && now - metadata.mtimeMs > SCREENSHOT_MAX_AGE_MS) {
@@ -52,7 +59,7 @@ export const simulatorPlugin = definePlugin({
 
     ctx.registerTool('take_screenshot', {
       description: 'Capture a screenshot from the connected iOS simulator or Android device.',
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { openWorldHint: true },
       parameters: z.object({
         platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
         delivery: z
@@ -64,8 +71,12 @@ export const simulatorPlugin = definePlugin({
         const p = platform === 'auto' ? await detectPlatform() : platform;
         if (!p) return 'No simulator/emulator detected.';
 
+        await prepareScreenshotDirectory();
         await cleanupOldScreenshots();
-        const tmpFile = join(tmpdir(), `${SCREENSHOT_PREFIX}${randomUUID()}.png`);
+        const tmpFile = join(
+          SCREENSHOT_DIRECTORY,
+          `${SCREENSHOT_PREFIX}${randomUUID()}.png`,
+        );
 
         try {
           if (p === 'ios') {
@@ -74,6 +85,7 @@ export const simulatorPlugin = definePlugin({
             await ctx.exec(`adb exec-out screencap -p > "${tmpFile}"`);
           }
 
+          await chmod(tmpFile, 0o600);
           const metadata = await stat(tmpFile);
           if (!metadata.isFile()) {
             throw new Error('capture did not produce a regular file');

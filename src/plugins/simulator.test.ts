@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { readFile, unlink, utimes, writeFile } from 'node:fs/promises';
+import { readFile, stat, unlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { z } from 'zod';
 import type {
   ComponentNode,
@@ -15,6 +15,7 @@ import { simulatorPlugin } from './simulator.js';
 type RegisteredTool = {
   parameters: z.ZodType;
   handler: (args: Record<string, unknown>) => Promise<ToolHandlerResult>;
+  annotations?: { readOnlyHint?: boolean; openWorldHint?: boolean };
 };
 
 const createdFiles = new Set<string>();
@@ -35,6 +36,7 @@ async function createSimulatorHarness(
     tools.set(name, {
       parameters: config.parameters,
       handler: config.handler as RegisteredTool['handler'],
+      annotations: config.annotations,
     });
   };
   const writeCapture = options.writeCapture ?? true;
@@ -119,6 +121,9 @@ describe('take_screenshot', () => {
     expect(path.startsWith(tmpdir())).toBe(true);
     expect(existsSync(path)).toBe(true);
     expect(await readFile(path)).toEqual(Buffer.from(png));
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect((await stat(dirname(path))).mode & 0o777).toBe(0o700);
+    expect(tool.annotations).toEqual({ openWorldHint: true });
   });
 
   test('returns a native inline image and deletes the capture file', async () => {
@@ -175,8 +180,13 @@ describe('take_screenshot', () => {
   });
 
   test('removes only old Metro MCP screenshot files opportunistically', async () => {
+    const tool = await createSimulatorHarness();
+    const first = await capture(tool, { platform: 'ios' });
+    const screenshotDirectory = dirname(
+      (first as { structuredContent: { path: string } }).structuredContent.path,
+    );
     const oldPath = join(
-      tmpdir(),
+      screenshotDirectory,
       `metro-mcp-screenshot-${randomUUID()}.png`,
     );
     createdFiles.add(oldPath);
@@ -184,7 +194,6 @@ describe('take_screenshot', () => {
     const oldDate = new Date(Date.now() - 25 * 60 * 60 * 1000);
     await utimes(oldPath, oldDate, oldDate);
 
-    const tool = await createSimulatorHarness();
     await capture(tool, { platform: 'ios' });
 
     expect(existsSync(oldPath)).toBe(false);
