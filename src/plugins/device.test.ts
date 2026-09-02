@@ -7,8 +7,8 @@ describe('describeMetroTarget', () => {
       describeMetroTarget({
         id: 'page-1',
         appId: 'com.example.app',
-        title: 'My App',
-        description: '',
+        title: 'Hermes React Native',
+        description: 'React Native instance',
         type: 'node',
         deviceName: 'iPhone 17',
         webSocketDebuggerUrl: 'ws://127.0.0.1:8081/debug?page=1',
