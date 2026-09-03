@@ -361,6 +361,27 @@ export const uiInteractPlugin = definePlugin({
               if (handled || metroFiberName(fiber) !== 'TextInput') return;
               var props = fiber.memoizedProps || {};
               if (typeof props[${JSON.stringify(handler)}] !== 'function') return;
+              var current = fiber;
+              var focused = false;
+              var inspected = 0;
+              while (current && inspected++ < 32) {
+                var node = current.stateNode;
+                var instance = node && node.canonical && node.canonical.publicInstance ||
+                               node && node.publicInstance ||
+                               node && node.__internalInstanceHandle &&
+                                 node.__internalInstanceHandle.stateNode &&
+                                 node.__internalInstanceHandle.stateNode.canonical &&
+                                 node.__internalInstanceHandle.stateNode.canonical.publicInstance ||
+                               node;
+                try {
+                  if (instance && typeof instance.isFocused === 'function' && instance.isFocused() === true) {
+                    focused = true;
+                    break;
+                  }
+                } catch (e) {}
+                current = current.child;
+              }
+              if (!focused) return;
               if (${JSON.stringify(button)} === 'ENTER') {
                 props.onSubmitEditing({ nativeEvent: { text: props.value || '' } });
               } else {

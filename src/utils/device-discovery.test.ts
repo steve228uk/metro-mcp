@@ -20,6 +20,7 @@ function runnerFor(options: {
   iosFailure?: boolean;
   iosUnavailable?: boolean;
   androidFailure?: boolean;
+  androidUnavailable?: boolean;
 }): DeviceDiscoveryRunner & { calls: string[][] } {
   const ios = [...(options.ios ?? [iosInventory([
     { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
@@ -36,6 +37,9 @@ function runnerFor(options: {
         if (options.iosFailure) throw new Error('simctl unavailable');
         const output = ios.shift() ?? ios.at(-1) ?? iosInventory([]);
         return Buffer.from(output);
+      }
+      if (options.androidUnavailable) {
+        throw Object.assign(new Error('spawn adb ENOENT'), { code: 'ENOENT' });
       }
       if (options.androidFailure) throw new Error('adb unavailable');
       return Buffer.from(options.android ?? 'List of devices attached\n');
@@ -95,6 +99,29 @@ describe('device discovery', () => {
     await expect(resolveDevice(runner, 'auto', {
       reactNative: { logicalDeviceId: 'opaque-inspector-id' },
     })).resolves.toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
+  test('uses a unique iOS name when adb is unavailable for a connected target', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
+        { name: 'iPhone 17', udid: 'IOS-17', state: 'Booted' },
+      ])],
+      androidUnavailable: true,
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'iPhone 17',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'ios', id: 'IOS-17' });
+  });
+
+  test('uses the sole iOS simulator when adb is unavailable and Metro ID is opaque', async () => {
+    const runner = runnerFor({
+      androidUnavailable: true,
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'ios', id: 'IOS-16' });
   });
 
   test('does not treat a generic iOS inventory error as a missing executable', async () => {

@@ -9,11 +9,13 @@ type Tool = {
 };
 
 async function createAppOnlyHarness(
-  evaluation: 'success' | 'failure' | 'pre-dispatch' = 'success',
+  evaluation: 'success' | 'failure' | 'pre-dispatch' | 'unhandled' | 'fabric-focused' = 'success',
   nativeAvailable = false,
 ) {
   const tools = new Map<string, Tool>();
   let nativeCalls = 0;
+  const execFileCalls: Array<{ command: string; args: string[] }> = [];
+  const reactCalls: string[] = [];
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
@@ -38,6 +40,7 @@ async function createAppOnlyHarness(
     },
     execFile: async (command, args) => {
       nativeCalls++;
+      execFileCalls.push({ command, args });
       if (nativeAvailable && command === 'xcrun') {
         return Buffer.from(JSON.stringify({
           devices: {
@@ -81,10 +84,39 @@ async function createAppOnlyHarness(
       truncate: (value: string) => value, structureOnly: (value: ComponentNode) => value,
     },
     // A true result means the app-side handler was found and invoked.
-    evalInApp: async () => {
+    evalInApp: async (expression) => {
       if (evaluation === 'failure') throw new Error('CDP disconnected');
       if (evaluation === 'pre-dispatch') {
         throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+      }
+      if (evaluation === 'unhandled') return false;
+      if (evaluation === 'fabric-focused') {
+        const host = {
+          stateNode: { canonical: { publicInstance: { isFocused: () => true } } },
+          child: null,
+          sibling: null,
+        };
+        const textInput = {
+          type: { displayName: 'TextInput' },
+          memoizedProps: {
+            value: 'hello',
+            onSubmitEditing: () => reactCalls.push('submit'),
+            onChangeText: () => reactCalls.push('change'),
+          },
+          stateNode: null,
+          child: host,
+          sibling: null,
+        };
+        const rootFiber = { type: 'Root', child: textInput, sibling: null };
+        const previousHook = (globalThis as Record<string, unknown>).__REACT_DEVTOOLS_GLOBAL_HOOK__;
+        (globalThis as Record<string, unknown>).__REACT_DEVTOOLS_GLOBAL_HOOK__ = {
+          getFiberRoots: () => new Set([{ current: rootFiber }]),
+        };
+        try {
+          return Function(`return (${expression});`)();
+        } finally {
+          (globalThis as Record<string, unknown>).__REACT_DEVTOOLS_GLOBAL_HOOK__ = previousHook;
+        }
       }
       return true;
     },
@@ -92,7 +124,7 @@ async function createAppOnlyHarness(
     notifyResourceUpdated: () => {},
   };
   await uiInteractPlugin.setup(ctx);
-  return { tools, getNativeCalls: () => nativeCalls };
+  return { tools, getNativeCalls: () => nativeCalls, execFileCalls, reactCalls };
 }
 
 describe('UI handler actions without native inventory', () => {
@@ -129,6 +161,28 @@ describe('UI handler actions without native inventory', () => {
         .toBe(`Pressed ${button}`);
     }
     expect(harness.getNativeCalls()).toBe(0);
+  });
+
+  test('invokes focused Fabric TextInput key handlers without native inventory', async () => {
+    const harness = await createAppOnlyHarness('fabric-focused');
+    const press = harness.tools.get('press_button')!;
+    for (const button of ['ENTER', 'DELETE'] as const) {
+      expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
+        .toBe(`Pressed ${button}`);
+    }
+    expect(harness.reactCalls).toEqual(['submit', 'change']);
+    expect(harness.getNativeCalls()).toBe(0);
+  });
+
+  test('uses the verified Android serial when no focused app handler accepts a key', async () => {
+    const harness = await createAppOnlyHarness('unhandled', true);
+    const press = harness.tools.get('press_button')!;
+    const result = await press.handler(press.parameters.parse({ button: 'ENTER', platform: 'android' }) as Record<string, unknown>);
+    expect(result).toContain('status=handled');
+    expect(harness.execFileCalls).toContainEqual({
+      command: 'adb',
+      args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '66'],
+    });
   });
 
   test('does not replay a possibly dispatched action after a CDP rejection', async () => {
