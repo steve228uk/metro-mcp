@@ -202,7 +202,10 @@ export async function awaitAppResult(
       );
     } else {
       sourceCompletedByValue = true;
-      await completeByValue(evaluate, key, completion.value, { deadline, timeout });
+      // The source has already executed. A transport failure while writing its
+      // completion is safe to retry through the mailbox evaluator, which owns
+      // reconnect policy and never replays the caller's source.
+      await completeByValue(pollEvaluate, key, completion.value, { deadline, timeout });
     }
 
     while (Date.now() < deadline) {
