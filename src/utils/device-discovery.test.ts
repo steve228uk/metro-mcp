@@ -82,6 +82,20 @@ describe('device discovery', () => {
     expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
   });
 
+  test('checks exact target IDs before a colliding iOS device name', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'Pixel_8', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    const device = await resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel_8',
+      reactNative: { logicalDeviceId: 'emulator-42' },
+    });
+    expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
   test('does not choose the first Android device when target identity is absent', async () => {
     const runner = runnerFor({
       ios: [iosInventory([])],
@@ -150,6 +164,40 @@ describe('device discovery', () => {
     expect(await resolveDevice(runner, 'ios')).toBeNull();
     expect(await resolveDevice(runner, 'ios')).toMatchObject({ id: 'IOS-16' });
     expect(runner.calls).toHaveLength(2);
+  });
+
+  test('matches ADB model underscores to Metro names containing spaces', async () => {
+    for (const platform of ['auto', 'android'] as const) {
+      const runner = runnerFor({
+        android: 'List of devices attached\none\tdevice model:Pixel_8\ntwo\tdevice model:Pixel_9_Pro\n',
+      });
+      expect(await resolveDevice(runner, platform, {
+        deviceName: 'Pixel 9 Pro', reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+      })).toMatchObject({ platform: 'android', id: 'two' });
+      const duplicates = runnerFor({
+        android: 'List of devices attached\none\tdevice model:Pixel_8\ntwo\tdevice model:Pixel_8\n',
+      });
+      await expect(resolveDevice(duplicates, platform, { deviceName: 'Pixel 8' }))
+        .rejects.toThrow('Ambiguous Android devices named');
+    }
+  });
+
+  test('matches the full ADB model sanitization while keeping collisions ambiguous', async () => {
+    for (const [name, model] of [['SM-G991B', 'SM_G991B'], ['Pixel (Pro)', 'Pixel__Pro_'], ['Téléphone', 'T__l__phone']]) {
+      for (const platform of ['auto', 'android'] as const) {
+        const runner = runnerFor({
+          android: `List of devices attached\none\tdevice model:Other\ntwo\tdevice model:${model}\n`,
+        });
+        expect(await resolveDevice(runner, platform, {
+          deviceName: name, reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+        })).toMatchObject({ platform: 'android', id: 'two' });
+      }
+    }
+    const collision = runnerFor({
+      android: 'List of devices attached\none\tdevice model:SM_G991B\ntwo\tdevice model:SM_G991B\n',
+    });
+    await expect(resolveDevice(collision, 'android', { deviceName: 'SM-G991B' }))
+      .rejects.toThrow('Ambiguous Android devices named');
   });
 
   test('excludes an unavailable booted entry and supports explicit platform selection', async () => {
