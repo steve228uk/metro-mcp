@@ -144,9 +144,9 @@ const START_RECORDING_JS = `
       var originalBegin = obj.onScrollBeginDrag;
       var originalEnd = obj.onScrollEndDrag;
       var originalMomentumEnd = obj.onMomentumScrollEnd;
-      // A forwarded begin handler can already belong to a previous props
-      // object. Keep its mutable gesture state with the wrapper so the end
-      // callbacks created for this props object observe the same coordinates.
+      // A forwarded scroll callback can already belong to a previous props
+      // object. Keep mutable gesture state with every wrapper so any existing
+      // begin, end, or momentum callback can share it with newly created peers.
       function existingScrollState(fn) {
         return fn && fn.__mcpRecSession === state.sessionId && fn.__mcpRecScrollState;
       }
