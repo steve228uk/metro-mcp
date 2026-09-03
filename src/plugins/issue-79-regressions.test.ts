@@ -104,6 +104,23 @@ describe('issue 79 device discovery regressions', () => {
     expect(harness.execFileCalls).toHaveLength(1);
   });
 
+  test('keeps the default auto filesystem fallback available without ADB', async () => {
+    const directories = {
+      documents: 'file:///data/user/0/com.example.app/files/',
+      cache: 'file:///data/user/0/com.example.app/cache/',
+      temp: 'file:///data/user/0/com.example.app/cache/',
+      library: null,
+    };
+    const harness = createContext({ inventory: 'missing', evaluate: directories });
+    await filesystemPlugin.setup(harness.ctx);
+    const tool = harness.tools.get('get_app_directories')!;
+
+    await expect(tool.handler(tool.parameters.parse({
+      bundleId: 'com.example.app',
+    }) as Record<string, unknown>)).resolves.toEqual(directories);
+    expect(harness.execCalls).toEqual([]);
+  });
+
   test('does not clear app data when Android inventory resolution fails', async () => {
     const harness = createContext({ inventory: 'missing', resetFailure: true });
     await permissionsPlugin.setup(harness.ctx);
