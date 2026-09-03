@@ -96,6 +96,52 @@ describe('device discovery', () => {
     expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
   });
 
+  test('reports ambiguity when an opaque target name matches both platforms', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'Pixel 8', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'opaque-metro-inspector-id' },
+    })).rejects.toThrow('Ambiguous connected device name "Pixel 8" across iOS and Android');
+  });
+
+  test('does not hide an ambiguous iOS name behind a unique Android name', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'Pixel 8', udid: 'IOS-16', state: 'Booted' },
+        { name: 'Pixel 8', udid: 'IOS-17', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'opaque-metro-inspector-id' },
+    })).rejects.toThrow('Ambiguous connected device name "Pixel 8" across iOS and Android');
+  });
+
+  test('keeps explicit platform selection independent of cross-platform names', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'Pixel 8', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    const target = {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'opaque-metro-inspector-id' },
+    };
+    expect(await resolveDevice(runner, 'ios', target)).toMatchObject({
+      platform: 'ios', id: 'IOS-16',
+    });
+    expect(await resolveDevice(runner, 'android', target)).toMatchObject({
+      platform: 'android', id: 'emulator-42',
+    });
+  });
+
   test('does not choose the first Android device when target identity is absent', async () => {
     const runner = runnerFor({
       ios: [iosInventory([])],

@@ -205,14 +205,44 @@ export async function resolveDevice(
   if (ios) return toResolvedIos(ios);
   if (android) return { platform: 'android', id: android.id, name: android.model };
 
-  if (iosResult.status === 'fulfilled') {
-    const iosMatch = findIosName(iosResult.value, connectedName);
-    if (iosMatch) return toResolvedIos(iosMatch);
+  // Resolve name evidence for both platforms before selecting either one.
+  // A Metro target's name is not platform-qualified, so selecting the first
+  // inventory to report a match can silently target an unrelated app when
+  // both runtimes use the same model name.
+  const iosNameMatches = iosResult.status === 'fulfilled'
+    ? findIosNames(iosResult.value, connectedName)
+    : [];
+  const authorizedAndroid = androidResult.status === 'fulfilled'
+    ? androidResult.value.filter((device) => device.status === 'device')
+    : [];
+  const androidNameMatches = connectedName
+    ? findAndroidNameMatches(authorizedAndroid, connectedName)
+    : [];
+  if (iosNameMatches.length > 0 && androidNameMatches.length > 0) {
+    throw new Error(
+      `Ambiguous connected device name "${connectedName}" across iOS and Android: ` +
+      `${iosNameMatches.map((device) => device.udid).join(', ')}, ` +
+      `${androidNameMatches.map((device) => device.id).join(', ')}.`,
+    );
   }
-  if (androidResult.status === 'fulfilled') {
-    const android = androidResult.value.filter((device) => device.status === 'device');
-    const match = findAndroidTarget(android, undefined, connectedName);
-    if (match) return { platform: 'android', id: match.id, name: match.model };
+  if (iosNameMatches.length > 1 || androidNameMatches.length > 1) {
+    // Do not let a unique name on the other platform hide an ambiguous
+    // same-name inventory. The name evidence cannot establish the platform.
+    if (iosNameMatches.length > 1) {
+      throw new Error(
+        `Ambiguous booted iOS simulators named "${connectedName}": ` +
+        `${iosNameMatches.map((device) => device.udid).join(', ')}.`,
+      );
+    }
+    throw new Error(
+      `Ambiguous Android devices named "${connectedName}": ` +
+      `${androidNameMatches.map((device) => device.id).join(', ')}.`,
+    );
+  }
+  if (iosNameMatches.length === 1) return toResolvedIos(iosNameMatches[0]);
+  if (androidNameMatches.length === 1) {
+    const match = androidNameMatches[0];
+    return { platform: 'android', id: match.id, name: match.model };
   }
   // A valid iOS inventory wins when both runtimes are present, matching the
   // historical auto-selection order while making ambiguity explicit.
@@ -244,15 +274,22 @@ function findAndroidTarget(
   const byId = connectedId ? devices.find((device) => device.id === connectedId) : undefined;
   if (byId) return byId;
   if (!connectedName) return undefined;
-  // ADB sanitizes every non-alphanumeric UTF-8 byte in its model field.
-  const modelName = Buffer.from(connectedName, 'utf8').toString('latin1').replace(/[^a-zA-Z0-9]/g, '_');
-  const matches = devices.filter((device) => device.model === modelName);
+  const matches = findAndroidNameMatches(devices, connectedName);
   if (matches.length > 1) {
     throw new Error(
       `Ambiguous Android devices named "${connectedName}": ${matches.map((device) => device.id).join(', ')}.`,
     );
   }
   return matches[0];
+}
+
+function findAndroidNameMatches(
+  devices: AndroidDevice[],
+  connectedName: string,
+): AndroidDevice[] {
+  // ADB sanitizes every non-alphanumeric UTF-8 byte in its model field.
+  const modelName = Buffer.from(connectedName, 'utf8').toString('latin1').replace(/[^a-zA-Z0-9]/g, '_');
+  return devices.filter((device) => device.model === modelName);
 }
 
 function resolveIosDevice(
@@ -290,10 +327,15 @@ function findIosName(
   devices: BootedSimulator[],
   connectedName?: string,
 ): BootedSimulator | undefined {
-  const byName = connectedName
-    ? devices.filter((device) => device.name === connectedName)
-    : [];
+  const byName = findIosNames(devices, connectedName);
   return byName.length === 1 ? byName[0] : undefined;
+}
+
+function findIosNames(
+  devices: BootedSimulator[],
+  connectedName?: string,
+): BootedSimulator[] {
+  return connectedName ? devices.filter((device) => device.name === connectedName) : [];
 }
 
 /** Convenience wrapper used by plugins that only need the selected platform. */
