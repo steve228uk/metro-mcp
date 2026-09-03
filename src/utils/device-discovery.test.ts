@@ -152,6 +152,22 @@ describe('device discovery', () => {
     expect(runner.calls).toHaveLength(2);
   });
 
+  test('matches ADB model underscores to Metro names containing spaces', async () => {
+    for (const platform of ['auto', 'android'] as const) {
+      const runner = runnerFor({
+        android: 'List of devices attached\none\tdevice model:Pixel_8\ntwo\tdevice model:Pixel_9_Pro\n',
+      });
+      expect(await resolveDevice(runner, platform, {
+        deviceName: 'Pixel 9 Pro', reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+      })).toMatchObject({ platform: 'android', id: 'two' });
+      const duplicates = runnerFor({
+        android: 'List of devices attached\none\tdevice model:Pixel_8\ntwo\tdevice model:Pixel_8\n',
+      });
+      await expect(resolveDevice(duplicates, platform, { deviceName: 'Pixel 8' }))
+        .rejects.toThrow('Ambiguous Android devices named');
+    }
+  });
+
   test('excludes an unavailable booted entry and supports explicit platform selection', async () => {
     const runner = runnerFor({
       ios: [iosInventory([
