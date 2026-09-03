@@ -42,6 +42,14 @@ const SCROLLABLE_PROPS_JS = `
   }
 `;
 
+const RECORDER_METADATA_JS = `
+  function hasMetadata(fn, tid, lbl) {
+    var metadata = fn && fn.__mcpRecMetadata;
+    return typeof fn === 'function' && fn.__mcpRecSession === state.sessionId &&
+      metadata && metadata.testID === tid && metadata.label === lbl;
+  }
+`;
+
 const START_RECORDING_JS = `
 (function() {
   var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
@@ -60,6 +68,7 @@ const START_RECORDING_JS = `
     capture: false,
     active: true,
     ready: false,
+    invocationDepth: 0,
     events: []
   };
   globalThis.__METRO_MCP_REC_STATE__ = state;
@@ -73,22 +82,36 @@ const START_RECORDING_JS = `
     return typeof fn === 'function' && fn.__mcpRecSession === state.sessionId;
   }
 
+  ${RECORDER_METADATA_JS}
+
   function record(event) {
     if (state.capture && globalThis.__METRO_MCP_REC_STATE__ === state)
       state.events.push(event);
   }
 
-  function wrap(obj, name, makeEvent) {
+  function invokeOriginal(original, receiver, args, makeEvent) {
+    var outermost = state.invocationDepth === 0;
+    state.invocationDepth++;
+    try {
+      if (outermost && state.capture && globalThis.__METRO_MCP_REC_STATE__ === state) {
+        try { record(makeEvent(args)); } catch (_) {}
+      }
+      return original.apply(receiver, args);
+    } finally {
+      state.invocationDepth--;
+    }
+  }
+
+  function wrap(obj, name, tid, lbl, makeEvent) {
     var original = obj[name];
-    if (typeof original !== 'function' || isWrapped(original)) return false;
+    if (typeof original !== 'function' || hasMetadata(original, tid, lbl)) return false;
     var wrapped = function() {
-      if (state.capture && globalThis.__METRO_MCP_REC_STATE__ === state)
-        record(makeEvent(arguments));
-      return original.apply(this, arguments);
+      return invokeOriginal(original, this, arguments, makeEvent);
     };
     try {
       Object.defineProperty(wrapped, '__mcpRecSession', { value: state.sessionId });
       Object.defineProperty(wrapped, '__mcpRecOriginal', { value: original });
+      Object.defineProperty(wrapped, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
       obj[name] = wrapped;
       return obj[name] === wrapped;
     } catch (_) {
@@ -103,16 +126,16 @@ const START_RECORDING_JS = `
     var tid = obj.testID || null;
     var lbl = obj.accessibilityLabel || obj['aria-label'] || null;
     var wrapped = false;
-    wrapped = wrap(obj, 'onPress', function() {
+    wrapped = wrap(obj, 'onPress', tid, lbl, function() {
       return { type: 'tap', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() };
     }) || wrapped;
-    wrapped = wrap(obj, 'onLongPress', function() {
+    wrapped = wrap(obj, 'onLongPress', tid, lbl, function() {
       return { type: 'long_press', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() };
     }) || wrapped;
-    wrapped = wrap(obj, 'onChangeText', function(args) {
+    wrapped = wrap(obj, 'onChangeText', tid, lbl, function(args) {
       return { type: 'type', testID: tid, label: lbl, text: args[0], route: getRoute(), timestamp: Date.now() };
     }) || wrapped;
-    wrapped = wrap(obj, 'onSubmitEditing', function() {
+    wrapped = wrap(obj, 'onSubmitEditing', tid, lbl, function() {
       return { type: 'submit', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() };
     }) || wrapped;
 
@@ -121,22 +144,29 @@ const START_RECORDING_JS = `
       var originalBegin = obj.onScrollBeginDrag;
       var originalEnd = obj.onScrollEndDrag;
       var originalMomentumEnd = obj.onMomentumScrollEnd;
-      if (!isWrapped(originalBegin)) {
+      if (!hasMetadata(originalBegin, tid, lbl)) {
         var begin = function(e) {
+          var outermost = state.invocationDepth === 0;
+          state.invocationDepth++;
           try {
-            scrollStart.x = e.nativeEvent.contentOffset.x;
-            scrollStart.y = e.nativeEvent.contentOffset.y;
-          } catch (_) { scrollStart.x = scrollStart.y = null; }
-          return originalBegin ? originalBegin.apply(this, arguments) : undefined;
+            if (outermost) {
+              try {
+                scrollStart.x = e.nativeEvent.contentOffset.x;
+                scrollStart.y = e.nativeEvent.contentOffset.y;
+              } catch (_) { scrollStart.x = scrollStart.y = null; }
+            }
+            return originalBegin ? originalBegin.apply(this, arguments) : undefined;
+          } finally { state.invocationDepth--; }
         };
         try {
           Object.defineProperty(begin, '__mcpRecSession', { value: state.sessionId });
+          Object.defineProperty(begin, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
           obj.onScrollBeginDrag = begin;
           wrapped = obj.onScrollBeginDrag === begin || wrapped;
         } catch (_) {}
       }
       function emitSwipe(e) {
-        if (scrollStart.x === null || !state.capture || globalThis.__METRO_MCP_REC_STATE__ !== state) return;
+        if (state.invocationDepth !== 1 || scrollStart.x === null || !state.capture || globalThis.__METRO_MCP_REC_STATE__ !== state) return;
         try {
           var dx = e.nativeEvent.contentOffset.x - scrollStart.x;
           var dy = e.nativeEvent.contentOffset.y - scrollStart.y;
@@ -151,18 +181,28 @@ const START_RECORDING_JS = `
         } catch (_) {}
         scrollStart.x = scrollStart.y = null;
       }
-      if (!isWrapped(originalEnd)) {
-        var end = function(e) { emitSwipe(e); return originalEnd ? originalEnd.apply(this, arguments) : undefined; };
+      if (!hasMetadata(originalEnd, tid, lbl)) {
+        var end = function(e) {
+          state.invocationDepth++;
+          try { emitSwipe(e); return originalEnd ? originalEnd.apply(this, arguments) : undefined; }
+          finally { state.invocationDepth--; }
+        };
         try {
           Object.defineProperty(end, '__mcpRecSession', { value: state.sessionId });
+          Object.defineProperty(end, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
           obj.onScrollEndDrag = end;
           wrapped = obj.onScrollEndDrag === end || wrapped;
         } catch (_) {}
       }
-      if (!isWrapped(originalMomentumEnd)) {
-        var momentum = function(e) { emitSwipe(e); return originalMomentumEnd ? originalMomentumEnd.apply(this, arguments) : undefined; };
+      if (!hasMetadata(originalMomentumEnd, tid, lbl)) {
+        var momentum = function(e) {
+          state.invocationDepth++;
+          try { emitSwipe(e); return originalMomentumEnd ? originalMomentumEnd.apply(this, arguments) : undefined; }
+          finally { state.invocationDepth--; }
+        };
         try {
           Object.defineProperty(momentum, '__mcpRecSession', { value: state.sessionId });
+          Object.defineProperty(momentum, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
           obj.onMomentumScrollEnd = momentum;
           wrapped = obj.onMomentumScrollEnd === momentum || wrapped;
         } catch (_) {}
@@ -235,7 +275,7 @@ const START_RECORDING_JS = `
     if (!props || typeof props !== 'object') return;
     var needsRefresh = false;
     for (var i = 0; i < HANDLERS.length; i++) {
-      if (typeof props[HANDLERS[i]] === 'function' && !isWrapped(props[HANDLERS[i]])) {
+      if (typeof props[HANDLERS[i]] === 'function' && !hasMetadata(props[HANDLERS[i]], props.testID || null, props.accessibilityLabel || props['aria-label'] || null)) {
         needsRefresh = true;
         break;
       }
@@ -277,6 +317,7 @@ const START_RECORDING_JS = `
 const RECORDING_READINESS_JS = buildFiberReadExpression(`
   var state = globalThis.__METRO_MCP_REC_STATE__;
   if (!state) return { ready: false, error: 'no-session' };
+  ${RECORDER_METADATA_JS}
   var handlers = ${JSON.stringify(RECORDING_HANDLERS)};
   var handlerCount = 0;
   var unwrapped = [];
@@ -288,14 +329,18 @@ const RECORDING_READINESS_JS = buildFiberReadExpression(`
       var name = handlers[index];
       if (typeof props[name] !== 'function') continue;
       handlerCount++;
-      if (props[name].__mcpRecSession !== state.sessionId)
+      var propTestID = props.testID || null;
+      var propLabel = props.accessibilityLabel || props['aria-label'] || null;
+      if (!hasMetadata(props[name], propTestID, propLabel))
         unwrapped.push(name);
     }
     if (isScrollable(props)) {
       var scrollHandlers = ['onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'];
       for (var scrollIndex = 0; scrollIndex < scrollHandlers.length; scrollIndex++) {
         var scrollName = scrollHandlers[scrollIndex];
-        if (typeof props[scrollName] !== 'function' || props[scrollName].__mcpRecSession !== state.sessionId)
+        var scrollTestID = props.testID || null;
+        var scrollLabel = props.accessibilityLabel || props['aria-label'] || null;
+        if (typeof props[scrollName] !== 'function' || !hasMetadata(props[scrollName], scrollTestID, scrollLabel))
           unwrapped.push(scrollName);
       }
     }
