@@ -216,6 +216,30 @@ describe('UI handler actions without native inventory', () => {
     }
   });
 
+  test('uses Android key events for uncontrolled Paper and Fabric inputs', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true);
+      const press = harness.tools.get('press_button')!;
+      for (const button of ['ENTER', 'DELETE'] as const) {
+        const result = await press.handler(press.parameters.parse({
+          button,
+          platform: 'android',
+        }) as Record<string, unknown>);
+        expect(result).toContain('backend=adb');
+        expect(result).toContain('status=handled');
+      }
+      expect(harness.reactCalls).toEqual([]);
+      expect(harness.execFileCalls).toContainEqual({
+        command: 'adb',
+        args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '66'],
+      });
+      expect(harness.execFileCalls).toContainEqual({
+        command: 'adb',
+        args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '67'],
+      });
+    }
+  });
+
   test('uses the verified Android serial when no focused app handler accepts a key', async () => {
     const harness = await createAppOnlyHarness('unhandled', true);
     const press = harness.tools.get('press_button')!;
