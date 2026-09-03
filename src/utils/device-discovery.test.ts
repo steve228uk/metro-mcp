@@ -168,6 +168,24 @@ describe('device discovery', () => {
     }
   });
 
+  test('matches the full ADB model sanitization while keeping collisions ambiguous', async () => {
+    for (const [name, model] of [['SM-G991B', 'SM_G991B'], ['Pixel (Pro)', 'Pixel__Pro_'], ['Téléphone', 'T__l__phone']]) {
+      for (const platform of ['auto', 'android'] as const) {
+        const runner = runnerFor({
+          android: `List of devices attached\none\tdevice model:Other\ntwo\tdevice model:${model}\n`,
+        });
+        expect(await resolveDevice(runner, platform, {
+          deviceName: name, reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+        })).toMatchObject({ platform: 'android', id: 'two' });
+      }
+    }
+    const collision = runnerFor({
+      android: 'List of devices attached\none\tdevice model:SM_G991B\ntwo\tdevice model:SM_G991B\n',
+    });
+    await expect(resolveDevice(collision, 'android', { deviceName: 'SM-G991B' }))
+      .rejects.toThrow('Ambiguous Android devices named');
+  });
+
   test('excludes an unavailable booted entry and supports explicit platform selection', async () => {
     const runner = runnerFor({
       ios: [iosInventory([
