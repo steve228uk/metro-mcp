@@ -149,7 +149,12 @@ All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB
 
 > No app changes needed.
 
-- **`audit_accessibility`** — Full screen audit for missing labels, roles, testIDs, alt text.
+- **`audit_accessibility`** — Audit the current screen for missing labels, roles, testIDs, and alt
+  text. Always returns `{ issues, summary, traversal }`, including clean results. `maxDepth`
+  defaults to 200 (maximum 600); `maxNodes` defaults to 1200 (maximum 5000). Check
+  `traversal.complete` before treating an empty issue list as a clean audit. Incomplete results
+  report their truncation reason; increase the limits to inspect deeper or wider trees. Severity
+  filters affect `issues`, while the summary counts all findings in the inspected portion.
 - **`check_element_accessibility`** — Deep check on a specific component.
 - **`get_accessibility_summary`** — Counts overview of accessibility coverage.
 
