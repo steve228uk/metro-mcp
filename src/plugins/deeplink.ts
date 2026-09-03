@@ -1,9 +1,85 @@
 import { z } from 'zod';
-import { definePlugin } from '../plugin.js';
+import { definePlugin, type PluginContext } from '../plugin.js';
 import {
   adbPrefix,
   resolveDevice,
 } from '../utils/device-discovery.js';
+
+function outputText(output: Buffer | string): string {
+  return typeof output === 'string' ? output : output.toString('utf8');
+}
+
+/**
+ * Extract the schemes declared in an iOS Info.plist JSON representation.
+ * Invalid entries are ignored because an app may declare URL types for other
+ * platforms or include optional plist values that are not strings.
+ */
+export function parseBundleUrlSchemes(plist: unknown): string[] {
+  if (!plist || typeof plist !== 'object' || Array.isArray(plist)) return [];
+  const urlTypes = (plist as Record<string, unknown>).CFBundleURLTypes;
+  if (!Array.isArray(urlTypes)) return [];
+
+  const schemes: string[] = [];
+  const seen = new Set<string>();
+  for (const urlType of urlTypes) {
+    if (!urlType || typeof urlType !== 'object' || Array.isArray(urlType)) continue;
+    const declared = (urlType as Record<string, unknown>).CFBundleURLSchemes;
+    if (!Array.isArray(declared)) continue;
+    for (const value of declared) {
+      if (typeof value !== 'string') continue;
+      const scheme = value.trim();
+      if (scheme && !seen.has(scheme)) {
+        seen.add(scheme);
+        schemes.push(scheme);
+      }
+    }
+  }
+  return schemes;
+}
+
+/** Keep Android's existing text response while avoiding a shell pipeline. */
+export function extractAndroidSchemeDump(output: string): string {
+  const lines = output.split(/\r?\n/);
+  const selected: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/scheme/i.test(lines[index] ?? '')) continue;
+    selected.push(...lines.slice(index, index + 6));
+  }
+  return selected.join('\n').trim();
+}
+
+async function readIosBundleSchemes(
+  ctx: PluginContext,
+  udid: string,
+  bundleId: string,
+): Promise<string[]> {
+  const appContainer = outputText(
+    await ctx.execFile('xcrun', [
+      'simctl',
+      'get_app_container',
+      udid,
+      bundleId,
+      'app',
+    ]),
+  ).trim();
+  if (!appContainer || appContainer.includes('\0')) {
+    throw new Error('simctl did not return an installed app container');
+  }
+
+  const plistPath = `${appContainer.replace(/\/+$/, '')}/Info.plist`;
+  const plistJson = outputText(
+    await ctx.execFile('plutil', ['-convert', 'json', '-o', '-', plistPath]),
+  );
+  let plist: unknown;
+  try {
+    plist = JSON.parse(plistJson);
+  } catch (error) {
+    throw new Error(
+      `Info.plist was not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return parseBundleUrlSchemes(plist);
+}
 
 export const deeplinkPlugin = definePlugin({
   name: 'deeplink',
@@ -38,43 +114,52 @@ export const deeplinkPlugin = definePlugin({
     });
 
     ctx.registerTool('list_url_schemes', {
-      description: 'List URL schemes registered by the app (attempts to detect from the running app).',
+      description: 'List URL schemes registered by an installed iOS app or Android package.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
         bundleId: z.string().optional().describe('Bundle ID to check (auto-detected if not provided)'),
       }),
       handler: async ({ bundleId }) => {
-        // Try to get URL schemes from the app via evaluate
-        try {
-          if (ctx.cdp.isConnected) {
-            const result = (await ctx.cdp.send('Runtime.evaluate', {
-              expression: `
-                (function() {
-                  try {
-                    var Linking = require('react-native').Linking;
-                    return { note: 'Use Linking.canOpenURL() to test specific schemes' };
-                  } catch(e) {
-                    return { error: e.message };
-                  }
-                })()
-              `,
-              returnByValue: true,
-            })) as Record<string, unknown>;
-            const val = (result.result as Record<string, unknown>).value;
-            if (val) return val;
-          }
-        } catch {}
+        const targetInfo = ctx.cdp.getTarget();
+        const target = await resolveTarget('auto');
+        if (!target) return 'No simulator/emulator detected.';
 
-        // Fallback: check Info.plist on iOS
-        try {
-          const target = await resolveTarget('auto');
-          if (target?.platform === 'android' && bundleId) {
-            const output = await ctx.exec(`${adbPrefix(target.id)} shell pm dump "${bundleId}" | grep -A5 "scheme" 2>/dev/null`);
-            return output || 'No URL schemes found.';
-          }
-        } catch {}
+        const requestedBundleId = bundleId?.trim() || targetInfo?.appId?.trim();
+        if (!requestedBundleId) {
+          return 'Bundle ID is required when no connected app target is available.';
+        }
 
-        return 'URL scheme detection requires a running app or bundle ID.';
+        if (target.platform === 'ios') {
+          try {
+            const schemes = await readIosBundleSchemes(
+              ctx,
+              target.id,
+              requestedBundleId,
+            );
+            return schemes.length > 0 ? schemes : 'No URL schemes found.';
+          } catch (error) {
+            return `Could not read URL schemes for "${requestedBundleId}": ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
+
+        // Android has no Info.plist equivalent. Keep the established package
+        // dump response, but scope it to the resolved serial and filter it in
+        // memory rather than sending an interpolated shell pipeline.
+        try {
+          const output = outputText(
+            await ctx.execFile('adb', [
+              '-s',
+              target.id,
+              'shell',
+              'pm',
+              'dump',
+              requestedBundleId,
+            ]),
+          );
+          return extractAndroidSchemeDump(output) || 'No URL schemes found.';
+        } catch (error) {
+          return `Could not read URL schemes for "${requestedBundleId}": ${error instanceof Error ? error.message : String(error)}`;
+        }
       },
     });
   },

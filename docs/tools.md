@@ -109,7 +109,11 @@ Browse and read files inside the app's private sandbox. Useful for inspecting SQ
 ## Deep Link
 
 - **`open_deeplink`** — Open a URL or deep link on the device.
-- **`list_url_schemes`** — List registered URL schemes.
+- **`list_url_schemes`** — List registered URL schemes. On iOS this reads
+  `CFBundleURLTypes` from the selected installed app's `Info.plist` using its
+  concrete simulator UDID. Provide `bundleId` to inspect a specific app, or
+  omit it to use the connected Metro target's app ID. Android uses the
+  package manager dump on the selected device serial for compatibility.
 
 ## Permissions
 
