@@ -96,16 +96,6 @@ export const permissionsPlugin = definePlugin({
   description: 'Inspect and manage app permissions on iOS Simulator and Android Emulator',
 
   async setup(ctx) {
-    async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      const device = await resolveDevice(ctx, 'auto', ctx.cdp.getTarget());
-      return device?.platform ?? null;
-    }
-
-    async function getBootedIosUdid(): Promise<string | null> {
-      const device = await resolveDevice(ctx, 'ios', ctx.cdp.getTarget());
-      return device?.id ?? null;
-    }
-
     async function detectBundleId(platform: 'ios' | 'android'): Promise<string | null> {
       if (bundleIdCache) return bundleIdCache;
       const config = ctx.config as Record<string, unknown>;
@@ -151,9 +141,7 @@ export const permissionsPlugin = definePlugin({
           const serviceError = validateIosService(service);
           if (serviceError) return serviceError;
           try {
-            const udid = await getBootedIosUdid();
-            if (!udid) return 'No booted iOS simulator found.';
-            await ctx.exec(`xcrun simctl privacy "${udid}" ${action} "${service}" "${id}"`);
+            await ctx.exec(`xcrun simctl privacy "${resolved.deviceId}" ${action} "${service}" "${id}"`);
             return action === 'grant'
               ? `Granted "${service}" permission to ${id} on iOS simulator.`
               : `Revoked "${service}" permission from ${id} on iOS simulator.`;
@@ -163,9 +151,7 @@ export const permissionsPlugin = definePlugin({
         } else {
           const perm = normalizeAndroidPermission(service);
           try {
-            const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
-            if (!device) return 'No authorized Android device found.';
-            await ctx.exec(`${adbPrefix(device.id)} shell pm ${action} "${id}" "${perm}"`);
+            await ctx.exec(`${adbPrefix(resolved.deviceId)} shell pm ${action} "${id}" "${perm}"`);
             return action === 'grant'
               ? `Granted "${perm}" to ${id} on Android device.`
               : `Revoked "${perm}" from ${id} on Android device.`;
@@ -178,13 +164,13 @@ export const permissionsPlugin = definePlugin({
 
     async function fetchPermissions(
       p: 'ios' | 'android',
-      id: string
+      id: string,
+      deviceId: string,
     ): Promise<Record<string, string> | string> {
       if (p === 'ios') {
         try {
           // simctl privacy has no 'list' action — read the TCC database directly.
-          const udid = await getBootedIosUdid();
-          if (!udid) return 'No booted iOS simulator found.';
+          const udid = deviceId;
 
           const safeId = id.replace(/'/g, "''");
           const tccDb = `${process.env.HOME}/Library/Developer/CoreSimulator/Devices/${udid}/data/Library/TCC/TCC.db`;
@@ -228,9 +214,7 @@ export const permissionsPlugin = definePlugin({
         }
       } else {
         try {
-          const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
-          if (!device) return 'No authorized Android device found.';
-          const output = await ctx.exec(`${adbPrefix(device.id)} shell dumpsys package "${id}" 2>/dev/null`);
+          const output = await ctx.exec(`${adbPrefix(deviceId)} shell dumpsys package "${id}" 2>/dev/null`);
           const permissions: Record<string, string> = {};
           const permRegex = /(android\.permission\.\w+):\s*granted=(\w+)/g;
           let match;
@@ -259,7 +243,7 @@ export const permissionsPlugin = definePlugin({
         const resolved = await resolveTarget(platform, bundleId);
         if (typeof resolved === 'string') return resolved;
         const { p, id } = resolved;
-        const perms = await fetchPermissions(p, id);
+        const perms = await fetchPermissions(p, id, resolved.deviceId);
         if (typeof perms === 'string') return perms;
         if (Object.keys(perms).length === 0)
           return p === 'ios'
@@ -364,14 +348,17 @@ export const permissionsPlugin = definePlugin({
           ),
       }),
       handler: async ({ platform, bundleId }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const device = await resolveDevice(
+          ctx,
+          platform === 'auto' ? 'auto' : platform,
+          ctx.cdp.getTarget(),
+        );
+        if (!device) return 'No simulator/emulator detected.';
+        const p = device.platform;
 
         if (p === 'ios') {
           try {
-            const udid = await getBootedIosUdid();
-            if (!udid) return 'No booted iOS simulator found.';
-            await ctx.exec(`xcrun simctl openurl "${udid}" app-settings:`);
+            await ctx.exec(`xcrun simctl openurl "${device.id}" app-settings:`);
             return 'Opened app settings on iOS simulator.';
           } catch (err) {
             return `Failed to open app settings: ${err instanceof Error ? err.message : String(err)}`;
@@ -380,8 +367,6 @@ export const permissionsPlugin = definePlugin({
           const id = bundleId || (await detectBundleId(p));
           if (!id) return 'Package name required for Android. Provide bundleId.';
           try {
-            const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
-            if (!device) return 'No authorized Android device found.';
             await ctx.exec(
               `${adbPrefix(device.id)} shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d "package:${id}"`
             );
@@ -399,11 +384,12 @@ export const permissionsPlugin = definePlugin({
         'Current permission statuses for the connected app (auto-detected platform and bundle ID)',
       mimeType: 'text/plain',
       handler: async () => {
-        const p = await detectPlatform();
-        if (!p) return '(no simulator/emulator detected)';
+        const target = await resolveDevice(ctx, 'auto', ctx.cdp.getTarget());
+        if (!target) return '(no simulator/emulator detected)';
+        const p = target.platform;
         const id = await detectBundleId(p);
         if (!id) return `(${p}) bundle ID not detected — run the app first`;
-        const perms = await fetchPermissions(p, id);
+        const perms = await fetchPermissions(p, id, target.id);
         if (typeof perms === 'string') return perms;
         if (Object.keys(perms).length === 0)
           return `[${p}] ${id}\n(no permissions requested yet)`;
