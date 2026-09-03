@@ -257,6 +257,92 @@ describe('native input providers', () => {
     expect(calls).toContain('tap');
   });
 
+  test('falls back to IDB when SimView cannot connect before dispatch', async () => {
+    const runner = fakeRunner();
+    const calls: string[] = [];
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'tap'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push(name);
+        if (name === 'connect_device') return { isError: true };
+        return { structuredContent: {} };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    await expect(controller.tap({ platform: 'ios', id: 'device-a' }, 1, 2)).resolves.toMatchObject({
+      backend: 'idb', status: 'handled', dispatched: true, dispatch: 'submitted',
+    });
+    expect(calls).toEqual(['connect_device']);
+    expect(runner.calls).toContainEqual({ command: 'idb', args: ['ui', 'tap', '1', '2', '--udid', 'device-a'] });
+  });
+
+  test('falls back to IDB when a cached SimView session refresh fails before dispatch', async () => {
+    const runner = fakeRunner();
+    const calls: string[] = [];
+    let refreshes = 0;
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'tap'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push(name);
+        if (name === 'get_simview_state' && ++refreshes > 2) return { isError: true };
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:device-a', capabilities: { input: { touch: true, text: 'unicode', buttons: [] } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        return { structuredContent: { accepted: true, inputDispatched: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    await expect(controller.tap({ platform: 'ios', id: 'device-a' }, 1, 2)).resolves.toMatchObject({ backend: 'simview', status: 'handled' });
+    await expect(controller.tap({ platform: 'ios', id: 'device-a' }, 3, 4)).resolves.toMatchObject({
+      backend: 'idb', status: 'handled', dispatched: true, dispatch: 'submitted',
+    });
+    expect(calls.filter((name) => name === 'tap')).toHaveLength(1);
+    expect(runner.calls).toContainEqual({ command: 'idb', args: ['ui', 'tap', '3', '4', '--udid', 'device-a'] });
+  });
+
+  test('falls back to IDB label lookup when SimView cannot connect before dispatch', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args) => {
+      if (command === 'idb' && args[0] === 'ui' && args[1] === 'describe-all') {
+        return Buffer.from(JSON.stringify([{ label: 'Continue', frame: { x: 10, y: 20, width: 80, height: 40 } }]));
+      }
+      return baseExecFile(command, args);
+    };
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'find_elements', 'tap_element'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        if (name === 'connect_device') return { isError: true };
+        return { structuredContent: {} };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    await expect(controller.tapLabel({ platform: 'ios', id: 'device-a' }, 'Continue')).resolves.toMatchObject({
+      backend: 'idb', status: 'handled', dispatched: true, dispatch: 'submitted',
+    });
+    expect(runner.calls).toContainEqual({ command: 'idb', args: ['ui', 'tap', '50', '40', '--udid', 'device-a'] });
+  });
+
   test('does not report a coordinate action as handled when the receipt did not dispatch input', async () => {
     const runner = fakeRunner();
     const client = {

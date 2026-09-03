@@ -396,8 +396,9 @@ export class NativeInputController {
 
   private async simviewLabel(target: NativeInputTarget, label: string, provider: Provider): Promise<NativeDispatchResult> {
     if (this.closed) return result('simview', 'unavailable', false, 'Native input controller is closed');
+    let inputAttempted = false;
     try {
-      return this.withActionQueue(async () => {
+      return await this.withActionQueue(async () => {
         const session = await this.getSession(target, provider);
         return this.withSessionQueue(session, async () => {
           try {
@@ -419,6 +420,7 @@ export class NativeInputController {
           }).filter((ref): ref is string => typeof ref === 'string');
           if (refs.length === 0) return result('simview', 'unsupported', false, `Element "${label}" was not found by SimView`);
           if (refs.length !== 1) return result('simview', 'failed', false, `Element "${label}" is ambiguous`);
+          inputAttempted = true;
           const tapResponse = await session.client.callTool({ name: 'tap_element', arguments: { ref: refs[0] } });
           const tapped = readStructuredResult(tapResponse);
           const interaction = tapped.interaction && typeof tapped.interaction === 'object'
@@ -445,7 +447,16 @@ export class NativeInputController {
         });
       });
     } catch (error) {
-      return result('simview', 'failed', false, error instanceof Error ? error.message : String(error), 'unknown');
+      // Connecting, refreshing, and searching happen before SimView receives
+      // the semantic tap. IDB may safely take over in auto mode in those
+      // cases; once the tap request was attempted, the dispatch is uncertain.
+      return result(
+        'simview',
+        inputAttempted ? 'failed' : 'unavailable',
+        false,
+        error instanceof Error ? error.message : String(error),
+        inputAttempted ? 'unknown' : 'not-sent',
+      );
     }
   }
 
@@ -628,9 +639,11 @@ export class NativeInputController {
       session = await this.getSession(target, provider);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      return message.includes('could not connect')
-        ? result('simview', 'failed', false, message, 'unknown')
-        : result('simview', 'unavailable', false, message);
+      // A failed handshake happens before SimView receives an input action.
+      // In auto mode this is safe to fall through to IDB; reporting an
+      // unknown dispatch would stop the chain and could strand a working
+      // native backend behind a transient SimView connection failure.
+      return result('simview', 'unavailable', false, message, 'not-sent');
     }
     return this.withSessionQueue(session, async () => {
       if (this.closed) return result('simview', 'unavailable', false, 'Native input controller is closed');
@@ -638,7 +651,9 @@ export class NativeInputController {
         await this.refreshSession(session);
       } catch (error) {
         await this.invalidateSession(session);
-        return result('simview', 'failed', false, error instanceof Error ? error.message : String(error), 'unknown');
+        // Refresh only reads the session/device state and precedes the actual
+        // input call, so a refresh failure cannot have dispatched input.
+        return result('simview', 'unavailable', false, error instanceof Error ? error.message : String(error), 'not-sent');
       }
       const tool = operation === 'long_press' ? 'long_press' : operation;
       const input = session.capabilities.input as Record<string, unknown> | undefined;
