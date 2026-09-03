@@ -1,7 +1,88 @@
-import { readFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { randomUUID } from 'node:crypto';
+import { constants } from 'node:fs';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  readFile,
+  stat,
+  unlink,
+  writeFile,
+} from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { z } from 'zod';
-import { definePlugin } from '../plugin.js';
+import { definePlugin, nativeToolResult } from '../plugin.js';
+
+const SCREENSHOT_PREFIX = 'metro-mcp-screenshot-';
+const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const SCREENSHOT_MAX_BYTES = 64 * 1024 * 1024;
+const SCREENSHOT_FILE_PATTERN = /^metro-mcp-screenshot-[a-zA-Z0-9-]+\.png$/;
+const SCREENSHOT_DIRECTORY = join(
+  tmpdir(),
+  `metro-mcp-screenshots-${process.getuid?.() ?? 'user'}`,
+);
+
+export async function prepareScreenshotDirectory(
+  directory = SCREENSHOT_DIRECTORY,
+): Promise<void> {
+  try {
+    await mkdir(directory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+
+  const pathMetadata = await lstat(directory);
+  if (!pathMetadata.isDirectory() || pathMetadata.isSymbolicLink()) {
+    throw new Error('Screenshot directory is not a real directory');
+  }
+
+  const handle = await open(
+    directory,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const openedMetadata = await handle.stat();
+    const currentUid = process.getuid?.();
+    if (
+      !openedMetadata.isDirectory() ||
+      openedMetadata.dev !== pathMetadata.dev ||
+      openedMetadata.ino !== pathMetadata.ino ||
+      (currentUid !== undefined && openedMetadata.uid !== currentUid)
+    ) {
+      throw new Error('Screenshot directory ownership changed');
+    }
+    // mkdir's mode is affected by the umask and does not repair an existing directory.
+    await handle.chmod(0o700);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function cleanupOldScreenshots(now = Date.now()): Promise<void> {
+  try {
+    const files = await readdir(SCREENSHOT_DIRECTORY);
+    await Promise.all(
+      files
+        .filter((file) => SCREENSHOT_FILE_PATTERN.test(file))
+        .map(async (file) => {
+          const path = join(SCREENSHOT_DIRECTORY, file);
+          try {
+            const metadata = await stat(path);
+            if (metadata.isFile() && now - metadata.mtimeMs > SCREENSHOT_MAX_AGE_MS) {
+              await unlink(path);
+            }
+          } catch {
+            // The file may have been removed concurrently.
+          }
+        }),
+    );
+  } catch {
+    // Screenshot cleanup is opportunistic and must not block a capture.
+  }
+}
 
 export const simulatorPlugin = definePlugin({
   name: 'simulator',
@@ -23,35 +104,75 @@ export const simulatorPlugin = definePlugin({
 
     ctx.registerTool('take_screenshot', {
       description: 'Capture a screenshot from the connected iOS simulator or Android device.',
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      annotations: { openWorldHint: true },
       parameters: z.object({
         platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
+        delivery: z
+          .enum(['path', 'inline'])
+          .default('path')
+          .describe('Return a retained temporary file path or an inline MCP image'),
       }),
-      handler: async ({ platform }) => {
+      handler: async ({ platform, delivery }) => {
         const p = platform === 'auto' ? await detectPlatform() : platform;
         if (!p) return 'No simulator/emulator detected.';
 
-        const tmpFile = `/tmp/metro-mcp-screenshot-${Date.now()}.png`;
+        await prepareScreenshotDirectory();
+        await cleanupOldScreenshots();
+        const tmpFile = join(
+          SCREENSHOT_DIRECTORY,
+          `${SCREENSHOT_PREFIX}${randomUUID()}.png`,
+        );
 
-        if (p === 'ios') {
-          await ctx.exec(`xcrun simctl io booted screenshot "${tmpFile}"`);
-        } else {
-          await ctx.exec(`adb exec-out screencap -p > "${tmpFile}"`);
+        try {
+          if (p === 'ios') {
+            await ctx.execFile(
+              'xcrun',
+              ['simctl', 'io', 'booted', 'screenshot', tmpFile],
+              { maxBuffer: SCREENSHOT_MAX_BYTES },
+            );
+          } else {
+            const capture = await ctx.execFile(
+              'adb',
+              ['exec-out', 'screencap', '-p'],
+              { maxBuffer: SCREENSHOT_MAX_BYTES },
+            );
+            await writeFile(tmpFile, capture, { flag: 'wx', mode: 0o600 });
+          }
+
+          await chmod(tmpFile, 0o600);
+          const metadata = await stat(tmpFile);
+          if (!metadata.isFile()) {
+            throw new Error('capture did not produce a regular file');
+          }
+          if (metadata.size > SCREENSHOT_MAX_BYTES) {
+            throw new Error('capture exceeds the 64 MiB screenshot limit');
+          }
+        } catch (error) {
+          await unlink(tmpFile).catch(() => {});
+          throw new Error(
+            `Failed to capture screenshot: ${error instanceof Error ? error.message : String(error)}`,
+          );
         }
 
-        // Read file and return as base64
-        if (existsSync(tmpFile)) {
-          const buffer = await readFile(tmpFile);
-          const base64 = buffer.toString('base64');
-          await ctx.exec(`rm -f "${tmpFile}"`);
-          return {
-            type: 'image',
-            format: 'png',
-            data: base64,
-            note: 'Screenshot captured successfully',
-          };
+        if (delivery === 'path') {
+          return nativeToolResult({
+            content: [{ type: 'text', text: `Screenshot saved to ${tmpFile}` }],
+            structuredContent: {
+              path: tmpFile,
+              mimeType: 'image/png',
+              platform: p,
+            },
+          });
         }
-        return 'Failed to capture screenshot.';
+
+        try {
+          const data = (await readFile(tmpFile)).toString('base64');
+          return nativeToolResult({
+            content: [{ type: 'image', data, mimeType: 'image/png' }],
+          });
+        } finally {
+          await unlink(tmpFile).catch(() => {});
+        }
       },
     });
 
