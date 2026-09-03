@@ -5,6 +5,7 @@ import {
   createDaemonIdentity,
   getDaemonCwd,
   getDaemonKeyFromEnv,
+  isManagedDaemonProcess,
   removeDaemonRecordForProcess,
   startStdioProxy,
   writeDaemonRecord,
@@ -108,11 +109,12 @@ Examples:
         projectRoot: config.projectRoot,
       });
       const key = getDaemonKeyFromEnv(serverArgs, identity);
+      const managed = isManagedDaemonProcess();
       const cleanupDaemonRecord = () =>
         removeDaemonRecordForProcess(key, process.pid);
       await startHttpServer(config, serverArgs, {
         port: mcpPort,
-        daemon: { key, identity },
+        daemon: { key, identity, managed },
         onListening: ({ host, port, url }) => {
           writeDaemonRecord({
             pid: process.pid,
@@ -123,6 +125,7 @@ Examples:
             cwd: config.projectRoot ?? getDaemonCwd(),
             args: serverArgs,
             identity,
+            managed,
             startedAt: new Date().toISOString(),
           });
           process.once('exit', cleanupDaemonRecord);

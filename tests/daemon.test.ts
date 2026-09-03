@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -6,10 +6,14 @@ import path from 'node:path';
 import {
   cleanupStaleDaemonRecords,
   createDaemonIdentity,
+  getDaemonIdentityFingerprint,
   getDaemonKey,
+  getDaemonKeyFingerprint,
+  getDaemonLockPath,
   getDaemonRecordPath,
   readLiveRecord,
   removeDaemonRecordForProcess,
+  withStartupLock,
   writeDaemonRecord,
 } from '../src/daemon.js';
 import { loadConfig } from '../src/config.js';
@@ -146,14 +150,25 @@ describe('daemon records', () => {
     const key = getDaemonKey(expected.args, expected);
 
     await withHealthServer(
-      { ok: true, name: 'metro-mcp', version: expected.version, daemon: { key, identity: expected } },
+      {
+        ok: true,
+        name: 'metro-mcp',
+        version: expected.version,
+        daemon: {
+          keyHash: getDaemonKeyFingerprint(key),
+          identityHash: getDaemonIdentityFingerprint(expected),
+          managed: true,
+        },
+      },
       async (url) => {
         writeDaemonRecord(record(key, url, expected));
 
         const live = await readLiveRecord(key, expected);
 
         expect(live?.url).toBe(url);
+        expect(live?.managed).toBe(true);
         expect(fs.existsSync(getDaemonRecordPath(key))).toBe(true);
+        expect(fs.statSync(getDaemonRecordPath(key)).mode & 0o777).toBe(0o600);
       },
     );
   });
@@ -163,7 +178,15 @@ describe('daemon records', () => {
     const key = getDaemonKey(expected.args, expected);
 
     await withHealthServer(
-      { ok: true, name: 'metro-mcp', version: '0.9.0', daemon: { key, identity: expected } },
+      {
+        ok: true,
+        name: 'metro-mcp',
+        version: '0.9.0',
+        daemon: {
+          keyHash: getDaemonKeyFingerprint(key),
+          identityHash: getDaemonIdentityFingerprint(expected),
+        },
+      },
       async (url) => {
         writeDaemonRecord(record(key, url, expected));
 
@@ -179,7 +202,15 @@ describe('daemon records', () => {
     const key = getDaemonKey(expected.args, expected);
 
     await withHealthServer(
-      { ok: true, name: 'metro-mcp', version: expected.version, daemon: { key, identity: actual } },
+      {
+        ok: true,
+        name: 'metro-mcp',
+        version: expected.version,
+        daemon: {
+          keyHash: getDaemonKeyFingerprint(key),
+          identityHash: getDaemonIdentityFingerprint(actual),
+        },
+      },
       async (url) => {
         writeDaemonRecord(record(key, url, expected));
 
@@ -202,7 +233,15 @@ describe('daemon records', () => {
     });
 
     await withHealthServer(
-      { ok: true, name: 'metro-mcp', version: expected.version, daemon: { key: liveKey, identity: expected } },
+      {
+        ok: true,
+        name: 'metro-mcp',
+        version: expected.version,
+        daemon: {
+          keyHash: getDaemonKeyFingerprint(liveKey),
+          identityHash: getDaemonIdentityFingerprint(expected),
+        },
+      },
       async (url) => {
         writeDaemonRecord(record(liveKey, url, expected));
 
@@ -248,10 +287,111 @@ describe('daemon records', () => {
     expect(fs.existsSync(getDaemonRecordPath(ownedKey))).toBe(false);
     expect(fs.existsSync(getDaemonRecordPath(otherKey))).toBe(true);
   });
+
+  test('cleans dead and stale startup locks while preserving a fresh live lock', async () => {
+    const deadPath = getDaemonLockPath('deadbeefdeadbeef');
+    const stalePath = getDaemonLockPath('aaaaaaaaaaaaaaaa');
+    const livePath = getDaemonLockPath('bbbbbbbbbbbbbbbb');
+    fs.writeFileSync(deadPath, JSON.stringify({ pid: 2_147_483_647, token: 'dead' }));
+    fs.writeFileSync(stalePath, JSON.stringify({ pid: process.pid, token: 'stale' }));
+    fs.writeFileSync(livePath, JSON.stringify({ pid: process.pid, token: 'live' }));
+    const staleDate = new Date(Date.now() - 31_000);
+    fs.utimesSync(stalePath, staleDate, staleDate);
+
+    await cleanupStaleDaemonRecords();
+
+    expect(fs.existsSync(deadPath)).toBe(false);
+    expect(fs.existsSync(stalePath)).toBe(false);
+    expect(fs.existsSync(livePath)).toBe(true);
+  });
+
+  test('preserves live records and fresh locks when PID probing returns EPERM', async () => {
+    const expected = identity();
+    const key = getDaemonKey(expected.args, expected);
+    const lockPath = getDaemonLockPath(key);
+    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token: 'live' }));
+
+    await withHealthServer(
+      {
+        ok: true,
+        name: 'metro-mcp',
+        version: expected.version,
+        daemon: {
+          keyHash: getDaemonKeyFingerprint(key),
+          identityHash: getDaemonIdentityFingerprint(expected),
+          managed: true,
+        },
+      },
+      async (url) => {
+        writeDaemonRecord(record(key, url, expected));
+        const kill = spyOn(process, 'kill').mockImplementation(() => {
+          throw Object.assign(new Error('Operation not permitted'), { code: 'EPERM' });
+        });
+        try {
+          await cleanupStaleDaemonRecords();
+          expect(fs.existsSync(lockPath)).toBe(true);
+          expect(fs.existsSync(getDaemonRecordPath(key))).toBe(true);
+          expect((await readLiveRecord(key, expected))?.managed).toBe(true);
+        } finally {
+          kill.mockRestore();
+        }
+      },
+    );
+  });
+
+  test('preserves a fresh startup lock while its payload is being written', async () => {
+    const lockPath = getDaemonLockPath('dddddddddddddddd');
+    fs.writeFileSync(lockPath, '');
+
+    await cleanupStaleDaemonRecords();
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+  });
+
+  test('removes an unparsable startup lock only after it becomes stale', async () => {
+    const lockPath = getDaemonLockPath('eeeeeeeeeeeeeeee');
+    fs.writeFileSync(lockPath, '');
+    const staleDate = new Date(Date.now() - 31_000);
+    fs.utimesSync(lockPath, staleDate, staleDate);
+
+    await cleanupStaleDaemonRecords();
+
+    expect(fs.existsSync(lockPath)).toBe(false);
+  });
+
+  test('does not remove a replacement lock when the previous owner finishes', async () => {
+    const key = 'cccccccccccccccc';
+    const lockPath = getDaemonLockPath(key);
+    await withStartupLock(key, async () => {
+      fs.unlinkSync(lockPath);
+      fs.writeFileSync(
+        lockPath,
+        JSON.stringify({
+          pid: process.pid,
+          createdAt: new Date().toISOString(),
+          token: 'replacement-owner',
+        }),
+      );
+    });
+
+    expect(fs.existsSync(lockPath)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(lockPath, 'utf8')).token).toBe(
+      'replacement-owner',
+    );
+  });
+
+  test('rejects daemon records that point outside localhost', async () => {
+    const expected = identity();
+    const key = getDaemonKey(expected.args, expected);
+    writeDaemonRecord(record(key, 'http://example.com:8080/mcp', expected));
+
+    await expect(readLiveRecord(key, expected)).resolves.toBeNull();
+    expect(fs.existsSync(getDaemonRecordPath(key))).toBe(false);
+  });
 });
 
 describe('HTTP health', () => {
-  test('exposes daemon identity while keeping name and version', async () => {
+  test('exposes a daemon fingerprint without leaking its lease key', async () => {
     const args = ['--port', '65535'];
     const daemonIdentity = identity({ version, args });
     const key = getDaemonKey(args, daemonIdentity);
@@ -272,8 +412,13 @@ describe('HTTP health', () => {
 
       expect(body.name).toBe('metro-mcp');
       expect(body.version).toBe(version);
-      expect(body.daemon?.key).toBe(key);
-      expect(body.daemon?.identity).toEqual(daemonIdentity);
+      expect(body.daemon?.keyHash).toBe(getDaemonKeyFingerprint(key));
+      expect(body.daemon?.identityHash).toBe(
+        getDaemonIdentityFingerprint(daemonIdentity),
+      );
+      expect(body.daemon).not.toHaveProperty('key');
+      expect(body.daemon).not.toHaveProperty('identity');
+      expect(body.daemon?.managed).toBe(false);
     } finally {
       await server.close();
     }
