@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  adbPrefix,
   discoverBootedSimulators,
+  isSafeDeviceId,
   parseAndroidDevices,
   parseBootedSimulators,
   resolveDevice,
@@ -48,6 +50,15 @@ function runnerFor(options: {
 }
 
 describe('device discovery', () => {
+  test('accepts a valid bracketed IPv6 ADB serial and keeps it quoted', () => {
+    const serial = '[2001:db8::1]:5555';
+    expect(parseAndroidDevices(`List of devices attached\n${serial}\tdevice model:Pixel_8\n`))
+      .toEqual([{ id: serial, status: 'device', model: 'Pixel_8' }]);
+    expect(adbPrefix(serial)).toBe('adb -s "[2001:db8::1]:5555"');
+    expect(isSafeDeviceId('[not-an-ipv6]:5555')).toBe(false);
+    expect(isSafeDeviceId('[2001:db8::1]:70000')).toBe(false);
+  });
+
   test('uses literal simctl JSON arguments and resolves a connected target by UDID', async () => {
     const runner = runnerFor({});
     const device = await resolveDevice(runner, 'ios', {
