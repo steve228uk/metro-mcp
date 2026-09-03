@@ -546,14 +546,14 @@ export const uiInteractPlugin = definePlugin({
         if (!(await isIDBAvailable())) {
           return `Button ${button} requires IDB on iOS. ${IDB_INSTALL}`;
         }
-        const idbMap: Record<string, string> = {
-          HOME: 'HOME', VOLUME_UP: 'VOLUME_UP', VOLUME_DOWN: 'VOLUME_DOWN', POWER: 'LOCK', BACK: 'HOME',
-        };
         if (button === 'ENTER' || button === 'DELETE') {
           const hidCode = button === 'ENTER' ? 40 : 42;
           await ctx.exec(`idb ui key ${hidCode} --udid "${target.id}"`);
           return `Pressed ${button}`;
         }
+        const idbMap: Record<string, string> = {
+          HOME: 'HOME', VOLUME_UP: 'VOLUME_UP', VOLUME_DOWN: 'VOLUME_DOWN', POWER: 'LOCK', BACK: 'HOME',
+        };
         await ctx.exec(`idb ui button ${idbMap[button] || button} --udid "${target.id}"`);
         return `Pressed ${button}`;
       },
