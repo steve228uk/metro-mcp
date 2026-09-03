@@ -340,6 +340,61 @@ describe('test recorder readiness', () => {
     expect(await call('stop_test_recording')).toContain('1 swipe');
   });
 
+  test('shares scroll state when a forwarded begin handler gets new end callbacks', async () => {
+    const app = appWithNaturalScroll();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+      var firstProps = {
+        scrollEnabled: true,
+        testID: 'forwarded-scroll',
+        onScrollBeginDrag: function() {},
+        onScrollEndDrag: function() {}
+      };
+      Object.freeze(firstProps);
+      scrollRoot.memoizedProps = firstProps;
+      var forwardedBegin = firstProps.onScrollBeginDrag;
+      var secondProps = {
+        scrollEnabled: true,
+        testID: 'forwarded-scroll',
+        onScrollBeginDrag: forwardedBegin,
+        onScrollEndDrag: function() {}
+      };
+      Object.freeze(secondProps);
+      scrollRoot.memoizedProps = secondProps;
+      secondProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      secondProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 swipe');
+  });
+
+  test('does not reuse an unfinished scroll from a previous recording session', async () => {
+    const app = appWithNaturalScroll();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+      var scrollProps = {
+        scrollEnabled: true,
+        testID: 'restarted-scroll',
+        onScrollBeginDrag: function() {},
+        onScrollEndDrag: function() {}
+      };
+      Object.freeze(scrollProps);
+      scrollRoot.memoizedProps = scrollProps;
+      scrollProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('No interactions');
+
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(
+      `scrollRoot.memoizedProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });`,
+      app,
+    );
+    expect(await call('stop_test_recording')).toContain('No interactions');
+  });
+
   test('exposes active status and annotations only after capture activates', async () => {
     const app = appWithDeepButton();
     const call = await createHarness(app, [testRecorderPlugin]);

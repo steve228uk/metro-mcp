@@ -141,10 +141,24 @@ const START_RECORDING_JS = `
     }) || wrapped;
 
     if (isScrollable(obj)) {
-      var scrollStart = { x: null, y: null };
       var originalBegin = obj.onScrollBeginDrag;
       var originalEnd = obj.onScrollEndDrag;
       var originalMomentumEnd = obj.onMomentumScrollEnd;
+      // A forwarded begin handler can already belong to a previous props
+      // object. Keep its mutable gesture state with the wrapper so the end
+      // callbacks created for this props object observe the same coordinates.
+      function existingScrollState(fn) {
+        return fn && fn.__mcpRecSession === state.sessionId && fn.__mcpRecScrollState;
+      }
+      var scrollStart = existingScrollState(originalBegin) ||
+        existingScrollState(originalEnd) ||
+        existingScrollState(originalMomentumEnd) ||
+        { x: null, y: null };
+      function tagScrollWrapper(fn) {
+        Object.defineProperty(fn, '__mcpRecSession', { value: state.sessionId });
+        Object.defineProperty(fn, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
+        Object.defineProperty(fn, '__mcpRecScrollState', { value: scrollStart });
+      }
       if (!hasMetadata(originalBegin, tid, lbl)) {
         var begin = function(e) {
           var outermost = state.invocationDepth === 0;
@@ -160,8 +174,7 @@ const START_RECORDING_JS = `
           } finally { state.invocationDepth--; }
         };
         try {
-          Object.defineProperty(begin, '__mcpRecSession', { value: state.sessionId });
-          Object.defineProperty(begin, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
+          tagScrollWrapper(begin);
           obj.onScrollBeginDrag = begin;
           wrapped = obj.onScrollBeginDrag === begin || wrapped;
         } catch (_) {}
@@ -189,8 +202,7 @@ const START_RECORDING_JS = `
           finally { state.invocationDepth--; }
         };
         try {
-          Object.defineProperty(end, '__mcpRecSession', { value: state.sessionId });
-          Object.defineProperty(end, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
+          tagScrollWrapper(end);
           obj.onScrollEndDrag = end;
           wrapped = obj.onScrollEndDrag === end || wrapped;
         } catch (_) {}
@@ -202,8 +214,7 @@ const START_RECORDING_JS = `
           finally { state.invocationDepth--; }
         };
         try {
-          Object.defineProperty(momentum, '__mcpRecSession', { value: state.sessionId });
-          Object.defineProperty(momentum, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
+          tagScrollWrapper(momentum);
           obj.onMomentumScrollEnd = momentum;
           wrapped = obj.onMomentumScrollEnd === momentum || wrapped;
         } catch (_) {}
