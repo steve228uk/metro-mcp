@@ -14,6 +14,17 @@ import {
 import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
 import { NativeInputController, type NativeDispatchResult, type NativeInputConfig } from '../utils/native-input.js';
 
+// Connection setup failures happen before Runtime.evaluate is dispatched, so
+// native input remains safe. Any other rejection may follow an app-side action
+// and must stop to avoid duplicate input.
+function isPreDispatchConnectionFailure(error: unknown): boolean {
+  return error instanceof Error && (
+    error.message === 'Not connected to CDP target' ||
+    error.message ===
+      'Not connected to Metro. Use list_devices to check connection status.'
+  );
+}
+
 export const uiInteractPlugin = definePlugin({
   name: 'ui-interact',
 
@@ -110,7 +121,10 @@ export const uiInteractPlugin = definePlugin({
             ${FIND_AND_INVOKE_JS}
             return findAndInvoke(${jsLabel}, 'onPress');
           })()
-        `);
+        `).catch((error) => {
+          if (!isPreDispatchConnectionFailure(error)) throw error;
+          return false;
+        });
         if (tapped) return `Tapped "${label}"`;
 
         const target = await resolveTarget(platform);
@@ -184,7 +198,10 @@ export const uiInteractPlugin = definePlugin({
             return true;
           }
           return false;
-        `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES }));
+        `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES })).catch((error) => {
+          if (!isPreDispatchConnectionFailure(error)) throw error;
+          return false;
+        });
         if (typed) return `Typed "${text}"`;
 
         const target = await resolveTarget(platform);
@@ -209,14 +226,22 @@ export const uiInteractPlugin = definePlugin({
         // ── CDP: find element by label/testID and call onLongPress ────────────
         if (label && x === undefined && y === undefined) {
           const jsLabel = JSON.stringify(label);
+          let evaluationError: unknown;
           const pressed = await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
               return findAndInvoke(${jsLabel}, 'onLongPress');
             })()
-          `);
+          `).catch((error) => {
+            if (!isPreDispatchConnectionFailure(error)) throw error;
+            evaluationError = error;
+            return false;
+          });
           if (pressed) return `Long pressed "${label}"`;
+          if (evaluationError) {
+            return `Could not evaluate the connected app while long pressing "${label}".`;
+          }
         }
 
         // ── Coordinate fallbacks ──────────────────────────────────────────────
@@ -286,7 +311,10 @@ export const uiInteractPlugin = definePlugin({
             }
             return false;
           })()
-        `);
+        `).catch((error) => {
+          if (!isPreDispatchConnectionFailure(error)) throw error;
+          return false;
+        });
         if (scrolled) result = `Swiped ${direction}`;
 
         if (!result) {
@@ -342,7 +370,10 @@ export const uiInteractPlugin = definePlugin({
               return { prune: true };
             });
             return handled;
-          `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES }));
+          `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES })).catch((error) => {
+            if (!isPreDispatchConnectionFailure(error)) throw error;
+            return false;
+          });
           if (handled) return `Pressed ${button}`;
         }
 
