@@ -167,18 +167,20 @@ describe('UI handler actions without native inventory', () => {
     ]);
   });
 
-  test('invokes focused Fabric TextInput key handlers without native inventory', async () => {
-    const harness = await createAppOnlyHarness('fabric-focused');
-    const press = harness.tools.get('press_button')!;
-    for (const button of ['ENTER', 'DELETE'] as const) {
-      expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
-        .toBe(`Pressed ${button}`);
+  test('invokes controlled Paper and Fabric handlers with exact non-empty payloads', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await createAppOnlyHarness(`${renderer}-focused`);
+      const press = harness.tools.get('press_button')!;
+      for (const button of ['ENTER', 'DELETE'] as const) {
+        expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
+          .toBe(`Pressed ${button}`);
+      }
+      expect(harness.reactCalls).toEqual([
+        { type: 'submit', value: { nativeEvent: { text: 'hello' } } },
+        { type: 'change', value: 'hell' },
+      ]);
+      expect(harness.getNativeCalls()).toBe(0);
     }
-    expect(harness.reactCalls).toEqual([
-      { type: 'submit', value: { nativeEvent: { text: 'hello' } } },
-      { type: 'change', value: 'hell' },
-    ]);
-    expect(harness.getNativeCalls()).toBe(0);
   });
 
   test('invokes controlled Paper and Fabric handlers with exact empty payloads', async () => {
@@ -201,10 +203,15 @@ describe('UI handler actions without native inventory', () => {
     for (const renderer of ['paper', 'fabric'] as const) {
       const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true);
       const press = harness.tools.get('press_button')!;
-      const result = await press.handler(press.parameters.parse({ button: 'ENTER', platform: 'ios' }) as Record<string, unknown>);
-      expect(result).toBe('Pressed ENTER');
+      for (const button of ['ENTER', 'DELETE'] as const) {
+        expect(await press.handler(press.parameters.parse({ button, platform: 'android' }) as Record<string, unknown>))
+          .toBe(`Pressed ${button}`);
+      }
       expect(harness.reactCalls).toEqual([]);
-      expect(harness.getNativeCalls()).toBeGreaterThan(0);
+      expect(harness.execCommands).toEqual([
+        'adb -s "emulator-42" shell input keyevent 66',
+        'adb -s "emulator-42" shell input keyevent 67',
+      ]);
     }
   });
 
