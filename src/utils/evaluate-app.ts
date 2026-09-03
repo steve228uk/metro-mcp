@@ -1,6 +1,10 @@
 import type { CDPConnection, EvalOptions } from '../plugin.js';
 import { extractCDPExceptionMessage } from './cdp.js';
-import { awaitAppResult, type AppEvaluationCompletion } from './await-app-result.js';
+import {
+  awaitAppResult,
+  awaitPromiseBeforeDeadline,
+  type AppEvaluationCompletion,
+} from './await-app-result.js';
 
 export interface AppEvaluationLifecycle {
   /** Ensure a request can be sent before it is dispatched. */
@@ -25,24 +29,6 @@ function isTransportError(error: unknown): boolean {
 
 function timeoutError(timeout: number): Error {
   return new Error(`App evaluation timed out after ${timeout}ms`);
-}
-
-async function awaitBeforeDeadline<T>(
-  operation: Promise<T>,
-  deadline: number,
-  timeout: number,
-): Promise<T> {
-  const remaining = deadline - Date.now();
-  if (remaining <= 0) throw timeoutError(timeout);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadlineReached = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(timeoutError(timeout)), remaining);
-  });
-  try {
-    return await Promise.race([operation, deadlineReached]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
 }
 
 async function sendRuntimeEvaluate(
@@ -150,7 +136,7 @@ export function createAppEvaluator(
   ): Promise<unknown> => {
     await lifecycle.ensureConnected();
     if (options?.deadline !== undefined && Date.now() >= options.deadline) {
-      throw new Error(`App evaluation timed out after ${options.timeout ?? 10_000}ms`);
+      throw timeoutError(options.timeout ?? 10_000);
     }
     const timeout = options?.deadline === undefined
       ? options?.timeout
@@ -164,7 +150,7 @@ export function createAppEvaluator(
   ): Promise<AppEvaluationCompletion> => {
     await lifecycle.ensureConnected();
     if (options?.deadline !== undefined && Date.now() >= options.deadline) {
-      throw new Error(`App evaluation timed out after ${options.timeout ?? 10_000}ms`);
+      throw timeoutError(options.timeout ?? 10_000);
     }
     const timeout = options?.deadline === undefined
       ? options?.timeout
@@ -177,7 +163,7 @@ export function createAppEvaluator(
     mailboxKey: string,
     options: { timeout?: number; deadline: number },
   ): Promise<boolean> => {
-    const attach = async (): Promise<boolean> => {
+    const attachRemoteSettlement = async (): Promise<boolean> => {
       const remaining = options.deadline - Date.now();
       if (remaining <= 0) throw timeoutError(options.timeout ?? 10_000);
       const result = (await cdp.send(
@@ -204,14 +190,14 @@ export function createAppEvaluator(
     };
 
     try {
-      return await attach();
+      return await attachRemoteSettlement();
     } catch (error) {
       if (!isTransportError(error)) throw error;
       // Attaching the same settlement callback twice is safe: it only writes
       // the private mailbox and never re-runs the caller's source. Bound the
       // reconnect itself by the same deadline as the attach and re-check it
       // before dispatching the retry, since reconnect may finish late.
-      await awaitBeforeDeadline(
+      await awaitPromiseBeforeDeadline(
         recoverTransport(),
         options.deadline,
         options.timeout ?? 10_000,
@@ -219,7 +205,7 @@ export function createAppEvaluator(
       if (Date.now() >= options.deadline) {
         throw timeoutError(options.timeout ?? 10_000);
       }
-      return attach();
+      return attachRemoteSettlement();
     }
   };
 

@@ -65,7 +65,7 @@ async function evaluateBeforeDeadline<T>(
   );
 }
 
-async function awaitPromiseBeforeDeadline<T>(
+export async function awaitPromiseBeforeDeadline<T>(
   operation: Promise<T>,
   deadline: number,
   timeout: number,
