@@ -123,7 +123,9 @@ Inspect and manage app permissions on iOS Simulator and Android Emulator without
 - **`grant_permission`** — Grant a permission to the app.
 - **`revoke_permission`** — Revoke a permission from the app.
 - **`reset_permissions`** — Reset one or all permissions to their default state. On iOS, omit `service` to reset everything. On Android, omit `service` to reset all runtime permissions (falls back to `pm clear` on older devices).
-- **`open_app_settings`** — Open the app's system settings page. On iOS, opens the Settings panel for the frontmost app. On Android, requires a bundle ID / package name.
+- **`open_app_settings`** — Open the connected app's system settings page via React Native
+  `Linking.openSettings()` and await completion. An optional bundle ID must match the connected
+  app. Reports unsupported capability when the app does not expose Linking through Metro.
 
 ## UI Interact
 

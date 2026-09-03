@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import { openAppSettingsExpression } from '../utils/app-settings.js';
 
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let platformCache: { value: 'ios' | 'android' | null; ts: number } | null = null;
@@ -356,7 +357,7 @@ export const permissionsPlugin = definePlugin({
 
     ctx.registerTool('open_app_settings', {
       description:
-        "Open the app's system settings page on the connected iOS simulator or Android emulator.",
+        "Open the connected app's system settings page using React Native Linking.openSettings().",
       annotations: { destructiveHint: false },
       parameters: z.object({
         platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
@@ -364,31 +365,24 @@ export const permissionsPlugin = definePlugin({
           .string()
           .optional()
           .describe(
-            'Bundle ID (iOS) or package name (Android). Auto-detected if omitted. Required for Android.'
+            'Bundle ID (iOS) or package name (Android). If supplied, it must match the connected app.'
           ),
       }),
       handler: async ({ platform, bundleId }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
-
-        if (p === 'ios') {
-          try {
-            await ctx.exec('xcrun simctl openurl booted app-settings:');
-            return 'Opened app settings on iOS simulator.';
-          } catch (err) {
-            return `Failed to open app settings: ${err instanceof Error ? err.message : String(err)}`;
-          }
-        } else {
-          const id = bundleId || (await detectBundleId(p));
-          if (!id) return 'Package name required for Android. Provide bundleId.';
-          try {
-            await ctx.exec(
-              `adb shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d "package:${id}"`
-            );
-            return `Opened app settings for ${id} on Android device.`;
-          } catch (err) {
-            return `Failed to open app settings: ${err instanceof Error ? err.message : String(err)}`;
-          }
+        const target = ctx.cdp.getTarget();
+        if (!target || !ctx.cdp.isConnected) return 'No connected app. Connect to the requested app first.';
+        if (bundleId && bundleId !== target.appId) {
+          return target.appId
+            ? `Bundle ID does not match the connected app (${target.appId}). Connect to the requested app first.`
+            : 'The connected app bundle ID is unavailable; the requested bundle ID cannot be verified.';
+        }
+        try {
+          await ctx.evalInApp(openAppSettingsExpression(platform), { awaitPromise: true });
+          return target.appId
+            ? `Opened app settings for ${target.appId}.`
+            : 'Opened settings for the connected app.';
+        } catch (err) {
+          return `Failed to open app settings: ${err instanceof Error ? err.message : String(err)}`;
         }
       },
     });
