@@ -106,6 +106,9 @@ export function normalizeLogicalPoint(
 }
 
 const SIMVIEW_PLUGIN_CACHE_ROOT = resolve(homedir(), '.codex/plugins/cache');
+// IDB's `ui key` takes USB HID usage IDs. These are the usages for Return and
+// Backspace/Delete in the keyboard page (the same values used by IDB text).
+const IOS_HID_KEY_CODES = { ENTER: 40, DELETE: 42 } as const;
 
 function configValue(config: NativeInputConfig | undefined): Required<NativeInputConfig> {
   return {
@@ -278,6 +281,7 @@ async function probeProvider(
   if (hasHelpCommand(uiHelp, 'text')) capabilities.add('text');
   if (hasHelpCommand(uiHelp, 'swipe')) capabilities.add('swipe');
   if (hasHelpCommand(uiHelp, 'button')) capabilities.add('button');
+  if (hasHelpCommand(uiHelp, 'key')) capabilities.add('key');
 
   // Long press and timed swipe depend on their operation-specific option.
   // Probe these read-only help pages independently so a provider can retain
@@ -650,6 +654,11 @@ export class NativeInputController {
       return code ? this.adb(target, ['shell', 'input', 'keyevent', code], `press ${button}`) : result('adb', 'unsupported', false, `Unsupported Android button ${button}`);
     }
     const simviewButton: Record<string, string> = { HOME: 'home', POWER: 'lock', VOLUME_UP: 'volume-up', VOLUME_DOWN: 'volume-down' };
+    if (button === 'ENTER' || button === 'DELETE') {
+      const key = button === 'ENTER' ? 'return' : 'delete';
+      const hidCode = IOS_HID_KEY_CODES[button];
+      return this.dispatchSimViewOrIdb(target, 'press_key', { key, hidCode });
+    }
     const selected = simviewButton[button];
     if (!selected) return result('none', 'unsupported', false, `Unsupported iOS button ${button}`);
     return this.dispatchSimViewOrIdb(target, 'press_button', { button: selected });
@@ -688,6 +697,7 @@ export class NativeInputController {
       case 'swipe': capability = 'swipe-duration'; break;
       case 'type_text': capability = 'text'; break;
       case 'press_button': capability = 'button'; break;
+      case 'press_key': capability = 'key'; break;
       default: capability = 'tap'; break;
     }
     if (!provider.capabilities?.has(capability)) {
@@ -715,6 +725,8 @@ export class NativeInputController {
         if (!button || !provider.buttons?.has(button.toLowerCase())) return result('idb', 'unsupported', false, `IDB cannot press ${String(args.button)}`);
         command = ['ui', 'button', button, ...common]; break;
       }
+      case 'press_key':
+        command = ['ui', 'key', String(args.hidCode), ...common]; break;
       default: return result('idb', 'unsupported');
     }
     try {
@@ -805,6 +817,7 @@ export class NativeInputController {
       const from = args.from as { x: number; y: number }; const to = args.to as { x: number; y: number };
       return { from: point(from.x, from.y), to: point(to.x, to.y), durationMs: args.durationMs };
     }
+    if (operation === 'press_key') return { key: args.key };
     return args;
   }
 
