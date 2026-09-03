@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { PluginContext } from '../plugin.js';
+import { decodeCDPUnserializableValue } from './cdp.js';
 
 type Evaluate = PluginContext['evalInApp'];
 
@@ -18,8 +19,18 @@ export type AppEvaluationCompletion =
 
 type EvaluateScript = (
   expression: string,
-  options?: { timeout?: number; deadline?: number; objectGroup?: string },
+  options?: {
+    timeout?: number;
+    deadline?: number;
+    objectGroup?: string;
+    generation?: number;
+  },
 ) => Promise<AppEvaluationCompletion>;
+
+type SetupMailbox = (
+  expression: string,
+  options: { timeout?: number; deadline: number },
+) => Promise<number | undefined>;
 
 type SettleRemote = (
   objectId: string,
@@ -65,7 +76,7 @@ async function evaluateBeforeDeadline<T>(
   );
 }
 
-async function awaitPromiseBeforeDeadline<T>(
+export async function awaitPromiseBeforeDeadline<T>(
   operation: Promise<T>,
   deadline: number,
   timeout: number,
@@ -98,6 +109,34 @@ export interface AwaitAppResultOptions {
   settleRemote?: SettleRemote;
   /** Release handles if source evaluation completes after the host deadline. */
   releaseObjectGroup?: ReleaseObjectGroup;
+  /** Runtime generation captured after mailbox creation. */
+  getRuntimeGeneration?: () => number;
+  /** Create the mailbox while bracketing the dispatch with generation checks. */
+  setupMailbox?: SetupMailbox;
+}
+
+function serializeCompletionValue(value: unknown): {
+  expression: string;
+  unserializableValue?: string;
+} {
+  if (value === undefined) return { expression: 'void 0' };
+  if (typeof value === 'number') {
+    if (Number.isNaN(value)) return { expression: 'void 0', unserializableValue: 'NaN' };
+    if (value === Number.POSITIVE_INFINITY) return { expression: 'void 0', unserializableValue: 'Infinity' };
+    if (value === Number.NEGATIVE_INFINITY) return { expression: 'void 0', unserializableValue: '-Infinity' };
+    if (Object.is(value, -0)) return { expression: 'void 0', unserializableValue: '-0' };
+  }
+  if (typeof value === 'bigint') {
+    return {
+      expression: 'void 0',
+      unserializableValue: `${value.toString()}n`,
+    };
+  }
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new Error('App evaluation result could not be serialized');
+  }
+  return { expression: serialized };
 }
 
 async function completeByValue(
@@ -106,16 +145,17 @@ async function completeByValue(
   value: unknown,
   options: { deadline: number; timeout: number },
 ): Promise<void> {
-  const serialized = value === undefined ? 'void 0' : JSON.stringify(value);
-  if (serialized === undefined) {
-    throw new Error('App evaluation result could not be serialized');
-  }
+  const serialized = serializeCompletionValue(value);
+  const unserializableValue = serialized.unserializableValue === undefined
+    ? 'void 0'
+    : JSON.stringify(serialized.unserializableValue);
   await evaluateBeforeDeadline(
     evaluate,
     `(function() {
       var state = globalThis[${key}];
       if (state) {
-        state.value = ${serialized};
+        state.unserializableValue = ${unserializableValue};
+        state.value = ${serialized.expression};
         state.status = 'fulfilled';
       }
     })()`,
@@ -157,7 +197,7 @@ export async function awaitAppResult(
   };
 
   try {
-    await evaluateBeforeDeadline(evaluate, `(function() {
+    const mailboxSetup = `(function() {
       var state = { status: 'pending' };
       Object.defineProperty(globalThis, ${key}, {
         value: state, configurable: true
@@ -166,7 +206,20 @@ export async function awaitAppResult(
         if (globalThis[${key}] === state) delete globalThis[${key}];
       }, ${timeout + 1000});
       return true;
-    })()`, { timeout, deadline }, timeout);
+    })()`;
+    const mailboxGeneration = options?.setupMailbox
+      ? await evaluateBeforeDeadline(
+        options.setupMailbox,
+        mailboxSetup,
+        { timeout, deadline },
+        timeout,
+      )
+      : await evaluateBeforeDeadline(
+        evaluate,
+        mailboxSetup,
+        { timeout, deadline },
+        timeout,
+      ).then(() => options?.getRuntimeGeneration?.());
 
     // Runtime.evaluate must receive the user's source itself. Indirect eval
     // runs in a separate variable environment and silently loses top-level
@@ -176,7 +229,12 @@ export async function awaitAppResult(
     let completion: AppEvaluationCompletion;
     if (options?.evaluateScript) {
       if (Date.now() >= deadline) throw timeoutError(timeout);
-      sourceEvaluation = options.evaluateScript(expression, { timeout, deadline, objectGroup });
+      sourceEvaluation = options.evaluateScript(expression, {
+        timeout,
+        deadline,
+        objectGroup,
+        generation: mailboxGeneration,
+      });
       sourceEvaluation.then(
         () => { sourceEvaluationSettled = true; },
         () => { sourceEvaluationSettled = true; },
@@ -213,14 +271,22 @@ export async function awaitAppResult(
         var state = globalThis[${key}];
         if (!state) return { status: 'missing' };
         return {
-          status: state.status, value: state.value, error: state.error
+          status: state.status,
+          value: state.value,
+          unserializableValue: state.unserializableValue,
+          error: state.error
         };
       })()`, { timeout: Math.max(1, deadline - Date.now()), deadline }, timeout) as {
         status: string;
         value?: unknown;
+        unserializableValue?: unknown;
         error?: string;
       };
-      if (result?.status === 'fulfilled') return result.value;
+      if (result?.status === 'fulfilled') {
+        return result.unserializableValue === undefined
+          ? result.value
+          : decodeCDPUnserializableValue(result.unserializableValue);
+      }
       if (result?.status === 'rejected') throw new Error(result.error);
       if (!result || result.status !== 'pending') {
         throw new Error('App evaluation context was lost before measurement completed');
