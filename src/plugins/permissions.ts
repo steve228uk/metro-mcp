@@ -1,11 +1,10 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
 
-// Module-level caches — persist across tool handler calls for the lifetime of the server.
-let platformCache: { value: 'ios' | 'android' | null; ts: number } | null = null;
+// Bundle IDs are stable for a plugin session; device state is deliberately
+// resolved on every call so a simulator booted after a miss is visible.
 let bundleIdCache: string | null = null;
-let iosUdidCache: { value: string | null; ts: number } | null = null;
-const IOS_UDID_TTL_MS = 30_000;
 
 // TCC service name → friendly name
 const TCC_SERVICE_MAP: Record<string, string> = {
@@ -98,36 +97,13 @@ export const permissionsPlugin = definePlugin({
 
   async setup(ctx) {
     async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      const now = Date.now();
-      if (platformCache && now - platformCache.ts < IOS_UDID_TTL_MS) return platformCache.value;
-      const [iosUdidResult, androidResult] = await Promise.allSettled([
-        getBootedIosUdid(),
-        ctx.exec('adb devices 2>/dev/null'),
-      ]);
-      let platform: 'ios' | 'android' | null = null;
-      if (iosUdidResult.status === 'fulfilled' && iosUdidResult.value !== null) {
-        platform = 'ios';
-      } else if (androidResult.status === 'fulfilled') {
-        const output = (androidResult as PromiseFulfilledResult<string>).value;
-        if (output.trim().split('\n').length > 1) platform = 'android';
-      }
-      platformCache = { value: platform, ts: now };
-      return platform;
+      const device = await resolveDevice(ctx, 'auto', ctx.cdp.getTarget());
+      return device?.platform ?? null;
     }
 
     async function getBootedIosUdid(): Promise<string | null> {
-      const now = Date.now();
-      if (iosUdidCache && now - iosUdidCache.ts < IOS_UDID_TTL_MS) return iosUdidCache.value;
-      const devicesJson = await ctx.exec('xcrun simctl list devices booted --json');
-      const devicesData = JSON.parse(devicesJson) as {
-        devices: Record<string, Array<{ udid: string; state: string }>>;
-      };
-      const udid =
-        Object.values(devicesData.devices)
-          .flat()
-          .find((d) => d.state === 'Booted')?.udid ?? null;
-      iosUdidCache = { value: udid, ts: now };
-      return udid;
+      const device = await resolveDevice(ctx, 'ios', ctx.cdp.getTarget());
+      return device?.id ?? null;
     }
 
     async function detectBundleId(platform: 'ios' | 'android'): Promise<string | null> {
@@ -170,7 +146,9 @@ export const permissionsPlugin = definePlugin({
           const serviceError = validateIosService(service);
           if (serviceError) return serviceError;
           try {
-            await ctx.exec(`xcrun simctl privacy booted ${action} "${service}" "${id}"`);
+            const udid = await getBootedIosUdid();
+            if (!udid) return 'No booted iOS simulator found.';
+            await ctx.exec(`xcrun simctl privacy "${udid}" ${action} "${service}" "${id}"`);
             return action === 'grant'
               ? `Granted "${service}" permission to ${id} on iOS simulator.`
               : `Revoked "${service}" permission from ${id} on iOS simulator.`;
@@ -180,7 +158,9 @@ export const permissionsPlugin = definePlugin({
         } else {
           const perm = normalizeAndroidPermission(service);
           try {
-            await ctx.exec(`adb shell pm ${action} "${id}" "${perm}"`);
+            const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
+            if (!device) return 'No authorized Android device found.';
+            await ctx.exec(`${adbPrefix(device.id)} shell pm ${action} "${id}" "${perm}"`);
             return action === 'grant'
               ? `Granted "${perm}" to ${id} on Android device.`
               : `Revoked "${perm}" from ${id} on Android device.`;
@@ -243,7 +223,9 @@ export const permissionsPlugin = definePlugin({
         }
       } else {
         try {
-          const output = await ctx.exec(`adb shell dumpsys package "${id}" 2>/dev/null`);
+          const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
+          if (!device) return 'No authorized Android device found.';
+          const output = await ctx.exec(`${adbPrefix(device.id)} shell dumpsys package "${id}" 2>/dev/null`);
           const permissions: Record<string, string> = {};
           const permRegex = /(android\.permission\.\w+):\s*granted=(\w+)/g;
           let match;
@@ -327,7 +309,9 @@ export const permissionsPlugin = definePlugin({
             if (serviceError) return serviceError;
           }
           try {
-            await ctx.exec(`xcrun simctl privacy booted reset "${iosTarget}" "${id}"`);
+            const udid = await getBootedIosUdid();
+            if (!udid) return 'No booted iOS simulator found.';
+            await ctx.exec(`xcrun simctl privacy "${udid}" reset "${iosTarget}" "${id}"`);
             return `Reset ${service ? `"${service}"` : 'all'} permissions for ${id} on iOS simulator.`;
           } catch (err) {
             return `Failed to reset permissions: ${err instanceof Error ? err.message : String(err)}`;
@@ -336,14 +320,20 @@ export const permissionsPlugin = definePlugin({
           try {
             if (service) {
               const perm = normalizeAndroidPermission(service);
-              await ctx.exec(`adb shell pm revoke "${id}" "${perm}"`);
+              const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
+              if (!device) return 'No authorized Android device found.';
+              await ctx.exec(`${adbPrefix(device.id)} shell pm revoke "${id}" "${perm}"`);
               return `Reset "${perm}" for ${id} on Android device.`;
             } else {
               // pm reset-permissions not available on older Android; pm clear resets all app state including permissions
               try {
-                await ctx.exec(`adb shell pm reset-permissions -p "${id}" 2>/dev/null`);
+                const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
+                if (!device) return 'No authorized Android device found.';
+                await ctx.exec(`${adbPrefix(device.id)} shell pm reset-permissions -p "${id}" 2>/dev/null`);
               } catch {
-                await ctx.exec(`adb shell pm clear "${id}"`);
+                const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
+                if (!device) return 'No authorized Android device found.';
+                await ctx.exec(`${adbPrefix(device.id)} shell pm clear "${id}"`);
               }
               return `Reset all permissions for ${id} on Android device.`;
             }
@@ -373,7 +363,9 @@ export const permissionsPlugin = definePlugin({
 
         if (p === 'ios') {
           try {
-            await ctx.exec('xcrun simctl openurl booted app-settings:');
+            const udid = await getBootedIosUdid();
+            if (!udid) return 'No booted iOS simulator found.';
+            await ctx.exec(`xcrun simctl openurl "${udid}" app-settings:`);
             return 'Opened app settings on iOS simulator.';
           } catch (err) {
             return `Failed to open app settings: ${err instanceof Error ? err.message : String(err)}`;
@@ -382,8 +374,10 @@ export const permissionsPlugin = definePlugin({
           const id = bundleId || (await detectBundleId(p));
           if (!id) return 'Package name required for Android. Provide bundleId.';
           try {
+            const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
+            if (!device) return 'No authorized Android device found.';
             await ctx.exec(
-              `adb shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d "package:${id}"`
+              `${adbPrefix(device.id)} shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d "package:${id}"`
             );
             return `Opened app settings for ${id} on Android device.`;
           } catch (err) {

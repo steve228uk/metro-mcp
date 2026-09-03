@@ -1,5 +1,9 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import {
+  adbPrefix,
+  resolveDevice,
+} from '../utils/device-discovery.js';
 
 export const deeplinkPlugin = definePlugin({
   name: 'deeplink',
@@ -7,17 +11,8 @@ export const deeplinkPlugin = definePlugin({
   description: 'Cross-platform deep link testing',
 
   async setup(ctx) {
-    async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      try {
-        await ctx.exec('xcrun simctl list booted 2>/dev/null | grep -q Booted');
-        return 'ios';
-      } catch {}
-      try {
-        const output = await ctx.exec('adb devices 2>/dev/null');
-        if (output.trim().split('\n').length > 1) return 'android';
-      } catch {}
-      return null;
-    }
+    const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
+      resolveDevice(ctx, platform, ctx.cdp.getTarget());
 
     ctx.registerTool('open_deeplink', {
       description: 'Open a URL or deep link on the connected iOS simulator or Android device.',
@@ -27,14 +22,15 @@ export const deeplinkPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ url, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         if (p === 'ios') {
-          await ctx.exec(`xcrun simctl openurl booted "${url}"`);
+          await ctx.exec(`xcrun simctl openurl "${target.id}" "${url}"`);
         } else {
           await ctx.exec(
-            `adb shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "${url}"`
+            `${adbPrefix(target.id)} shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "${url}"`
           );
         }
         return `Opened "${url}" on ${p === 'ios' ? 'iOS simulator' : 'Android device'}.`;
@@ -71,9 +67,9 @@ export const deeplinkPlugin = definePlugin({
 
         // Fallback: check Info.plist on iOS
         try {
-          const platform = await detectPlatform();
-          if (platform === 'android' && bundleId) {
-            const output = await ctx.exec(`adb shell pm dump "${bundleId}" | grep -A5 "scheme" 2>/dev/null`);
+          const target = await resolveTarget('auto');
+          if (target?.platform === 'android' && bundleId) {
+            const output = await ctx.exec(`${adbPrefix(target.id)} shell pm dump "${bundleId}" | grep -A5 "scheme" 2>/dev/null`);
             return output || 'No URL schemes found.';
           }
         } catch {}
