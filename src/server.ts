@@ -129,6 +129,61 @@ const BUILT_IN_PLUGINS: PluginDefinition[] = [
   environmentPlugin,
 ];
 
+export interface ReconnectWaitTimers {
+  setInterval(callback: () => void, delay: number): ReturnType<typeof setInterval>;
+  clearInterval(handle: ReturnType<typeof setInterval>): void;
+  setTimeout(callback: () => void, delay: number): ReturnType<typeof setTimeout>;
+  clearTimeout(handle: ReturnType<typeof setTimeout>): void;
+}
+
+const reconnectWaitTimers: ReconnectWaitTimers = {
+  setInterval,
+  clearInterval,
+  setTimeout,
+  clearTimeout,
+};
+
+export function waitForReconnect(
+  isReconnecting: () => boolean,
+  deadline?: number,
+  timers: ReconnectWaitTimers = reconnectWaitTimers,
+): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (!isReconnecting()) {
+      resolve();
+      return;
+    }
+    let check: ReturnType<typeof setInterval> | null = null;
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (error?: Error): void => {
+      if (check) {
+        timers.clearInterval(check);
+        check = null;
+      }
+      if (deadlineTimer) {
+        timers.clearTimeout(deadlineTimer);
+        deadlineTimer = null;
+      }
+      if (error) reject(error);
+      else resolve();
+    };
+    check = timers.setInterval(() => {
+      if (!isReconnecting()) finish();
+    }, 100);
+    if (deadline !== undefined) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        finish(new Error('App evaluation timed out'));
+        return;
+      }
+      deadlineTimer = timers.setTimeout(
+        () => finish(new Error('App evaluation timed out')),
+        remaining,
+      );
+    }
+  });
+}
+
 type RuntimeRegistration = (server: McpServer) => { remove: () => void };
 
 interface McpSession {
@@ -244,29 +299,18 @@ export async function createMetroRuntime(
   const MAX_BURST_ATTEMPTS = 15; // fast retries; after this, switch to slow background probe
   let reconnectAttempts = 0;
   let isReconnecting = false;
+  let runtimeGeneration = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectStabilityTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const waitForCurrentReconnect = (deadline?: number): Promise<void> =>
+    waitForReconnect(() => isReconnecting, deadline);
 
   function clearReconnectStabilityTimer(): void {
     if (reconnectStabilityTimer) {
       clearTimeout(reconnectStabilityTimer);
       reconnectStabilityTimer = null;
     }
-  }
-
-  function waitForReconnect(): Promise<void> {
-    return new Promise<void>((resolve) => {
-      if (!isReconnecting) {
-        resolve();
-        return;
-      }
-      const check = setInterval(() => {
-        if (!isReconnecting) {
-          clearInterval(check);
-          resolve();
-        }
-      }, 100);
-    });
   }
 
   // Enable required CDP domains. Called on every CDP connection and after Metro
@@ -310,6 +354,7 @@ export async function createMetroRuntime(
 
   // Enable required CDP domains on every connection (initial and reconnect).
   cdpSession.on('reconnected', async () => {
+    runtimeGeneration++;
     isReconnecting = false;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -328,6 +373,7 @@ export async function createMetroRuntime(
 
   // Drive all reconnection through connectToMetro() so we always get a fresh target URL.
   cdpSession.on('disconnected', () => {
+    runtimeGeneration++;
     clearReconnectStabilityTimer();
     cleanProxyLock();
     scheduleReconnect();
@@ -339,6 +385,7 @@ export async function createMetroRuntime(
   // Metro fires 'bundle_build_done' once the new bundle is ready to run.
   eventsClient.on('bundle_build_done', async () => {
     if (!cdpSession.isConnected) return;
+    runtimeGeneration++;
     logger.info('Metro bundle rebuilt — re-enabling CDP domains');
     await enableCDPDomains();
   });
@@ -371,12 +418,12 @@ export async function createMetroRuntime(
   ): PluginContext {
     const pluginLogger = createLogger(plugin.name);
     const evalInApp = createAppEvaluator(cdpSession, {
-      ensureConnected: async () => {
+      ensureConnected: async (deadline?: number) => {
         if (!cdpSession.isConnected) {
           if (isReconnecting) {
             // A reconnect is already in flight — wait for it rather than
             // starting another one.
-            await waitForReconnect();
+            await waitForCurrentReconnect(deadline);
           } else {
             // Reset the attempt counter so the background scheduler can resume
             // after this tool-triggered reconnect, rather than staying capped.
@@ -391,8 +438,9 @@ export async function createMetroRuntime(
           );
         }
       },
-      waitForReconnect,
+      waitForReconnect: waitForCurrentReconnect,
       isReconnecting: () => isReconnecting,
+      getGeneration: () => runtimeGeneration,
       reconnect: async () => {
         reconnectAttempts = 0;
         await connectToMetro();
@@ -754,7 +802,7 @@ export async function createMetroRuntime(
   // Idempotent: concurrent callers wait for the in-flight attempt to finish.
   async function connectToMetro(): Promise<boolean> {
     if (isReconnecting) {
-      await waitForReconnect();
+      await waitForCurrentReconnect();
       return cdpSession.isConnected;
     }
     isReconnecting = true;

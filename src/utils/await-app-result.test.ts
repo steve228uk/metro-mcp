@@ -34,7 +34,19 @@ function hermesHarness() {
     if (result && typeof (result as Promise<unknown>).then === 'function') {
       void Promise.resolve(result).then(
         (value) => {
-          if (state) { state.value = value; state.status = 'fulfilled'; }
+          if (state) {
+            state.unserializableValue = undefined;
+            if (typeof value === 'number') {
+              if (Number.isNaN(value)) state.unserializableValue = 'NaN';
+              else if (value === Infinity) state.unserializableValue = 'Infinity';
+              else if (value === -Infinity) state.unserializableValue = '-Infinity';
+              else if (Object.is(value, -0)) state.unserializableValue = '-0';
+            } else if (typeof value === 'bigint') {
+              state.unserializableValue = String(value) + 'n';
+            }
+            state.value = state.unserializableValue === undefined ? value : undefined;
+            state.status = 'fulfilled';
+          }
         },
         (error) => {
           if (state) {
@@ -80,6 +92,24 @@ function userRuntimeKeys(runtime: vm.Context): string[] {
   );
 }
 
+const UNSERIALIZABLE_CASES: Array<[string, unknown]> = [
+  ['NaN', Number.NaN],
+  ['Infinity', Number.POSITIVE_INFINITY],
+  ['-Infinity', Number.NEGATIVE_INFINITY],
+  ['-0', -0],
+  ['123456789012345678901234567890n', 123456789012345678901234567890n],
+];
+
+function expectUnserializableValue(actual: unknown, expected: unknown): void {
+  if (typeof expected === 'number' && Object.is(expected, -0)) {
+    expect(Object.is(actual, -0)).toBe(true);
+  } else if (typeof expected === 'number' && Number.isNaN(expected)) {
+    expect(Number.isNaN(actual)).toBe(true);
+  } else {
+    expect(actual).toBe(expected);
+  }
+}
+
 describe('async app read results', () => {
   test('awaits a promise when CDP serializes the promise object', async () => {
     const { runtime, evaluate, awaitResult } = hermesHarness();
@@ -122,6 +152,22 @@ describe('async app read results', () => {
       awaitResult('Promise.resolve(42)'),
     ])).toEqual([undefined, null, 42]);
     expect(userRuntimeKeys(runtime)).toEqual([]);
+  });
+
+  test('preserves unserializable values from remote Promise settlement', async () => {
+    const { awaitResult } = hermesHarness();
+    for (const [source, expected] of UNSERIALIZABLE_CASES) {
+      const actual = await awaitResult(`Promise.resolve(${source})`);
+      expectUnserializableValue(actual, expected);
+    }
+  });
+
+  test('preserves unserializable synchronous awaited completions', async () => {
+    const { awaitResult } = hermesHarness();
+    for (const [source, expected] of UNSERIALIZABLE_CASES) {
+      const actual = await awaitResult(source);
+      expectUnserializableValue(actual, expected);
+    }
   });
 
   test('preserves script completion values and executes the source once', async () => {
