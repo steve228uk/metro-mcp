@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import type { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -699,6 +700,32 @@ export class DaemonLeaseClient {
   }
 }
 
+/** SDK stdio transports do not turn stdin EOF into an onclose notification. */
+export function registerStdioProxyShutdown(
+  shutdown: () => void,
+  input: EventEmitter = process.stdin,
+  lifecycle: EventEmitter = process,
+): () => void {
+  let requested = false;
+  const requestShutdown = () => {
+    if (requested) return;
+    requested = true;
+    shutdown();
+  };
+  input.on('end', requestShutdown);
+  input.on('close', requestShutdown);
+  lifecycle.on('SIGINT', requestShutdown);
+  lifecycle.on('SIGTERM', requestShutdown);
+  lifecycle.on('beforeExit', requestShutdown);
+  return () => {
+    input.off('end', requestShutdown);
+    input.off('close', requestShutdown);
+    lifecycle.off('SIGINT', requestShutdown);
+    lifecycle.off('SIGTERM', requestShutdown);
+    lifecycle.off('beforeExit', requestShutdown);
+  };
+}
+
 export async function startStdioProxy(args: string[]): Promise<void> {
   const record = await ensureDaemon(args);
   const lease = new DaemonLeaseClient(record);
@@ -707,6 +734,7 @@ export async function startStdioProxy(args: string[]): Promise<void> {
     new URL(record.url),
   );
   let closing = false;
+  const removeShutdownListeners = registerStdioProxyShutdown(() => void close());
 
   async function closeQuietly(transport: {
     close(): Promise<void>;
@@ -719,6 +747,7 @@ export async function startStdioProxy(args: string[]): Promise<void> {
     closing = true;
     await lease.stop().catch(() => {});
     await Promise.all([closeQuietly(stdio), closeQuietly(daemonTransport)]);
+    removeShutdownListeners();
     process.exit(0);
   }
 
