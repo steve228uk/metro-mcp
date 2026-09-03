@@ -8,18 +8,22 @@ type Tool = {
   handler: (args: Record<string, unknown>) => Promise<ToolHandlerResult>;
 };
 
+type AppEvaluation =
+  | 'success'
+  | 'failure'
+  | 'pre-dispatch'
+  | 'unhandled'
+  | {
+      renderer: 'paper' | 'fabric';
+      value: string;
+    }
+  | {
+      renderer: 'paper' | 'fabric';
+      defaultValue: string;
+    };
+
 async function createAppOnlyHarness(
-  evaluation:
-    | 'success'
-    | 'failure'
-    | 'pre-dispatch'
-    | 'unhandled'
-    | 'fabric-focused'
-    | 'paper-focused'
-    | 'fabric-empty'
-    | 'paper-empty'
-    | 'fabric-uncontrolled'
-    | 'paper-uncontrolled' = 'success',
+  evaluation: AppEvaluation = 'success',
   nativeAvailable = false,
 ) {
   const tools = new Map<string, Tool>();
@@ -76,11 +80,11 @@ async function createAppOnlyHarness(
         throw new Error('Not connected to Metro. Use list_devices to check connection status.');
       }
       if (evaluation === 'unhandled') return false;
-      if (evaluation.endsWith('-focused') || evaluation.endsWith('-empty') || evaluation.endsWith('-uncontrolled')) {
+      if (typeof evaluation === 'object') {
         const publicInstance = { isFocused: () => true };
-        const fabric = evaluation.startsWith('fabric-');
-        const controlled = !evaluation.endsWith('-uncontrolled');
-        const value = evaluation.endsWith('-empty') ? '' : 'hello';
+        const fabric = evaluation.renderer === 'fabric';
+        const controlled = 'value' in evaluation;
+        const value = controlled ? evaluation.value : evaluation.defaultValue;
         const host = {
           stateNode: fabric ? { canonical: { publicInstance } } : publicInstance,
           child: null,
@@ -115,6 +119,21 @@ async function createAppOnlyHarness(
   };
   await uiInteractPlugin.setup(ctx);
   return { tools, getNativeCalls: () => nativeCalls, evaluations, execCommands, reactCalls };
+}
+
+async function pressTextInputKeys(
+  evaluation: Extract<AppEvaluation, object>,
+  options: { nativeAvailable?: boolean; platform?: 'ios' | 'android' } = {},
+) {
+  const harness = await createAppOnlyHarness(evaluation, options.nativeAvailable);
+  const press = harness.tools.get('press_button')!;
+  for (const button of ['ENTER', 'DELETE'] as const) {
+    expect(await press.handler(press.parameters.parse({
+      button,
+      platform: options.platform ?? 'ios',
+    }) as Record<string, unknown>)).toBe(`Pressed ${button}`);
+  }
+  return harness;
 }
 
 describe('UI handler actions without native inventory', () => {
@@ -169,12 +188,7 @@ describe('UI handler actions without native inventory', () => {
 
   test('invokes controlled Paper and Fabric handlers with exact non-empty payloads', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
-      const harness = await createAppOnlyHarness(`${renderer}-focused`);
-      const press = harness.tools.get('press_button')!;
-      for (const button of ['ENTER', 'DELETE'] as const) {
-        expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
-          .toBe(`Pressed ${button}`);
-      }
+      const harness = await pressTextInputKeys({ renderer, value: 'hello' });
       expect(harness.reactCalls).toEqual([
         { type: 'submit', value: { nativeEvent: { text: 'hello' } } },
         { type: 'change', value: 'hell' },
@@ -185,12 +199,7 @@ describe('UI handler actions without native inventory', () => {
 
   test('invokes controlled Paper and Fabric handlers with exact empty payloads', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
-      const harness = await createAppOnlyHarness(`${renderer}-empty`);
-      const press = harness.tools.get('press_button')!;
-      for (const button of ['ENTER', 'DELETE'] as const) {
-        expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
-          .toBe(`Pressed ${button}`);
-      }
+      const harness = await pressTextInputKeys({ renderer, value: '' });
       expect(harness.reactCalls).toEqual([
         { type: 'submit', value: { nativeEvent: { text: '' } } },
         { type: 'change', value: '' },
@@ -201,12 +210,10 @@ describe('UI handler actions without native inventory', () => {
 
   test('leaves uncontrolled Paper and Fabric inputs for native handling', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
-      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true);
-      const press = harness.tools.get('press_button')!;
-      for (const button of ['ENTER', 'DELETE'] as const) {
-        expect(await press.handler(press.parameters.parse({ button, platform: 'android' }) as Record<string, unknown>))
-          .toBe(`Pressed ${button}`);
-      }
+      const harness = await pressTextInputKeys(
+        { renderer, defaultValue: 'hello' },
+        { nativeAvailable: true, platform: 'android' },
+      );
       expect(harness.reactCalls).toEqual([]);
       expect(harness.execCommands).toEqual([
         'adb -s "emulator-42" shell input keyevent 66',
