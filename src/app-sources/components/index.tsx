@@ -5,6 +5,9 @@ import { initialize, callTool, getToolText } from '../shared/bridge';
 import { useKeyboard } from '../shared/useKeyboard';
 
 interface FiberNode {
+  id: string;
+  parentId: string | null;
+  depth: number;
   name: string;
   children?: FiberNode[];
   props?: Record<string, unknown>;
@@ -19,27 +22,73 @@ interface InspectResult {
   hooks: Array<{ index: number; value: unknown }>;
 }
 
+interface Traversal {
+  scope: 'focused-scene' | 'all-scenes';
+  complete: boolean;
+  depthReached: number;
+  scannedNodes: number;
+  truncationReason?: string;
+}
+
+interface TreePage {
+  snapshotId: string | null;
+  nodes: FiberNode[];
+  traversal: Traversal;
+  nextCursor?: string;
+  error?: string;
+}
+
+interface InspectEnvelope {
+  result: InspectResult | null;
+  traversal: Traversal;
+}
+
 function App() {
-  const [tree, setTree] = useState<FiberNode | null>(null);
+  const [tree, setTree] = useState<FiberNode[]>([]);
   const [selected, setSelected] = useState<InspectResult | null>(null);
   const [inspecting, setInspecting] = useState('');
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState('');
+  const [warning, setWarning] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
 
   const fetchTree = useCallback(async () => {
     try {
-      const result = await callTool('get_component_tree', { structureOnly: true, maxDepth: 30 });
-      const text = getToolText(result);
-      if (text.startsWith('Component tree not available')) {
-        setMsg(text);
+      const nodes: FiberNode[] = [];
+      const seenCursors = new Set<string>();
+      let cursor: string | undefined;
+      let lastPage: TreePage | null = null;
+      do {
+        const result = await callTool('get_component_tree', {
+          structureOnly: true,
+          pageSize: 250,
+          ...(cursor ? { cursor } : {}),
+        });
+        const page = JSON.parse(getToolText(result)) as TreePage;
+        lastPage = page;
+        nodes.push(...page.nodes);
+        cursor = page.nextCursor;
+        if (cursor && seenCursors.has(cursor)) throw new Error('Repeated component-tree cursor');
+        if (cursor) seenCursors.add(cursor);
+      } while (cursor);
+
+      if (lastPage?.error) {
+        setMsg(lastPage.error);
+        setTree([]);
+        setWarning('');
       } else {
-        setTree(JSON.parse(text) as FiberNode);
+        setTree(reconstructTree(nodes));
         setMsg('');
+        setWarning(
+          lastPage && !lastPage.traversal.complete
+            ? `Incomplete ${lastPage.traversal.scope} traversal: ${lastPage.traversal.truncationReason ?? 'limit reached'} after ${lastPage.traversal.scannedNodes} fibers (depth ${lastPage.traversal.depthReached}).`
+            : '',
+        );
       }
     } catch {
       setMsg('Component tree unavailable. Ensure the app is running.');
+      setWarning('');
     } finally {
       setLoading(false);
     }
@@ -49,12 +98,8 @@ function App() {
     setInspecting(name);
     try {
       const result = await callTool('inspect_component', { name });
-      const text = getToolText(result);
-      if (text.includes('not found')) {
-        setSelected(null);
-      } else {
-        setSelected(JSON.parse(text) as InspectResult);
-      }
+      const envelope = JSON.parse(getToolText(result)) as InspectEnvelope;
+      setSelected(envelope.result);
     } catch {
       setSelected(null);
     } finally {
@@ -78,18 +123,24 @@ function App() {
       </div>
       <div class="split">
         <div class="split-main" style="padding:8px">
+          {warning && (
+            <div style="margin:0 0 8px;padding:7px 9px;border:1px solid var(--warn);border-radius:var(--r);color:var(--warn);font-size:11px">
+              {warning}
+            </div>
+          )}
           {loading && <div class="empty">Loading…</div>}
           {!loading && msg && <div class="empty">{msg}<p>Ensure the app is running and React DevTools hook is active.</p></div>}
-          {!loading && !msg && tree && (
+          {!loading && !msg && tree.map(node => (
             <NodeTree
-              node={tree}
+              key={node.id}
+              node={node}
               search={search}
               depth={0}
               activeInspect={selected?.name ?? ''}
               onInspect={inspect}
               inspecting={inspecting}
             />
-          )}
+          ))}
         </div>
         {selected && (
           <div class="split-side open">
@@ -127,6 +178,21 @@ function App() {
       </div>
     </div>
   );
+}
+
+function reconstructTree(flatNodes: FiberNode[]): FiberNode[] {
+  const byId = new Map<string, FiberNode>();
+  const roots: FiberNode[] = [];
+  for (const flatNode of flatNodes) {
+    byId.set(flatNode.id, { ...flatNode, children: [] });
+  }
+  for (const flatNode of flatNodes) {
+    const node = byId.get(flatNode.id)!;
+    const parent = flatNode.parentId ? byId.get(flatNode.parentId) : undefined;
+    if (parent) parent.children!.push(node);
+    else roots.push(node);
+  }
+  return roots;
 }
 
 function NodeTree({ node, search, depth, activeInspect, onInspect, inspecting }: {

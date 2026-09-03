@@ -1,7 +1,17 @@
 import { readFile } from 'fs/promises';
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { FIBER_ROOT_JS, FIND_AND_INVOKE_JS, GET_ROUTE_FUNC_JS, SWIPE_COORDS } from '../utils/fiber.js';
+import {
+  DEFAULT_FIBER_MAX_DEPTH,
+  DEFAULT_FIBER_MAX_NODES,
+  FIBER_ROOT_JS,
+  FIND_AND_INVOKE_JS,
+  GET_ROUTE_FUNC_JS,
+  MAX_FIBER_DEPTH,
+  MAX_FIBER_NODES,
+  SWIPE_COORDS,
+  buildFiberReadExpression,
+} from '../utils/fiber.js';
 
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let idbAvailableCache: boolean | null = null;
@@ -47,16 +57,27 @@ export const uiInteractPlugin = definePlugin({
 
     ctx.registerTool('list_elements', {
       description:
-        'Get interactive elements from the current screen via the React component tree. Returns labels, testIDs, and roles — use label or testID with tap_element.',
+        'Get labelled or interactive elements from the focused React screen. Check traversal.complete before treating an empty elements array as definitive.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
         interactiveOnly: z.boolean().default(false).describe('Return only elements with onPress handlers'),
+        maxDepth: z
+          .number()
+          .int()
+          .min(0)
+          .max(MAX_FIBER_DEPTH)
+          .default(DEFAULT_FIBER_MAX_DEPTH),
+        maxNodes: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_FIBER_NODES)
+          .default(DEFAULT_FIBER_MAX_NODES),
       }),
-      handler: async ({ interactiveOnly }) => {
-        const elements = await ctx.evalInApp(`
-          (function() {
-            ${FIBER_ROOT_JS}
-            var results = [];
+      handler: async ({ interactiveOnly, maxDepth, maxNodes }) => {
+        const expression = buildFiberReadExpression(
+          `
+            var elements = [];
             var INTERACTIVE = new Set([
               'TouchableOpacity','TouchableHighlight','TouchableWithoutFeedback',
               'TouchableNativeFeedback','Pressable','Button',
@@ -64,59 +85,20 @@ export const uiInteractPlugin = definePlugin({
               'LongPressGestureHandler','TapGestureHandler',
               'Chip','FAB','IconButton','ListItem','MenuItem',
             ]);
-            function getName(fiber) {
-              if (!fiber || !fiber.type) return null;
-              if (typeof fiber.type === 'string') return fiber.type;
-              return fiber.type.displayName || fiber.type.name || null;
-            }
-            var seenTestIDs = {};
-            var stack = [{ fiber: rootFiber, depth: 0 }];
-            while (stack.length > 0) {
-              var item = stack.pop();
-              var fiber = item.fiber; var depth = item.depth;
-              if (!fiber || depth > 200) continue;
-              var name = getName(fiber);
-              if (name && name.indexOf('RCT') === 0) {
-                if (fiber.sibling) stack.push({ fiber: fiber.sibling, depth: depth });
-                if (fiber.child) stack.push({ fiber: fiber.child, depth: depth + 1 });
-                continue;
-              }
-              if (name) {
-                var props = fiber.memoizedProps || {};
-                var label = props.accessibilityLabel || props['aria-label'] || null;
-                var testID = props.testID || null;
-                var role  = props.accessibilityRole || props['role'] || null;
-                var interactive = !!(props.onPress || props.onPressIn || props.onLongPress ||
-                                     props.onTap || props.onClick || props.accessible ||
-                                     props.hitSlop || ('disabled' in props)) ||
-                                  INTERACTIVE.has(name);
-                if (label || testID || interactive) {
-                  if (!testID || !seenTestIDs[testID]) {
-                    if (testID) seenTestIDs[testID] = true;
-                    results.push({ type: name, label, testID, role, interactive,
-                                   hint: props.accessibilityHint || null });
-                  }
-                }
-              }
-              if (fiber.sibling) stack.push({ fiber: fiber.sibling, depth: depth });
-              if (fiber.child) stack.push({ fiber: fiber.child, depth: depth + 1 });
-            }
-            return results;
-          })()
-        `).catch(() => null);
-
-        if (!elements || !Array.isArray(elements)) {
-          return 'Component tree not available. Ensure the app is running and Metro is connected.';
-        }
-        const filtered = interactiveOnly
-          ? (elements as Array<Record<string, unknown>>).filter((e) => e.interactive)
-          : elements;
-        if ((filtered as unknown[]).length === 0) {
-          return interactiveOnly
-            ? 'No interactive elements found on the current screen.'
-            : 'No labelled or interactive elements found on the current screen.';
-        }
-        return filtered;
+            var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber, context) {
+              var element = metroElementFromFiber(fiber);
+              if (!element) return;
+              element.interactive = element.interactive || INTERACTIVE.has(element.name);
+              if (${interactiveOnly} && !element.interactive) return;
+              if (!element.label && !element.testID && !element.interactive) return;
+              element.depth = context.depth;
+              elements.push(element);
+            });
+            return { elements: elements, traversal: traversal };
+          `,
+          { maxDepth, maxNodes },
+        );
+        return ctx.evalInApp(expression, { timeout: 10_000 });
       },
     });
 
