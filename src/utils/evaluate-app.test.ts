@@ -1,12 +1,24 @@
 import { describe, expect, test } from 'bun:test';
 import vm from 'node:vm';
-import { createAppEvaluator, evaluateAppScript } from './evaluate-app.js';
+import {
+  createAppEvaluator,
+  evaluateAppScript,
+  evaluateAppScriptCompletion,
+} from './evaluate-app.js';
 
 function cdpHarness(response: unknown) {
-  const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+  const calls: Array<{
+    method: string;
+    params?: Record<string, unknown>;
+    options?: Record<string, unknown>;
+  }> = [];
   const cdp = {
-    send: async (method: string, params?: Record<string, unknown>) => {
-      calls.push({ method, params });
+    send: async (
+      method: string,
+      params?: Record<string, unknown>,
+      options?: Record<string, unknown>,
+    ) => {
+      calls.push({ method, params, options });
       if (response instanceof Error) throw response;
       return response;
     },
@@ -27,6 +39,7 @@ describe('raw app evaluation', () => {
         awaitPromise: false,
         timeout: 1234,
       },
+      options: { timeoutMs: 1234 },
     }]);
   });
 
@@ -38,6 +51,27 @@ describe('raw app evaluation', () => {
     expect(calls).toHaveLength(1);
   });
 
+  test('keeps the engine timeout with a remote completion group', async () => {
+    const { cdp, calls } = cdpHarness({
+      result: { type: 'object', subtype: 'promise', objectId: 'promise-1' },
+    });
+    await expect(evaluateAppScriptCompletion(cdp, 'Promise.resolve(42)', {
+      timeout: 321,
+      objectGroup: 'group-1',
+    })).resolves.toEqual({ objectId: 'promise-1' });
+    expect(calls[0]).toEqual({
+      method: 'Runtime.evaluate',
+      params: {
+        expression: 'Promise.resolve(42)',
+        returnByValue: false,
+        awaitPromise: false,
+        timeout: 321,
+        objectGroup: 'group-1',
+      },
+      options: { timeoutMs: 321 },
+    });
+  });
+
   test('propagates an ambiguous transport failure after one dispatch', async () => {
     const { cdp, calls } = cdpHarness(new Error('WebSocket closed'));
     await expect(evaluateAppScript(cdp, 'increment();')).rejects.toThrow('WebSocket closed');
@@ -47,19 +81,52 @@ describe('raw app evaluation', () => {
 
 function vmTransport() {
   let appGlobal = vm.createContext({ setTimeout, clearTimeout });
-  const calls: Array<Record<string, unknown>> = [];
+  let nextObjectId = 0;
+  let remoteObjects = new Map<string, unknown>();
+  const calls: Array<{
+    method: string;
+    params: Record<string, unknown>;
+    options?: Record<string, unknown>;
+  }> = [];
   const transport = {
-    send: async (_method: string, params?: Record<string, unknown>) => {
-      calls.push(params ?? {});
-      const result = new vm.Script(String(params?.expression)).runInContext(appGlobal);
-      return {
-        result: {
-          value: result === undefined ? undefined : JSON.parse(JSON.stringify(result)),
-        },
-      };
+    send: async (
+      method: string,
+      params?: Record<string, unknown>,
+      options?: Record<string, unknown>,
+    ) => {
+      const actualParams = params ?? {};
+      calls.push({ method, params: actualParams, options });
+      if (method === 'Runtime.evaluate') {
+        const result = new vm.Script(String(actualParams.expression)).runInContext(appGlobal);
+        if (actualParams.returnByValue === false && result !== null &&
+            (typeof result === 'object' || typeof result === 'function')) {
+          const objectId = `remote-${++nextObjectId}`;
+          remoteObjects.set(objectId, result);
+          return {
+            result: {
+              type: 'object',
+              subtype: result instanceof Promise ? 'promise' : undefined,
+              objectId,
+            },
+          };
+        }
+        return {
+          result: {
+            value: result === undefined ? undefined : JSON.parse(JSON.stringify(result)),
+          },
+        };
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const object = remoteObjects.get(String(actualParams.objectId));
+        const fn = new vm.Script(`(${String(actualParams.functionDeclaration)})`).runInContext(appGlobal) as Function;
+        fn.call(object, ...((actualParams.arguments as Array<{ value: unknown }> | undefined)?.map((arg) => arg.value) ?? []));
+        return { result: { value: true } };
+      }
+      return { result: { value: undefined } };
     },
     replaceContext() {
       appGlobal = vm.createContext({ setTimeout, clearTimeout });
+      remoteObjects = new Map();
     },
     get context() {
       return appGlobal;
@@ -86,6 +153,28 @@ function lifecycle(overrides: Partial<{
 }
 
 describe('shared app evaluation policy', () => {
+  test('passes only the remaining deadline to transport after connection setup', async () => {
+    const { cdp, calls } = cdpHarness({ result: { value: 42 } });
+    const evaluate = createAppEvaluator(cdp, lifecycle({
+      ensureConnected: async () => { await new Promise((resolve) => setTimeout(resolve, 30)); },
+    }));
+    const deadline = Date.now() + 200;
+    expect(await evaluate('42', { timeout: 200, deadline })).toBe(42);
+    expect(calls[0].options?.timeoutMs).toBeGreaterThan(0);
+    expect(calls[0].options?.timeoutMs).toBeLessThanOrEqual(175);
+  });
+
+  test('does not dispatch after connection setup outlives the caller deadline', async () => {
+    const { cdp, calls } = cdpHarness({ result: { value: 42 } });
+    const evaluate = createAppEvaluator(cdp, lifecycle({
+      ensureConnected: async () => { await new Promise((resolve) => setTimeout(resolve, 50)); },
+    }));
+    await expect(evaluate('mutate()', { awaitPromise: true, timeout: 10 })).rejects.toThrow('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate')).toHaveLength(0);
+    expect(calls).toHaveLength(1); // bounded late-completion group cleanup
+  });
+
   test('does not replay a script after an ambiguous initial dispatch', async () => {
     const { transport, calls } = vmTransport();
     const initialContext = transport.context;
@@ -93,7 +182,8 @@ describe('shared app evaluation policy', () => {
     const originalSend = transport.send;
     transport.send = async (method, params) => {
       const result = await originalSend(method, params);
-      if (first) {
+      if (first && method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('executionCount')) {
         first = false;
         throw new Error('WebSocket closed');
       }
@@ -106,7 +196,8 @@ describe('shared app evaluation policy', () => {
       { awaitPromise: true, timeout: 1000 },
     )).rejects.toThrow('WebSocket closed');
     expect(initialContext).toHaveProperty('executionCount', 1);
-    expect(calls).toHaveLength(2); // initial dispatch plus mailbox cleanup
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('executionCount'))).toHaveLength(1);
   });
 
   test('reconnects mailbox reads without replaying the original source', async () => {
@@ -114,7 +205,8 @@ describe('shared app evaluation policy', () => {
     let firstPoll = true;
     const originalSend = transport.send;
     transport.send = async (method, params) => {
-      if (firstPoll && calls.length === 1) {
+      if (firstPoll && method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('return { status:')) {
         firstPoll = false;
         throw new Error('WebSocket closed');
       }
@@ -154,14 +246,16 @@ describe('shared app evaluation policy', () => {
     expect(initialContext).toHaveProperty('executionCount', 1);
     expect(state.state().reconnectCount).toBe(0);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.awaitPromise).toBe(false);
+    expect(calls[0]?.params.awaitPromise).toBe(false);
   });
 
   test('reports a lost mailbox when reconnect lands in a new app context', async () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
     transport.send = async (method, params) => {
-      if (calls.length === 1) transport.replaceContext();
+      if (method === 'Runtime.evaluate' && String(params?.expression).includes('return { status:')) {
+        transport.replaceContext();
+      }
       return originalSend(method, params);
     };
     const evalInApp = createAppEvaluator(transport, lifecycle());
@@ -186,14 +280,16 @@ describe('shared app evaluation policy', () => {
     await expect(evalInApp('new Promise(() => {})', { awaitPromise: true, timeout: 40 }))
       .rejects.toThrow('timed out');
     expect(Date.now() - started).toBeLessThan(500);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(2); // stalled setup plus bounded group cleanup
   });
 
   test('bounds a stalled mailbox poll and does not wait for cleanup', async () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
     transport.send = async (method, params) => {
-      if (calls.length === 1) return new Promise(() => {});
+      if (method === 'Runtime.evaluate' && String(params?.expression).includes('return { status:')) {
+        return new Promise(() => {});
+      }
       return originalSend(method, params);
     };
     const started = Date.now();
@@ -202,15 +298,17 @@ describe('shared app evaluation policy', () => {
     await expect(evalInApp('Promise.resolve(1)', { awaitPromise: true, timeout: 40 }))
       .rejects.toThrow('timed out');
     expect(Date.now() - started).toBeLessThan(500);
-    expect(calls).toHaveLength(1);
+    expect(calls).toHaveLength(4); // setup, source, stalled poll, and bounded cleanup
   });
 
   test('bounds reconnect recovery after a dropped mailbox read', async () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
     transport.send = async (method, params) => {
-      if (calls.length === 0) return originalSend(method, params);
-      throw new Error('WebSocket closed');
+      if (method === 'Runtime.evaluate' && String(params?.expression).includes('return { status:')) {
+        throw new Error('WebSocket closed');
+      }
+      return originalSend(method, params);
     };
     const state = lifecycle({ reconnect: async () => new Promise(() => {}) });
     const started = Date.now();
@@ -225,7 +323,9 @@ describe('shared app evaluation policy', () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
     transport.send = async (method, params) => {
-      if (calls.length === 2) return new Promise(() => {});
+      if (method === 'Runtime.evaluate' && String(params?.expression).includes('clearTimeout(state.timer)')) {
+        return new Promise(() => {});
+      }
       return originalSend(method, params);
     };
     const started = Date.now();
