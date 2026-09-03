@@ -64,7 +64,14 @@ function hermesHarness() {
       releaseObjectGroup: async (objectGroup) => { releasedGroups.push(objectGroup); },
     },
   );
-  return { runtime, evaluate, awaitResult, releasedGroups };
+  return {
+    runtime,
+    evaluate,
+    evaluateScript,
+    settleRemote,
+    awaitResult,
+    releasedGroups,
+  };
 }
 
 function userRuntimeKeys(runtime: vm.Context): string[] {
@@ -164,6 +171,51 @@ describe('async app read results', () => {
     expect(runtime).toMatchObject({ evaluationCount: 1 });
     expect(pollReads).toBeGreaterThan(1);
     expect(transportRecovered).toBe(true);
+  });
+
+  test('retries a mailbox completion write without replaying the source', async () => {
+    const {
+      runtime,
+      evaluate,
+      evaluateScript,
+      settleRemote,
+      releasedGroups,
+    } = hermesHarness();
+    let mailboxWriteAttempts = 0;
+    let reconnects = 0;
+    const evaluateWithDisconnect: PluginContext['evalInApp'] = async (expression, options) => {
+      if (expression.includes('state.value =')) {
+        mailboxWriteAttempts += 1;
+        if (mailboxWriteAttempts === 1) throw new Error('transport disconnected');
+      }
+      return evaluate(expression, options);
+    };
+    const pollEvaluate: PluginContext['evalInApp'] = async (expression, options) => {
+      try {
+        return await evaluateWithDisconnect(expression, options);
+      } catch (error) {
+        if (!expression.includes('state.value =')) throw error;
+        reconnects += 1;
+        return evaluateWithDisconnect(expression, options);
+      }
+    };
+
+    await expect(awaitAppResult(
+      evaluateWithDisconnect,
+      `globalThis.evaluationCount = (globalThis.evaluationCount || 0) + 1;
+       globalThis.evaluationCount;`,
+      1000,
+      {
+        pollEvaluate,
+        evaluateScript,
+        settleRemote,
+        releaseObjectGroup: async (objectGroup) => { releasedGroups.push(objectGroup); },
+      },
+    )).resolves.toBe(1);
+    expect(runtime).toMatchObject({ evaluationCount: 1 });
+    expect(mailboxWriteAttempts).toBe(2);
+    expect(reconnects).toBe(1);
+    expect(releasedGroups).toHaveLength(0);
   });
 
   test('keeps global script declarations across awaited evaluations', async () => {
