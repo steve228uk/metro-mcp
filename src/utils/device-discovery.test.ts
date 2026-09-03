@@ -112,6 +112,17 @@ describe('device discovery', () => {
     })).resolves.toMatchObject({ platform: 'android', id: 'emulator-42' });
   });
 
+  test('rejects a contradictory Android name when xcrun is unavailable', async () => {
+    const runner = runnerFor({
+      iosUnavailable: true,
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Other device',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).rejects.toThrow('iOS simulator discovery failed');
+  });
+
   test('uses a unique iOS name when adb is unavailable for a connected target', async () => {
     const runner = runnerFor({
       ios: [iosInventory([
@@ -133,6 +144,16 @@ describe('device discovery', () => {
     await expect(resolveDevice(runner, 'auto', {
       reactNative: { logicalDeviceId: 'opaque-inspector-id' },
     })).resolves.toMatchObject({ platform: 'ios', id: 'IOS-16' });
+  });
+
+  test('rejects a contradictory iOS name when adb is unavailable', async () => {
+    const runner = runnerFor({
+      androidUnavailable: true,
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Other simulator',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).rejects.toThrow('Android device discovery failed');
   });
 
   test('does not treat a generic iOS inventory error as a missing executable', async () => {

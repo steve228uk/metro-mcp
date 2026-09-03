@@ -1,6 +1,13 @@
 import type { CDPConnection, EvalOptions } from '../plugin.js';
-import { extractCDPExceptionMessage } from './cdp.js';
-import { awaitAppResult, type AppEvaluationCompletion } from './await-app-result.js';
+import {
+  decodeCDPUnserializableValue,
+  extractCDPExceptionMessage,
+} from './cdp.js';
+import {
+  awaitAppResult,
+  awaitPromiseBeforeDeadline,
+  type AppEvaluationCompletion,
+} from './await-app-result.js';
 
 export interface AppEvaluationLifecycle {
   /** Ensure a request can be sent before it is dispatched. */
@@ -11,6 +18,8 @@ export interface AppEvaluationLifecycle {
   reconnect(): Promise<void>;
   /** Whether a reconnect attempt is already running. */
   isReconnecting(): boolean;
+  /** Monotonic runtime generation; changes invalidate remote handles. */
+  getGeneration?: () => number;
 }
 
 function isTransportError(error: unknown): boolean {
@@ -21,6 +30,26 @@ function isTransportError(error: unknown): boolean {
       error.message ===
         'Not connected to Metro. Use list_devices to check connection status.')
   );
+}
+
+function timeoutError(timeout: number): Error {
+  return new Error(`App evaluation timed out after ${timeout}ms`);
+}
+
+function remoteObjectValue(remote: Record<string, unknown>): unknown {
+  return Object.prototype.hasOwnProperty.call(remote, 'unserializableValue')
+    ? decodeCDPUnserializableValue(remote.unserializableValue)
+    : remote.value;
+}
+
+function boundedRequestTimeout(options?: {
+  timeout?: number;
+  deadline?: number;
+}): number | undefined {
+  if (options?.deadline === undefined) return options?.timeout;
+  const remaining = options.deadline - Date.now();
+  if (remaining <= 0) throw timeoutError(options.timeout ?? 10_000);
+  return Math.min(options.timeout ?? 10_000, Math.max(1, remaining));
 }
 
 async function sendRuntimeEvaluate(
@@ -62,7 +91,7 @@ export async function evaluateAppScript(
     awaitPromise: false,
     ...(options?.timeout === undefined ? {} : { timeout: options.timeout }),
   }, options?.timeout);
-  return (result.result as Record<string, unknown>).value;
+  return remoteObjectValue((result.result ?? {}) as Record<string, unknown>);
 }
 
 /**
@@ -83,13 +112,14 @@ export async function evaluateAppScriptCompletion(
     ...(options?.objectGroup ? { objectGroup: options.objectGroup } : {}),
   }, options?.timeout);
   const remote = (result.result ?? {}) as Record<string, unknown>;
+  const value = remoteObjectValue(remote);
   if (typeof remote.objectId === 'string') {
     return {
       objectId: remote.objectId,
-      ...(remote.value === undefined ? {} : { value: remote.value }),
+      ...(value === undefined ? {} : { value }),
     };
   }
-  return { value: remote.value };
+  return { value };
 }
 
 const SETTLE_REMOTE_FUNCTION = `function(key) {
@@ -97,7 +127,16 @@ const SETTLE_REMOTE_FUNCTION = `function(key) {
   if (!state) return false;
   function fulfill(value) {
     if (globalThis[key] !== state) return;
-    state.value = value;
+    state.unserializableValue = undefined;
+    if (typeof value === 'number') {
+      if (value !== value) state.unserializableValue = 'NaN';
+      else if (value === Infinity) state.unserializableValue = 'Infinity';
+      else if (value === -Infinity) state.unserializableValue = '-Infinity';
+      else if (value === 0 && 1 / value === -Infinity) state.unserializableValue = '-0';
+    } else if (typeof value === 'bigint') {
+      state.unserializableValue = String(value) + 'n';
+    }
+    state.value = state.unserializableValue === undefined ? value : undefined;
     state.status = 'fulfilled';
   }
   function reject(error) {
@@ -127,27 +166,47 @@ export function createAppEvaluator(
     options?: EvalOptions,
   ): Promise<unknown> => {
     await lifecycle.ensureConnected();
-    if (options?.deadline !== undefined && Date.now() >= options.deadline) {
-      throw new Error(`App evaluation timed out after ${options.timeout ?? 10_000}ms`);
-    }
-    const timeout = options?.deadline === undefined
-      ? options?.timeout
-      : Math.min(options.timeout ?? 10_000, Math.max(1, options.deadline - Date.now()));
+    const timeout = boundedRequestTimeout(options);
     return evaluateAppScript(cdp, expression, { ...options, timeout });
   };
 
   const evaluateScript = async (
     expression: string,
-    options?: { timeout?: number; deadline?: number; objectGroup?: string },
+    options?: {
+      timeout?: number;
+      deadline?: number;
+      objectGroup?: string;
+      generation?: number;
+    },
   ): Promise<AppEvaluationCompletion> => {
     await lifecycle.ensureConnected();
-    if (options?.deadline !== undefined && Date.now() >= options.deadline) {
-      throw new Error(`App evaluation timed out after ${options.timeout ?? 10_000}ms`);
+    if (
+      options?.generation !== undefined &&
+      lifecycle.getGeneration &&
+      options.generation !== lifecycle.getGeneration()
+    ) {
+      throw new Error('App evaluation context changed before source dispatch');
     }
-    const timeout = options?.deadline === undefined
-      ? options?.timeout
-      : Math.min(options.timeout ?? 10_000, Math.max(1, options.deadline - Date.now()));
+    const timeout = boundedRequestTimeout(options);
     return evaluateAppScriptCompletion(cdp, expression, { timeout, objectGroup: options?.objectGroup });
+  };
+
+  const setupMailbox = async (
+    expression: string,
+    options: { timeout?: number; deadline: number },
+  ): Promise<number | undefined> => {
+    await lifecycle.ensureConnected();
+    const generation = lifecycle.getGeneration?.();
+    const timeout = boundedRequestTimeout(options);
+    await evaluateAppScript(cdp, expression, { timeout });
+    if (
+      generation !== undefined &&
+      lifecycle.getGeneration &&
+      generation !== lifecycle.getGeneration()
+    ) {
+      throw new Error('App evaluation context changed during mailbox setup');
+    }
+    return generation;
   };
 
   const settleRemote = async (
@@ -155,28 +214,51 @@ export function createAppEvaluator(
     mailboxKey: string,
     options: { timeout?: number; deadline: number },
   ): Promise<boolean> => {
-    const remaining = Math.max(1, options.deadline - Date.now());
-    const result = (await cdp.send(
-      'Runtime.callFunctionOn',
-      {
-        objectId,
-        functionDeclaration: SETTLE_REMOTE_FUNCTION,
-        arguments: [{ value: mailboxKey }],
-        returnByValue: true,
-      },
-      { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
-    )) as Record<string, unknown>;
-    if (result.exceptionDetails) {
-      throw new Error(
-        extractCDPExceptionMessage(
-          result.exceptionDetails as Record<string, unknown>,
-        ),
+    const attachRemoteSettlement = async (): Promise<boolean> => {
+      const remaining = options.deadline - Date.now();
+      if (remaining <= 0) throw timeoutError(options.timeout ?? 10_000);
+      const result = (await cdp.send(
+        'Runtime.callFunctionOn',
+        {
+          objectId,
+          functionDeclaration: SETTLE_REMOTE_FUNCTION,
+          arguments: [{ value: mailboxKey }],
+          returnByValue: true,
+        },
+        { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
+      )) as Record<string, unknown>;
+      if (result.exceptionDetails) {
+        throw new Error(
+          extractCDPExceptionMessage(
+            result.exceptionDetails as Record<string, unknown>,
+          ),
+        );
+      }
+      // Keep the unique object group responsible for cleanup. Its separately
+      // bounded release runs after mailbox settlement, so handle cleanup cannot
+      // delay polling or leave a detached, permanently pending transport call.
+      return false;
+    };
+
+    try {
+      return await attachRemoteSettlement();
+    } catch (error) {
+      if (!isTransportError(error)) throw error;
+      // The request may have run the user's thenable before its response was
+      // lost. Remote handles are invalid after reconnect, so replaying this
+      // callFunctionOn could invoke a side-effecting thenable twice. Recover
+      // transport and continue mailbox polling; a pre-dispatch loss remains
+      // pending and is allowed to time out.
+      await awaitPromiseBeforeDeadline(
+        recoverTransport(),
+        options.deadline,
+        options.timeout ?? 10_000,
       );
+      if (Date.now() >= options.deadline) {
+        throw timeoutError(options.timeout ?? 10_000);
+      }
+      return false;
     }
-    // Keep the unique object group responsible for cleanup. Its separately
-    // bounded release runs after mailbox settlement, so handle cleanup cannot
-    // delay polling or leave a detached, permanently pending transport call.
-    return false;
   };
 
   const releaseObjectGroup = async (
@@ -224,6 +306,8 @@ export function createAppEvaluator(
           evaluateScript,
           settleRemote,
           releaseObjectGroup,
+          getRuntimeGeneration: lifecycle.getGeneration,
+          setupMailbox,
         },
       );
     }

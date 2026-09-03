@@ -77,6 +77,29 @@ describe('raw app evaluation', () => {
     await expect(evaluateAppScript(cdp, 'increment();')).rejects.toThrow('WebSocket closed');
     expect(calls).toHaveLength(1);
   });
+
+  test('preserves CDP unserializable primitive completions', async () => {
+    const values: Array<[string, unknown]> = [
+      ['NaN', Number.NaN],
+      ['Infinity', Number.POSITIVE_INFINITY],
+      ['-Infinity', Number.NEGATIVE_INFINITY],
+      ['-0', -0],
+      ['123456789012345678901234567890n', 123456789012345678901234567890n],
+    ];
+    for (const [unserializableValue, expected] of values) {
+      const { cdp } = cdpHarness({
+        result: { type: 'number', unserializableValue },
+      });
+      const actual = await evaluateAppScript(cdp, 'completion');
+      if (typeof expected === 'number' && Object.is(expected, -0)) {
+        expect(Object.is(actual, -0)).toBe(true);
+      } else if (typeof expected === 'number' && Number.isNaN(expected)) {
+        expect(Number.isNaN(actual)).toBe(true);
+      } else {
+        expect(actual).toBe(expected);
+      }
+    }
+  });
 });
 
 function vmTransport() {
@@ -126,6 +149,9 @@ function vmTransport() {
     },
     replaceContext() {
       appGlobal = vm.createContext({ setTimeout, clearTimeout });
+      remoteObjects = new Map();
+    },
+    invalidateHandles() {
       remoteObjects = new Map();
     },
     get context() {
@@ -221,6 +247,139 @@ describe('shared app evaluation policy', () => {
     )).resolves.toBe(1);
     expect(state.state().reconnectCount).toBe(1);
     expect(calls.length).toBeGreaterThan(2);
+  });
+
+  test('leaves a pre-dispatch settlement loss pending without replay', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    let settlementAttempts = 0;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.callFunctionOn') {
+        settlementAttempts += 1;
+        if (settlementAttempts === 1) throw new Error('WebSocket closed');
+      }
+      return originalSend(method, params);
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; Promise.resolve(executionCount);',
+      { awaitPromise: true, timeout: 40 },
+    )).rejects.toThrow('timed out');
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(state.state().reconnectCount).toBe(1);
+    expect(settlementAttempts).toBe(1);
+  });
+
+  test('recovers a lost settlement response without replaying a side-effecting thenable', async () => {
+    const { transport } = vmTransport();
+    const originalSend = transport.send;
+    let settlementAttempts = 0;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.callFunctionOn') {
+        settlementAttempts += 1;
+        const result = await originalSend(method, params);
+        if (settlementAttempts === 1) throw new Error('WebSocket closed');
+        return result;
+      }
+      return originalSend(method, params);
+    };
+    let reconnects = 0;
+    const state = lifecycle({ reconnect: async () => {
+      reconnects += 1;
+      transport.invalidateHandles();
+    } });
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      `globalThis.thenCalls = 0;
+       ({ then: function(resolve) { globalThis.thenCalls += 1; resolve(7); } });`,
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(7);
+    expect(transport.context).toHaveProperty('thenCalls', 1);
+    expect(reconnects).toBe(1);
+    expect(settlementAttempts).toBe(1);
+  });
+
+  test('does not dispatch source when runtime generation changes after mailbox setup', async () => {
+    const { transport, calls } = vmTransport();
+    let generation = 0;
+    const base = lifecycle();
+    const evalInApp = createAppEvaluator(transport, {
+      ...base,
+      getGeneration: () => generation,
+      ensureConnected: async () => {
+        if (calls.filter((call) => call.method === 'Runtime.evaluate').length === 1) {
+          generation += 1;
+        }
+      },
+    });
+
+    await expect(evalInApp(
+      'globalThis.sourceMutation = true; Promise.resolve(1);',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('context changed before source dispatch');
+    expect(transport.context).not.toHaveProperty('sourceMutation');
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('sourceMutation'))).toHaveLength(0);
+  });
+
+  test('rejects a generation change immediately after mailbox setup response', async () => {
+    const { transport, calls } = vmTransport();
+    let generation = 0;
+    const originalSend = transport.send;
+    transport.send = async (method, params) => {
+      const result = await originalSend(method, params);
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+        generation += 1;
+      }
+      return result;
+    };
+    const base = lifecycle();
+    const evalInApp = createAppEvaluator(transport, {
+      ...base,
+      getGeneration: () => generation,
+    });
+
+    await expect(evalInApp(
+      'globalThis.sourceMutation = true; Promise.resolve(1);',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('context changed during mailbox setup');
+    expect(transport.context).not.toHaveProperty('sourceMutation');
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('sourceMutation'))).toHaveLength(0);
+  });
+
+  test('does not retry remote settlement after a deadline-bounded reconnect', async () => {
+    const { transport } = vmTransport();
+    const originalSend = transport.send;
+    let settlementAttempts = 0;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.callFunctionOn') {
+        settlementAttempts += 1;
+        if (settlementAttempts === 1) throw new Error('WebSocket closed');
+      }
+      return originalSend(method, params);
+    };
+    let reconnects = 0;
+    const state = lifecycle({
+      reconnect: async () => {
+        reconnects += 1;
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      },
+    });
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; new Promise(resolve => setTimeout(() => resolve(executionCount), 100));',
+      { awaitPromise: true, timeout: 30 },
+    )).rejects.toThrow('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(settlementAttempts).toBe(1);
+    expect(reconnects).toBe(1);
   });
 
   test('keeps unawaited evaluation one-shot after an ambiguous dispatch', async () => {
