@@ -213,7 +213,7 @@ export const uiInteractPlugin = definePlugin({
 
     ctx.registerTool('long_press', {
       description:
-        'Long press using a React handler by label/testID, or native input at logical device-point coordinates. Native results identify the backend and dispatch state.',
+        'Long press using a React handler by label/testID, then semantic native input through SimView or IDB when the handler is unavailable. Explicit coordinates use native input directly; native results identify the backend and dispatch state.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         label: z.string().optional().describe('Accessibility label or testID of the element to long press'),
@@ -226,7 +226,6 @@ export const uiInteractPlugin = definePlugin({
         // ── CDP: find element by label/testID and call onLongPress ────────────
         if (label && x === undefined && y === undefined) {
           const jsLabel = JSON.stringify(label);
-          let evaluationError: unknown;
           const pressed = await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
@@ -235,13 +234,9 @@ export const uiInteractPlugin = definePlugin({
             })()
           `).catch((error) => {
             if (!isPreDispatchConnectionFailure(error)) throw error;
-            evaluationError = error;
             return false;
           });
           if (pressed) return `Long pressed "${label}"`;
-          if (evaluationError) {
-            return `Could not evaluate the connected app while long pressing "${label}".`;
-          }
         }
 
         // ── Coordinate fallbacks ──────────────────────────────────────────────
@@ -252,9 +247,14 @@ export const uiInteractPlugin = definePlugin({
           return nativeResult(`Long pressed at (${x}, ${y}) for ${duration}ms`, dispatch);
         }
 
-        return label
-          ? `Element "${label}" not found or has no onLongPress handler. Provide x,y coordinates as fallback.`
-          : 'Provide a label/testID or x,y coordinates.';
+        if (label) {
+          const target = await resolveTarget(platform);
+          if (!target) return 'No simulator/emulator detected.';
+          const dispatch = await nativeInput.longPressLabel(target, label, duration);
+          return nativeResult(`Long pressed "${label}"`, dispatch);
+        }
+
+        return 'Provide a label/testID or x,y coordinates.';
       },
     });
 

@@ -394,6 +394,36 @@ export class NativeInputController {
     }
   }
 
+  /** Locate a label through semantic providers and long press its frame center. */
+  async longPressLabel(target: NativeInputTarget, label: string, duration: number): Promise<NativeDispatchResult> {
+    if (this.closed) return result('none', 'unavailable', false, 'Native input controller is closed');
+
+    const providers = await this.providersFor(target);
+    let fallback: NativeDispatchResult | undefined;
+    const simview = providers.find((candidate) => candidate.kind === 'simview' && candidate.available);
+    if (simview) {
+      const semantic = await this.simviewLongPressLabel(target, label, duration, simview);
+      if (semantic.status !== 'unavailable' && semantic.status !== 'unsupported') return semantic;
+      fallback = semantic;
+    }
+
+    // IDB's accessibility dump and UI input commands are iOS-only. SimView
+    // remains available on Android because it can query that device directly.
+    if (target.platform !== 'ios') return fallback ?? result('none', 'unsupported', false, 'Label lookup is only available through SimView on Android');
+    const provider = providers.find((candidate) => candidate.kind === 'idb' && candidate.available);
+    if (!provider) return fallback ?? result('none', 'unavailable', false, 'IDB is not installed for accessibility label lookup');
+    if (!provider.capabilities?.has('describe-all')) return result('idb', 'unsupported', false, 'IDB does not advertise accessibility descriptions');
+    if (!provider.capabilities.has('long_press')) return result('idb', 'unsupported', false, 'IDB does not advertise long press input');
+    try {
+      const dump = await this.options.runner.execFile(provider.command, [...provider.args, 'ui', 'describe-all', '--udid', target.id, '--json'], { maxBuffer: 2 * 1024 * 1024 });
+      const match = findAccessibilityPoint(dump.toString('utf8'), label);
+      if (!match.point) return result('idb', match.ambiguous ? 'failed' : 'unsupported', false, match.ambiguous ? `Element "${label}" is ambiguous` : `Element "${label}" was not found by IDB`);
+      return this.idb(target, 'long_press', { ...match.point, durationMs: duration }, provider);
+    } catch (error) {
+      return result('idb', 'unavailable', false, error instanceof Error ? error.message : String(error), 'not-sent');
+    }
+  }
+
   private async simviewLabel(target: NativeInputTarget, label: string, provider: Provider): Promise<NativeDispatchResult> {
     if (this.closed) return result('simview', 'unavailable', false, 'Native input controller is closed');
     let inputAttempted = false;
@@ -450,6 +480,75 @@ export class NativeInputController {
       // Connecting, refreshing, and searching happen before SimView receives
       // the semantic tap. IDB may safely take over in auto mode in those
       // cases; once the tap request was attempted, the dispatch is uncertain.
+      return result(
+        'simview',
+        inputAttempted ? 'failed' : 'unavailable',
+        false,
+        error instanceof Error ? error.message : String(error),
+        inputAttempted ? 'unknown' : 'not-sent',
+      );
+    }
+  }
+
+  private async simviewLongPressLabel(target: NativeInputTarget, label: string, duration: number, provider: Provider): Promise<NativeDispatchResult> {
+    if (this.closed) return result('simview', 'unavailable', false, 'Native input controller is closed');
+    let inputAttempted = false;
+    try {
+      return await this.withActionQueue(async () => {
+        const session = await this.getSession(target, provider);
+        return this.withSessionQueue(session, async () => {
+          try {
+            await this.refreshSession(session);
+          } catch (error) {
+            await this.invalidateSession(session);
+            throw error;
+          }
+          if (!session.tools.has('find_elements') || !session.tools.has('long_press')) {
+            return result('simview', 'unsupported', false, 'SimView does not provide semantic long press input');
+          }
+          const input = session.capabilities.input as Record<string, unknown> | undefined;
+          if (input?.touch !== true) {
+            return result('simview', 'unsupported', false, 'SimView does not support touch input');
+          }
+          const searchResponse = await session.client.callTool({ name: 'find_elements', arguments: { name: label, exact: true } });
+          if (searchResponse.isError) return result('simview', 'unavailable', false, 'SimView semantic search is unavailable');
+          const found = readStructuredResult(searchResponse);
+          const matches = Array.isArray(found.matches) ? found.matches : [];
+          if (matches.length === 0) return result('simview', 'unsupported', false, `Element "${label}" was not found by SimView`);
+          if (matches.length !== 1) return result('simview', 'failed', false, `Element "${label}" is ambiguous`);
+          const match = matches[0];
+          const element = match && typeof match === 'object'
+            ? ((match as Record<string, unknown>).element && typeof (match as Record<string, unknown>).element === 'object'
+              ? (match as Record<string, unknown>).element
+              : match)
+            : undefined;
+          const point = simViewFrameCenter(element, session.width, session.height);
+          if (!point) return result('simview', 'unsupported', false, `Element "${label}" has no usable frame`);
+          inputAttempted = true;
+          const response = await session.client.callTool({ name: 'long_press', arguments: { ...point, durationMs: duration } });
+          const structured = readStructuredResult(response);
+          const interaction = structured.interaction && typeof structured.interaction === 'object'
+            ? structured.interaction as Record<string, unknown>
+            : undefined;
+          const accepted = typeof interaction?.accepted === 'boolean' ? interaction.accepted : structured.accepted;
+          const inputDispatched = typeof interaction?.inputDispatched === 'boolean'
+            ? interaction.inputDispatched
+            : typeof structured.inputDispatched === 'boolean' ? structured.inputDispatched : undefined;
+          const dispatched = inputDispatched === true;
+          if (response.isError) return result('simview', 'failed', dispatched, 'SimView long press result is uncertain', dispatchEvidence(inputDispatched));
+          if (interaction?.safeToContinue === false || structured.safeToContinue === false) {
+            return result('simview', 'failed', dispatched, 'SimView reported that it is unsafe to continue after the long press', dispatchEvidence(inputDispatched));
+          }
+          if (accepted === false) return result('simview', 'failed', dispatched, 'SimView rejected the long press', dispatched ? 'submitted' : 'not-sent');
+          if (accepted === true && inputDispatched === false) return result('simview', 'failed', false, 'SimView accepted the request without dispatching input');
+          if (accepted !== true) return result('simview', 'failed', dispatched, 'SimView returned no accepted long press receipt', dispatched ? 'submitted' : 'unknown');
+          // SimView's public long_press output schema is `{ accepted: true }`.
+          // Newer implementations may add inputDispatched telemetry, but the
+          // schema-level acceptance itself is the successful dispatch receipt.
+          return result('simview', 'handled', true);
+        });
+      });
+    } catch (error) {
       return result(
         'simview',
         inputAttempted ? 'failed' : 'unavailable',
@@ -955,4 +1054,27 @@ function findAccessibilityPoint(raw: string, label: string): { point: { x: numbe
     stack.push(...Object.values(object));
   }
   return { point: points.length === 1 ? points[0] : null, ambiguous: points.length > 1 };
+}
+
+function simViewFrameCenter(value: unknown, width: number, height: number): { x: number; y: number } | null {
+  if (!value || typeof value !== 'object') return null;
+  const object = value as Record<string, unknown>;
+  const frame = object.frame && typeof object.frame === 'object' ? object.frame as Record<string, unknown> : object;
+  const normalized = frame.normalized && typeof frame.normalized === 'object' ? frame.normalized as Record<string, unknown> : undefined;
+  const points = frame.points && typeof frame.points === 'object' ? frame.points as Record<string, unknown> : undefined;
+  const center = (candidate: Record<string, unknown> | undefined, scaleX: number, scaleY: number) => {
+    if (!candidate) return null;
+    const x = Number(candidate.x);
+    const y = Number(candidate.y);
+    const frameWidth = Number(candidate.width);
+    const frameHeight = Number(candidate.height);
+    if (![x, y, frameWidth, frameHeight].every(Number.isFinite) || frameWidth < 0 || frameHeight < 0) return null;
+    const centerX = (x + frameWidth / 2) * scaleX;
+    const centerY = (y + frameHeight / 2) * scaleY;
+    if (centerX < 0 || centerX > 1 || centerY < 0 || centerY > 1) return null;
+    return { x: centerX, y: centerY };
+  };
+  // SimView exposes both logical points and normalized frame coordinates. Use
+  // normalized values first so a stale point geometry cannot skew the action.
+  return center(normalized, 1, 1) ?? center(points, 1 / width, 1 / height) ?? center(frame, 1 / width, 1 / height);
 }

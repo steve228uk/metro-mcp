@@ -166,11 +166,13 @@ describe('UI handler actions without native inventory', () => {
     expect(harness.getNativeCalls()).toBeGreaterThan(0);
   });
 
-  test('reports a pre-dispatch failure for a label-only long press', async () => {
+  test('uses native fallback for a label-only long press after a pre-dispatch failure', async () => {
     const harness = await createAppOnlyHarness('pre-dispatch', true);
     const tool = harness.tools.get('long_press')!;
-    const result = await tool.handler(tool.parameters.parse({ label: 'Save' }) as Record<string, unknown>);
-    expect(result).toContain('Could not evaluate');
-    expect(harness.getNativeCalls()).toBe(0);
+    const result = await tool.handler(tool.parameters.parse({ label: 'Save', platform: 'ios' }) as Record<string, unknown>);
+    expect(result).toContain('Long pressed "Save"');
+    expect(result).toContain('backend=idb');
+    expect(result).toContain('status=handled');
+    expect(harness.getNativeCalls()).toBeGreaterThan(0);
   });
 });

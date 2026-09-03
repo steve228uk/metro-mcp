@@ -393,6 +393,111 @@ describe('native input providers', () => {
     expect(runner.calls.some(({ command, args }) => command === 'idb' && args[0] === 'ui' && args.includes('--udid'))).toBe(false);
   });
 
+  test('long presses the unique SimView semantic match at its normalized frame center', async () => {
+    const runner = fakeRunner();
+    const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'find_elements', 'long_press'].map((name) => ({ name })) }),
+      callTool: async ({ name, arguments: args }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push({ name, arguments: args });
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:device-a', pointWidth: 400, pointHeight: 800, capabilities: { input: { touch: true } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        if (name === 'find_elements') return { structuredContent: { matches: [{ element: { frame: { points: { x: 10, y: 20, width: 80, height: 40 }, normalized: { x: 0.25, y: 0.1, width: 0.5, height: 0.2 } } } }] } };
+        return { structuredContent: { accepted: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'simview', simviewCommand: '/bin/echo' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    await expect(controller.longPressLabel({ platform: 'ios', id: 'device-a' }, 'Continue', 900)).resolves.toMatchObject({
+      backend: 'simview', status: 'handled', dispatched: true,
+    });
+    expect(calls.find((call) => call.name === 'long_press')?.arguments).toEqual({ x: 0.5, y: 0.2, durationMs: 900 });
+  });
+
+  test('falls through to IDB when SimView reports no touch capability', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args) => {
+      if (command === 'idb' && args[0] === 'ui' && args[1] === 'describe-all') {
+        return Buffer.from(JSON.stringify([{ label: 'Continue', frame: { x: 10, y: 20, width: 80, height: 40 } }]));
+      }
+      return baseExecFile(command, args);
+    };
+    const calls: string[] = [];
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'find_elements', 'long_press'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push(name);
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:device-a', pointWidth: 400, pointHeight: 800, capabilities: { input: { touch: false } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        return { structuredContent: { connected: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    await expect(controller.longPressLabel({ platform: 'ios', id: 'device-a' }, 'Continue', 900)).resolves.toMatchObject({
+      backend: 'idb', status: 'handled', dispatched: true,
+    });
+    expect(calls).not.toContain('find_elements');
+    expect(calls).not.toContain('long_press');
+  });
+
+  test('reports unsupported Android semantic long press before dispatch when touch is unavailable', async () => {
+    const runner = fakeRunner();
+    const calls: string[] = [];
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'find_elements', 'long_press'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push(name);
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'android:device-a', pointWidth: 400, pointHeight: 800, capabilities: { input: { touch: false } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        return { structuredContent: { connected: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'simview', simviewCommand: '/bin/echo' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    await expect(controller.longPressLabel({ platform: 'android', id: 'device-a' }, 'Continue', 900)).resolves.toMatchObject({
+      backend: 'simview', status: 'unsupported', dispatched: false, dispatch: 'not-sent',
+    });
+    expect(calls).not.toContain('find_elements');
+    expect(calls).not.toContain('long_press');
+  });
+
+  test('falls back to IDB long press using the accessibility frame center', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args) => {
+      if (command === 'idb' && args[0] === 'ui' && args[1] === 'describe-all') {
+        return Buffer.from(JSON.stringify([{ label: 'Continue', frame: { x: 10, y: 20, width: 80, height: 40 } }]));
+      }
+      return baseExecFile(command, args);
+    };
+    const controller = new NativeInputController({ config: { nativeBackend: 'idb', idbCommand: 'idb' }, runner });
+
+    await expect(controller.longPressLabel({ platform: 'ios', id: 'device-a' }, 'Continue', 900)).resolves.toMatchObject({
+      backend: 'idb', status: 'handled', dispatched: true,
+    });
+    expect(runner.calls).toContainEqual({ command: 'idb', args: ['ui', 'tap', '50', '40', '--duration', '0.9', '--udid', 'device-a'] });
+  });
+
   test('stops a raw SimView action when safeToContinue is false, even with a dispatch receipt', async () => {
     const runner = fakeRunner();
     const calls: string[] = [];
