@@ -23,6 +23,28 @@ function isTransportError(error: unknown): boolean {
   );
 }
 
+function timeoutError(timeout: number): Error {
+  return new Error(`App evaluation timed out after ${timeout}ms`);
+}
+
+async function awaitBeforeDeadline<T>(
+  operation: Promise<T>,
+  deadline: number,
+  timeout: number,
+): Promise<T> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) throw timeoutError(timeout);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadlineReached = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(timeoutError(timeout)), remaining);
+  });
+  try {
+    return await Promise.race([operation, deadlineReached]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function sendRuntimeEvaluate(
   cdp: Pick<CDPConnection, 'send'>,
   params: Record<string, unknown>,
@@ -155,28 +177,50 @@ export function createAppEvaluator(
     mailboxKey: string,
     options: { timeout?: number; deadline: number },
   ): Promise<boolean> => {
-    const remaining = Math.max(1, options.deadline - Date.now());
-    const result = (await cdp.send(
-      'Runtime.callFunctionOn',
-      {
-        objectId,
-        functionDeclaration: SETTLE_REMOTE_FUNCTION,
-        arguments: [{ value: mailboxKey }],
-        returnByValue: true,
-      },
-      { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
-    )) as Record<string, unknown>;
-    if (result.exceptionDetails) {
-      throw new Error(
-        extractCDPExceptionMessage(
-          result.exceptionDetails as Record<string, unknown>,
-        ),
+    const attach = async (): Promise<boolean> => {
+      const remaining = options.deadline - Date.now();
+      if (remaining <= 0) throw timeoutError(options.timeout ?? 10_000);
+      const result = (await cdp.send(
+        'Runtime.callFunctionOn',
+        {
+          objectId,
+          functionDeclaration: SETTLE_REMOTE_FUNCTION,
+          arguments: [{ value: mailboxKey }],
+          returnByValue: true,
+        },
+        { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
+      )) as Record<string, unknown>;
+      if (result.exceptionDetails) {
+        throw new Error(
+          extractCDPExceptionMessage(
+            result.exceptionDetails as Record<string, unknown>,
+          ),
+        );
+      }
+      // Keep the unique object group responsible for cleanup. Its separately
+      // bounded release runs after mailbox settlement, so handle cleanup cannot
+      // delay polling or leave a detached, permanently pending transport call.
+      return false;
+    };
+
+    try {
+      return await attach();
+    } catch (error) {
+      if (!isTransportError(error)) throw error;
+      // Attaching the same settlement callback twice is safe: it only writes
+      // the private mailbox and never re-runs the caller's source. Bound the
+      // reconnect itself by the same deadline as the attach and re-check it
+      // before dispatching the retry, since reconnect may finish late.
+      await awaitBeforeDeadline(
+        recoverTransport(),
+        options.deadline,
+        options.timeout ?? 10_000,
       );
+      if (Date.now() >= options.deadline) {
+        throw timeoutError(options.timeout ?? 10_000);
+      }
+      return attach();
     }
-    // Keep the unique object group responsible for cleanup. Its separately
-    // bounded release runs after mailbox settlement, so handle cleanup cannot
-    // delay polling or leave a detached, permanently pending transport call.
-    return false;
   };
 
   const releaseObjectGroup = async (

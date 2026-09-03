@@ -223,6 +223,83 @@ describe('shared app evaluation policy', () => {
     expect(calls.length).toBeGreaterThan(2);
   });
 
+  test('reconnects a remote settlement attachment lost before dispatch', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    let settlementAttempts = 0;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.callFunctionOn') {
+        settlementAttempts += 1;
+        if (settlementAttempts === 1) throw new Error('WebSocket closed');
+      }
+      return originalSend(method, params);
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; Promise.resolve(executionCount);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(1);
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(state.state().reconnectCount).toBe(1);
+    expect(settlementAttempts).toBe(2);
+  });
+
+  test('reconnects a remote settlement attachment after a lost response', async () => {
+    const { transport } = vmTransport();
+    const originalSend = transport.send;
+    let settlementAttempts = 0;
+    transport.send = async (method, params) => {
+      const result = await originalSend(method, params);
+      if (method === 'Runtime.callFunctionOn') {
+        settlementAttempts += 1;
+        if (settlementAttempts === 1) throw new Error('WebSocket closed');
+      }
+      return result;
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; Promise.resolve(executionCount);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(1);
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(state.state().reconnectCount).toBe(1);
+    expect(settlementAttempts).toBe(2);
+  });
+
+  test('does not retry remote settlement after a deadline-bounded reconnect', async () => {
+    const { transport } = vmTransport();
+    const originalSend = transport.send;
+    let settlementAttempts = 0;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.callFunctionOn') {
+        settlementAttempts += 1;
+        if (settlementAttempts === 1) throw new Error('WebSocket closed');
+      }
+      return originalSend(method, params);
+    };
+    let reconnects = 0;
+    const state = lifecycle({
+      reconnect: async () => {
+        reconnects += 1;
+        await new Promise((resolve) => setTimeout(resolve, 60));
+      },
+    });
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; new Promise(resolve => setTimeout(() => resolve(executionCount), 100));',
+      { awaitPromise: true, timeout: 30 },
+    )).rejects.toThrow('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(settlementAttempts).toBe(1);
+    expect(reconnects).toBe(1);
+  });
+
   test('keeps unawaited evaluation one-shot after an ambiguous dispatch', async () => {
     const { transport, calls } = vmTransport();
     const initialContext = transport.context;
