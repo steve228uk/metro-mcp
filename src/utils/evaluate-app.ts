@@ -156,42 +156,27 @@ export function createAppEvaluator(
     options: { timeout?: number; deadline: number },
   ): Promise<boolean> => {
     const remaining = Math.max(1, options.deadline - Date.now());
-    let settled = false;
-    let released = false;
-    try {
-      const result = (await cdp.send(
-        'Runtime.callFunctionOn',
-        {
-          objectId,
-          functionDeclaration: SETTLE_REMOTE_FUNCTION,
-          arguments: [{ value: mailboxKey }],
-          returnByValue: true,
-        },
-        { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
-      )) as Record<string, unknown>;
-      if (result.exceptionDetails) {
-        throw new Error(
-          extractCDPExceptionMessage(
-            result.exceptionDetails as Record<string, unknown>,
-          ),
-        );
-      }
-      settled = ((result.result as Record<string, unknown> | undefined)?.value !== false);
-    } finally {
-      // The completion handle is only needed while its settlement callback is
-      // being attached. Releasing it avoids retaining every awaited Promise.
-      try {
-        await cdp.send(
-          'Runtime.releaseObject',
-          { objectId },
-          { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
-        );
-        released = true;
-      } catch {
-        // The object group cleanup in awaitAppResult remains the fallback.
-      }
+    const result = (await cdp.send(
+      'Runtime.callFunctionOn',
+      {
+        objectId,
+        functionDeclaration: SETTLE_REMOTE_FUNCTION,
+        arguments: [{ value: mailboxKey }],
+        returnByValue: true,
+      },
+      { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
+    )) as Record<string, unknown>;
+    if (result.exceptionDetails) {
+      throw new Error(
+        extractCDPExceptionMessage(
+          result.exceptionDetails as Record<string, unknown>,
+        ),
+      );
     }
-    return settled && released;
+    // Keep the unique object group responsible for cleanup. Its separately
+    // bounded release runs after mailbox settlement, so handle cleanup cannot
+    // delay polling or leave a detached, permanently pending transport call.
+    return false;
   };
 
   const releaseObjectGroup = async (
