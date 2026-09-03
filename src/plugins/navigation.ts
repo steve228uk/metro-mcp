@@ -66,7 +66,7 @@ export const navigationPlugin = definePlugin({
     });
 
     ctx.registerTool('list_routes', {
-      description: 'List all registered route names in the app.',
+      description: 'List registered route names from available navigation state. Uninitialized nested navigators are not discoverable.',
       annotations: { readOnlyHint: true },
       parameters: z.object({}),
       handler: async () => {
@@ -74,17 +74,27 @@ export const navigationPlugin = definePlugin({
         if (!state || typeof state !== 'object') return 'Navigation state not found.';
 
         const routeNames = new Set<string>();
-        function collectRoutes(s: Record<string, unknown>) {
-          const routes = s.routes as Array<Record<string, unknown>>;
-          if (!routes) return;
-          for (const route of routes) {
-            routeNames.add(route.name as string);
-            if (route.state && typeof route.state === 'object') {
-              collectRoutes(route.state as Record<string, unknown>);
+        const pending: unknown[] = [state];
+        const seen = new Set<object>();
+        while (pending.length) {
+          const next = pending.pop();
+          if (!next || typeof next !== 'object' || seen.has(next)) continue;
+          seen.add(next);
+          const navigation = next as Record<string, unknown>;
+          if (Array.isArray(navigation.routeNames)) {
+            for (const name of navigation.routeNames) {
+              if (typeof name === 'string') routeNames.add(name);
+            }
+          }
+          if (!Array.isArray(navigation.routes)) continue;
+          for (const route of navigation.routes) {
+            if (!route || typeof route !== 'object') continue;
+            if (typeof route.name === 'string') routeNames.add(route.name);
+            if (route.state) {
+              pending.push(route.state);
             }
           }
         }
-        collectRoutes(state as Record<string, unknown>);
         return Array.from(routeNames).sort();
       },
     });

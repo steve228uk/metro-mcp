@@ -146,7 +146,9 @@ All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB
   the same SDK, navigation ref, Expo state, and bounded Fiber discovery as `get_current_route`,
   including nested navigators. It also succeeds when the requested route is already focused.
 - **`get_route_history`** — Navigation back stack.
-- **`list_routes`** — All registered route names.
+- **`list_routes`** — Sorted, deduplicated registered and mounted route names from all
+  available navigation state, including unvisited screens in `routeNames`. Nested navigators
+  that have not initialized their state cannot be discovered.
 
 ## Accessibility
 

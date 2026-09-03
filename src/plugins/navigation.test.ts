@@ -153,6 +153,35 @@ describe('navigation inspection and waits', () => {
     await expect(call('wait_for_navigation', { routeName: 'Home', timeout: 100 }))
       .rejects.toThrow('Timed out');
   });
+
+  test('lists unvisited registered routes alongside mounted routes throughout nested state', async () => {
+    const { call } = await harness({
+      __METRO_BRIDGE__: { navigation: { getState: async () => ({
+        routeNames: ['Home', 'Unvisited', 'Tabs'],
+        routes: [
+          { name: 'Home' },
+          { name: 'Tabs', state: {
+            routeNames: ['Settings', 'Profile', 'Home'],
+            routes: [{ name: 'Profile' }, { name: 'Legacy' }],
+          } },
+        ],
+      }) } },
+    });
+    expect(await call('list_routes'))
+      .toEqual(['Home', 'Legacy', 'Profile', 'Settings', 'Tabs', 'Unvisited']);
+  });
+
+  test('lists routeNames-only states and excludes invalid names', async () => {
+    const { call } = await harness({
+      __EXPO_ROUTER_STATE__: {
+        routeNames: ['Root', 'Unused', 'Root', null, 17],
+        routes: [null, { params: {} }, { name: 'Root', state: { routeNames: ['Nested'] } }],
+      },
+    });
+    expect(await call('list_routes')).toEqual(['Nested', 'Root', 'Unused']);
+    const onlyNames = await harness({ __EXPO_ROUTER_STATE__: { routeNames: ['B', 'A', 'B'] } });
+    expect(await onlyNames.call('list_routes')).toEqual(['A', 'B']);
+  });
 });
 
 test('focused route resolution handles empty, invalid, and cyclic states', () => {
