@@ -107,6 +107,9 @@ export const devtoolsPlugin = definePlugin({
             if (target.devtoolsFrontendUrl) {
               frontendUrl = `http://${ctx.metro.host}:${ctx.metro.port}${target.devtoolsFrontendUrl}`;
             } else {
+              if (!target.webSocketDebuggerUrl) {
+                return 'Metro target has no debugger WebSocket URL. Try reconnecting.';
+              }
               let wsHost: string;
               try {
                 wsHost = new URL(target.webSocketDebuggerUrl).host;

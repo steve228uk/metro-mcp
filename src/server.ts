@@ -51,6 +51,12 @@ import { extractCDPExceptionMessage } from './utils/cdp.js';
 import { createPreferredFrameSizeMeta, withAppSizing } from './utils/apps.js';
 import { ResourceSubscriptionManager } from './utils/resource-subscriptions.js';
 import { createResourceUpdateScheduler } from './utils/resource-updates.js';
+import {
+  createMetroTargetPin,
+  selectMetroTarget,
+  selectPinnedTarget,
+  type MetroTargetPin,
+} from './utils/target-selection.js';
 import { version } from './version.js';
 import { createDaemonIdentity, getDaemonKey } from './daemon.js';
 import type { DaemonIdentity } from './daemon.js';
@@ -215,6 +221,7 @@ export async function createMetroRuntime(
   // Active device tracking — used by plugins to key per-device buffers.
   let activeDeviceKey: string | null = null;
   let activeDeviceName: string | null = null;
+  let targetPin: MetroTargetPin | null = null;
 
   // Server-side reconnect state — single source of truth for all reconnect logic.
   // Start with a very short delay (500ms) to recover quickly from brief disconnects
@@ -673,33 +680,34 @@ export async function createMetroRuntime(
           signal: AbortSignal.timeout(2000),
         });
         if (!resp.ok) return false;
-        const targets = (await resp.json()) as Array<{
-          id?: string;
-          title?: string;
-          webSocketDebuggerUrl?: string;
-        }>;
-        if (targets.length > 0 && targets[0].webSocketDebuggerUrl) {
+        const targets = (await resp.json()) as MetroTarget[];
+        const metroHost = lockData.metroHost ?? config.metro.host!;
+        const metroPort = lockData.metroPort ?? config.metro.port!;
+        const target = targetPin
+          ? targetPin.host === metroHost && targetPin.port === metroPort
+            ? selectPinnedTarget(targets, targetPin)
+            : null
+          : selectBestTarget(targets);
+        if (target) {
           logger.info(
             `Found existing metro-mcp proxy (PID ${lockData.pid}, port ${lockData.port}) — connecting as secondary`,
           );
           // Set active device key BEFORE connecting so plugin event handlers
           // that fire on the 'reconnected' event can store events immediately.
-          activeDeviceKey = targets[0].id
-            ? `${lockData.port}-${targets[0].id}`
-            : null;
-          activeDeviceName = targets[0].title || targets[0].id || 'secondary';
+          activeDeviceKey = `${metroPort}-${target.id}`;
+          activeDeviceName = target.title || target.deviceName || target.id;
           // Point devtools plugin at the primary's proxy so open_devtools uses the right port
           (config as Record<string, unknown>).proxy = {
             ...config.proxy,
             port: lockData.port,
           };
-          await cdpSession.connectToTarget(
-            targets[0] as unknown as MetroTarget,
+          await cdpSession.connectToTarget(target);
+          eventsClient.connect(metroHost, metroPort);
+          config.metro.port = metroPort;
+          targetPin ??= createMetroTargetPin(
+            { host: metroHost, port: metroPort },
+            target,
           );
-          if (lockData.metroPort) {
-            eventsClient.connect(config.metro.host!, lockData.metroPort);
-            config.metro.port = lockData.metroPort;
-          }
           return true;
         }
       }
@@ -709,11 +717,20 @@ export async function createMetroRuntime(
     return false;
   }
 
-  function writeProxyLock(proxyPort: number, metroPort: number): void {
+  function writeProxyLock(
+    proxyPort: number,
+    metroHost: string,
+    metroPort: number,
+  ): void {
     try {
       fs.writeFileSync(
         PROXY_LOCK_FILE,
-        JSON.stringify({ pid: process.pid, port: proxyPort, metroPort }),
+        JSON.stringify({
+          pid: process.pid,
+          port: proxyPort,
+          metroHost,
+          metroPort,
+        }),
       );
       isPrimaryInstance = true;
       logger.info(`Wrote proxy lock (port ${proxyPort})`);
@@ -771,14 +788,17 @@ export async function createMetroRuntime(
         return false;
       }
 
-      const server = servers[0];
-      config.metro.port = server.port;
-      const target = selectBestTarget(server.targets);
-
-      if (!target) {
-        logger.warn('No suitable CDP target found.');
+      const selected = selectMetroTarget(servers, targetPin);
+      if (!selected) {
+        logger.warn(
+          targetPin
+            ? 'Pinned Metro app is unavailable; remaining disconnected.'
+            : 'No suitable CDP target found.',
+        );
         return false;
       }
+      const { server, target } = selected;
+      config.metro.port = server.port;
 
       // Set active device key BEFORE connecting so plugin event handlers
       // that fire on the 'reconnected' event can store events immediately.
@@ -815,9 +835,10 @@ export async function createMetroRuntime(
 
       await cdpSession.connectToTarget(target);
       eventsClient.connect(server.host, server.port);
+      targetPin ??= createMetroTargetPin(server, target);
 
       if (cdpMultiplexer?.port) {
-        writeProxyLock(cdpMultiplexer.port, server.port);
+        writeProxyLock(cdpMultiplexer.port, server.host, server.port);
       }
 
       return true;
