@@ -17,6 +17,18 @@ import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let idbAvailableCache: boolean | null = null;
 
+// A failed CDP request is ambiguous once Runtime.evaluate may have been
+// dispatched: retrying a native action could duplicate the app-side event.
+// These errors are raised before dispatch, while the connection is being
+// established, so the native backend is still safe to try.
+function isPreDispatchConnectionFailure(error: unknown): boolean {
+  return error instanceof Error && (
+    error.message === 'Not connected to CDP target' ||
+    error.message ===
+      'Not connected to Metro. Use list_devices to check connection status.'
+  );
+}
+
 export const uiInteractPlugin = definePlugin({
   name: 'ui-interact',
 
@@ -122,19 +134,21 @@ export const uiInteractPlugin = definePlugin({
 
         // ── Label/testID tap: CDP fiber tree (works on both platforms) ───────
         const jsLabel = JSON.stringify(label);
-        let evaluationFailed = false;
+        let evaluationError: unknown;
         const tapped = await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             ${FIND_AND_INVOKE_JS}
             return findAndInvoke(${jsLabel}, 'onPress');
           })()
-        `).catch(() => {
-          evaluationFailed = true;
+        `).catch((error) => {
+          evaluationError = error;
           return false;
         });
         if (tapped) return `Tapped "${label}"`;
-        if (evaluationFailed) return `Could not evaluate the connected app while tapping "${label}".`;
+        if (evaluationError && !isPreDispatchConnectionFailure(evaluationError)) {
+          return `Could not evaluate the connected app while tapping "${label}".`;
+        }
 
         const target = await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
@@ -201,7 +215,7 @@ export const uiInteractPlugin = definePlugin({
         // ── CDP: find TextInput and call onChangeText ─────────────────────────
         const jsText = JSON.stringify(text);
         const jsTestID = testID ? JSON.stringify(testID) : 'null';
-        let evaluationFailed = false;
+        let evaluationError: unknown;
         const typed = await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
@@ -234,12 +248,14 @@ export const uiInteractPlugin = definePlugin({
             }
             return false;
           })()
-        `).catch(() => {
-          evaluationFailed = true;
+        `).catch((error) => {
+          evaluationError = error;
           return false;
         });
         if (typed) return `Typed "${text}"`;
-        if (evaluationFailed) return 'Could not evaluate the connected app while typing text.';
+        if (evaluationError && !isPreDispatchConnectionFailure(evaluationError)) {
+          return 'Could not evaluate the connected app while typing text.';
+        }
 
         const target = await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
@@ -285,19 +301,24 @@ export const uiInteractPlugin = definePlugin({
         // ── CDP: find element by label/testID and call onLongPress ────────────
         if (label) {
           const jsLabel = JSON.stringify(label);
-          let evaluationFailed = false;
+          let evaluationError: unknown;
           const pressed = await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
               return findAndInvoke(${jsLabel}, 'onLongPress');
             })()
-          `).catch(() => {
-            evaluationFailed = true;
+          `).catch((error) => {
+            evaluationError = error;
             return false;
           });
           if (pressed) return `Long pressed "${label}"`;
-          if (evaluationFailed) return `Could not evaluate the connected app while long pressing "${label}".`;
+          if (
+            evaluationError &&
+            (!isPreDispatchConnectionFailure(evaluationError) || x === undefined || y === undefined)
+          ) {
+            return `Could not evaluate the connected app while long pressing "${label}".`;
+          }
         }
 
         // ── Coordinate fallbacks ──────────────────────────────────────────────
@@ -335,7 +356,7 @@ export const uiInteractPlugin = definePlugin({
 
         // ── CDP: find ScrollView and invoke scrollTo on its native node ────────
         const jsDir = JSON.stringify(direction);
-        let evaluationFailed = false;
+        let evaluationError: unknown;
         const scrolled = await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
@@ -378,12 +399,14 @@ export const uiInteractPlugin = definePlugin({
             } catch(e) {}
             return false;
           })()
-        `).catch(() => {
-          evaluationFailed = true;
+        `).catch((error) => {
+          evaluationError = error;
           return false;
         });
         if (scrolled) result = `Swiped ${direction}`;
-        if (evaluationFailed) return 'Could not evaluate the connected app while swiping.';
+        if (evaluationError && !isPreDispatchConnectionFailure(evaluationError)) {
+          return 'Could not evaluate the connected app while swiping.';
+        }
 
         if (!result) {
           const target = await resolveTarget(platform);
@@ -432,7 +455,7 @@ export const uiInteractPlugin = definePlugin({
         // ENTER and DELETE first try the connected app handler. This path only
         // needs CDP and must work when no local native inventory is available.
         if (button === 'ENTER') {
-          let evaluationFailed = false;
+          let evaluationError: unknown;
           const submitted = await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
@@ -454,16 +477,18 @@ export const uiInteractPlugin = definePlugin({
               target.memoizedProps.onSubmitEditing({ nativeEvent: { text: target.memoizedProps.value || '' } });
               return true;
             })()
-          `).catch(() => {
-            evaluationFailed = true;
+          `).catch((error) => {
+            evaluationError = error;
             return false;
           });
           if (submitted) return 'Pressed ENTER';
-          if (evaluationFailed) return 'Could not evaluate the connected app while pressing ENTER.';
+          if (evaluationError && !isPreDispatchConnectionFailure(evaluationError)) {
+            return 'Could not evaluate the connected app while pressing ENTER.';
+          }
         }
 
         if (button === 'DELETE') {
-          let evaluationFailed = false;
+          let evaluationError: unknown;
           const deleted = await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
@@ -486,12 +511,14 @@ export const uiInteractPlugin = definePlugin({
               target.memoizedProps.onChangeText(val);
               return true;
             })()
-          `).catch(() => {
-            evaluationFailed = true;
+          `).catch((error) => {
+            evaluationError = error;
             return false;
           });
           if (deleted) return 'Pressed DELETE';
-          if (evaluationFailed) return 'Could not evaluate the connected app while pressing DELETE.';
+          if (evaluationError && !isPreDispatchConnectionFailure(evaluationError)) {
+            return 'Could not evaluate the connected app while pressing DELETE.';
+          }
         }
 
         const target = await resolveTarget(platform);

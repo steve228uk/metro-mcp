@@ -213,6 +213,30 @@ export async function resolveDevice(
     (iosResult.status === 'rejected' || androidResult.status === 'rejected') &&
     target != null
   ) {
+    // Some hosts (for example Linux) cannot run xcrun at all. When that
+    // impossible platform is the only failed inventory, a connected Android
+    // target can still be resolved from a unique surviving inventory match.
+    // Keep the stricter retry path for ordinary discovery failures, where the
+    // missing inventory may simply be temporarily unavailable.
+    if (
+      iosResult.status === 'rejected' &&
+      androidResult.status === 'fulfilled' &&
+      isUnavailableToolError(iosResult.reason)
+    ) {
+      const authorized = androidResult.value.filter((device) => device.status === 'device');
+      const nameMatches = connectedName ? findAndroidNameMatches(authorized, connectedName) : [];
+      if (nameMatches.length === 1) {
+        const match = nameMatches[0];
+        return { platform: 'android', id: match.id, name: match.model };
+      }
+      // An opaque Metro logical ID is still evidence that a target is
+      // connected. With only one authorized Android device remaining, there
+      // is no competing local candidate to choose accidentally.
+      if (targetId(target) && authorized.length === 1) {
+        const device = authorized[0];
+        return { platform: 'android', id: device.id, name: device.model };
+      }
+    }
     const failed = [
       iosResult.status === 'rejected' ? 'iOS simulator' : null,
       androidResult.status === 'rejected' ? 'Android device' : null,
@@ -290,6 +314,11 @@ export async function resolveDevice(
     throw iosResult.reason instanceof Error ? iosResult.reason : new Error(String(iosResult.reason));
   }
   return null;
+}
+
+function isUnavailableToolError(reason: unknown): boolean {
+  return typeof reason === 'object' && reason !== null &&
+    'code' in reason && reason.code === 'ENOENT';
 }
 
 function findAndroidTarget(

@@ -18,6 +18,7 @@ function runnerFor(options: {
   ios?: string[];
   android?: string;
   iosFailure?: boolean;
+  iosUnavailable?: boolean;
   androidFailure?: boolean;
 }): DeviceDiscoveryRunner & { calls: string[][] } {
   const ios = [...(options.ios ?? [iosInventory([
@@ -29,6 +30,9 @@ function runnerFor(options: {
     async execFile(command, args) {
       calls.push([command, ...args]);
       if (command === 'xcrun') {
+        if (options.iosUnavailable) {
+          throw Object.assign(new Error('spawn xcrun ENOENT'), { code: 'ENOENT' });
+        }
         if (options.iosFailure) throw new Error('simctl unavailable');
         const output = ios.shift() ?? ios.at(-1) ?? iosInventory([]);
         return Buffer.from(output);
@@ -72,7 +76,28 @@ describe('device discovery', () => {
     expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
   });
 
-  test('does not use an Android name or sole fallback when iOS discovery fails for a connected target', async () => {
+  test('uses a unique Android name when xcrun is unavailable for a connected target', async () => {
+    const runner = runnerFor({
+      iosUnavailable: true,
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
+  test('uses the sole Android device when xcrun is unavailable and Metro ID is opaque', async () => {
+    const runner = runnerFor({
+      iosUnavailable: true,
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
+  test('does not treat a generic iOS inventory error as a missing executable', async () => {
     const runner = runnerFor({
       iosFailure: true,
       android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
