@@ -116,7 +116,11 @@ function appWithoutFiberRoots() {
   return app;
 }
 
-async function createHarness(app: Record<string, unknown>, plugins: PluginDefinition[]): Promise<Runner> {
+async function createHarness(
+  app: Record<string, unknown>,
+  plugins: PluginDefinition[],
+  beforeEval?: (expression: string) => void,
+): Promise<Runner> {
   const tools = new Map<string, Tool>();
   const resources = new Map<string, () => Promise<string>>();
   const ctx: PluginContext = {
@@ -140,6 +144,7 @@ async function createHarness(app: Record<string, unknown>, plugins: PluginDefini
       truncate: (value: string) => value, structureOnly: (value: ComponentNode) => value,
     },
     evalInApp: async (expression) => {
+      beforeEval?.(expression);
       const value = new vm.Script(expression).runInContext(app as vm.Context);
       return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
     },
@@ -307,6 +312,34 @@ describe('test recorder readiness', () => {
     expect(raw[0].type).toBe('long_press');
   });
 
+  test('does not report readiness for a forwarded wrapper from another handler kind', async () => {
+    const app = appWithDeepButton();
+    let replacedBeforeReadiness = false;
+    const call = await createHarness(app, [testRecorderPlugin], (expression) => {
+      if (replacedBeforeReadiness || !expression.includes('handlerCount')) return;
+      replacedBeforeReadiness = true;
+      vm.runInContext(`
+        leaf.memoizedProps = {
+          testID: 'deep-button',
+          onLongPress: leaf.memoizedProps.onPress
+        };
+      `, app);
+    });
+    const realNow = Date.now;
+    let clockReads = 0;
+    Date.now = () => realNow() + (clockReads++ < 2 ? 0 : 7000);
+    let result: unknown;
+    try {
+      result = await call('start_test_recording');
+    } finally {
+      Date.now = realNow;
+    }
+    expect(replacedBeforeReadiness).toBe(true);
+    expect(String(result)).toContain('unwrapped handlers: onLongPress');
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
+  });
+
   test('keeps recorder and profiler commit hooks chained in either stop order', async () => {
     const app = appWithDeepButton();
     const call = await createHarness(app, [testRecorderPlugin, profilerPlugin]);
@@ -388,6 +421,39 @@ describe('test recorder readiness', () => {
     `, app);
     expect(await call('stop_test_recording')).toContain('1 swipe');
   });
+
+  for (const forwardedHandler of ['onScrollEndDrag', 'onMomentumScrollEnd'] as const) {
+    test(`shares scroll state when a forwarded ${forwardedHandler} gets a new begin callback`, async () => {
+      const app = appWithNaturalScroll();
+      const call = await createHarness(app, [testRecorderPlugin]);
+      expect(await call('start_test_recording')).toContain('Recording started');
+      vm.runInContext(`
+        var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+        var firstProps = {
+          scrollEnabled: true,
+          testID: 'forwarded-scroll',
+          onScrollBeginDrag: function() {},
+          onScrollEndDrag: function() {},
+          onMomentumScrollEnd: function() {}
+        };
+        Object.freeze(firstProps);
+        var secondProps = {
+          scrollEnabled: true,
+          testID: 'forwarded-scroll',
+          onScrollBeginDrag: function() {},
+          ${forwardedHandler}: firstProps.${forwardedHandler}
+        };
+        Object.freeze(secondProps);
+        scrollRoot.memoizedProps = secondProps;
+        secondProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+        secondProps.${forwardedHandler}({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+      `, app);
+      expect(await call('stop_test_recording')).toContain('1 swipe');
+      const raw = vm.runInContext('__METRO_MCP_REC_EVENTS__', app) as Array<{ direction?: string }>;
+      expect(raw).toHaveLength(1);
+      expect(raw[0].direction).toBe('up');
+    });
+  }
 
   test('does not reuse an unfinished scroll from a previous recording session', async () => {
     const app = appWithNaturalScroll();
