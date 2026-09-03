@@ -102,12 +102,13 @@ function appWithoutFiberRoots() {
   return app;
 }
 
-async function createHarness(app: Record<string, unknown>, plugins: PluginDefinition[]): Promise<Runner> {
+async function createHarness(app: Record<string, unknown>, plugins: PluginDefinition[], targetAppId?: string): Promise<Runner> {
   const tools = new Map<string, Tool>();
   const resources = new Map<string, () => Promise<string>>();
   const ctx: PluginContext = {
     cdp: {
-      on: () => {}, off: () => {}, isConnected: true, getTarget: () => null,
+      on: () => {}, off: () => {}, isConnected: true,
+      getTarget: () => targetAppId ? ({ appId: targetAppId } as ReturnType<PluginContext['cdp']['getTarget']>) : null,
       send: async () => ({}),
     },
     events: { on: () => {}, off: () => {}, isConnected: () => true },
@@ -258,5 +259,112 @@ describe('test recorder readiness', () => {
     }
     expect(String(result)).toContain('coverage did not become ready');
     expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
+  });
+
+  test('generates WDIO runner specs for either setup mode without a second session', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var rootForSpec = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+      var leafForSpec = rootForSpec;
+      while (leafForSpec.child) leafForSpec = leafForSpec.child;
+      leafForSpec.memoizedProps.onPress();
+    `, app);
+    await call('stop_test_recording');
+
+    for (const includeSetup of [true, false]) {
+      const generated = String(await call('generate_test_from_recording', {
+        format: 'appium',
+        platform: 'both',
+        bundleId: `com.example.${includeSetup ? 'one' : 'two'}`,
+        testName: `Flow ${includeSetup ? 'one' : 'two'} quoted`,
+        includeSetup,
+      }));
+      expect(generated).toContain(`import { browser } from '@wdio/globals';`);
+      expect(generated).not.toContain('remote(');
+      expect(generated).not.toContain('deleteSession');
+      expect(generated).not.toContain('beforeAll');
+      expect(generated).not.toContain('afterAll');
+      expect(generated).not.toContain('capabilities');
+      expect(generated).toContain('browser.$("~deep-button").click()');
+      expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+    }
+  });
+
+  test('generates configurable iOS and Android capabilities without fixed simulator values', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
+    const generated = String(await call('generate_wdio_config', {
+      platform: 'both',
+      bundleId: "com.example.special'app",
+      appPath: '/tmp/My App.app',
+      udid: 'device-123',
+      deviceName: 'QA phone',
+      platformVersion: '26.5',
+      outputPath: './e2e/wdio.conf.ts',
+    }));
+    expect(generated).toContain('"appium:udid": "device-123"');
+    expect(generated).toContain('"appium:deviceName": "QA phone"');
+    expect(generated).toContain('"appium:platformVersion": "26.5"');
+    expect(generated).toContain('"appium:app": "/tmp/My App.app"');
+    expect(generated).not.toContain('iPhone 16');
+    expect(generated).not.toContain('18.0');
+    expect(generated).not.toContain('emulator-5554');
+    expect(generated).toContain('config: WebdriverIO.Config');
+    expect(generated).not.toContain('autoCompileOpts');
+    expect(generated).not.toContain('appium: { command');
+    expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('uses the connected app ID when config arguments omit an app target', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], 'com.connected.app');
+    const generated = String(await call('generate_wdio_config', { platform: 'ios' }));
+    expect(generated).toContain('"appium:bundleId": "com.connected.app"');
+    expect(generated).not.toContain('com.example.app');
+    expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('rejects an Appium config with no app path, bundle ID, or connected target', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
+    await expect(call('generate_wdio_config', { platform: 'ios' })).resolves.toContain('without an app target');
+  });
+
+  test('generates W3C actions for recorded long presses and swipes', async () => {
+    const app = appWithDeepButton();
+    vm.runInContext(`
+      var actionRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+      var actionLeaf = actionRoot;
+      while (actionLeaf.child) actionLeaf = actionLeaf.child;
+      actionLeaf.stateNode = null;
+      actionLeaf.memoizedProps = Object.freeze({
+        testID: 'action-button',
+        onPress: function() {},
+        onLongPress: function() {},
+        onChangeText: function() {},
+        onSubmitEditing: function() {},
+        scrollEnabled: true,
+        onScrollBeginDrag: function() {},
+        onScrollEndDrag: function() {}
+      });
+    `, app);
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var actionProps = actionLeaf.memoizedProps;
+      actionProps.onLongPress();
+      actionProps.onChangeText('hello');
+      actionProps.onSubmitEditing();
+      actionProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      actionProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    await call('stop_test_recording');
+    const generated = String(await call('generate_test_from_recording', { format: 'appium' }));
+    expect(generated).toContain('await longPress(');
+    expect(generated).toContain('await swipe(');
+    expect(generated).toContain("await browser.keys(['Enter']);");
+    expect(generated).toContain('browser.performActions');
+    expect(generated).toContain('browser.releaseActions');
+    expect(generated).not.toContain('touchAction');
+    expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
   });
 });

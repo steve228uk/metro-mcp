@@ -6,7 +6,6 @@ import { definePlugin } from '../plugin.js';
 import {
   FIBER_WALKER_JS,
   GET_ROUTE_FUNC_JS,
-  SWIPE_COORDS,
   buildFiberReadExpression,
 } from '../utils/fiber.js';
 
@@ -381,33 +380,89 @@ function deduplicateEvents(events: RecordedEvent[]): RecordedEvent[] {
 }
 
 // ── Emit Appium capability lines into an array
-function pushCaps(lines: string[], platform: 'ios' | 'android', bundleId: string | undefined, indent: string): void {
-  if (platform === 'ios') {
-    lines.push(`${indent}platformName: 'iOS',`);
-    lines.push(`${indent}'appium:automationName': 'XCUITest',`);
-    lines.push(bundleId
-      ? `${indent}'appium:bundleId': '${bundleId}',`
-      : `${indent}'appium:bundleId': 'com.example.app', // TODO: set bundle ID`);
-  } else {
-    lines.push(`${indent}platformName: 'Android',`);
-    lines.push(`${indent}'appium:automationName': 'UiAutomator2',`);
-    lines.push(bundleId
-      ? `${indent}'appium:appPackage': '${bundleId}',`
-      : `${indent}'appium:appPackage': 'com.example.app', // TODO: set app package`);
-    lines.push(`${indent}'appium:appActivity': '.MainActivity',`);
+//
+// Capabilities belong to the generated WDIO configuration. The generated spec
+// deliberately consumes the runner-owned `browser` session instead of opening
+// a second WebDriver connection.
+function pushCaps(
+  lines: string[],
+  platform: 'ios' | 'android',
+  options: {
+    bundleId?: string;
+    appPath?: string;
+    udid?: string;
+    deviceName?: string;
+    platformVersion?: string;
+  },
+  indent: string,
+): void {
+  const push = (key: string, value: string) => lines.push(`${indent}${JSON.stringify(key)}: ${JSON.stringify(value)},`);
+  push('platformName', platform === 'ios' ? 'iOS' : 'Android');
+  push('appium:automationName', platform === 'ios' ? 'XCUITest' : 'UiAutomator2');
+  if (options.udid) push('appium:udid', options.udid);
+  if (options.deviceName) push('appium:deviceName', options.deviceName);
+  if (options.platformVersion) push('appium:platformVersion', options.platformVersion);
+  if (options.appPath) {
+    push('appium:app', options.appPath);
+  } else if (options.bundleId) {
+    push(platform === 'ios' ? 'appium:bundleId' : 'appium:appPackage', options.bundleId);
+    if (platform === 'android') push('appium:appActivity', '.MainActivity');
   }
 }
 
-// ── Appium swipe touchAction block
-function appiumSwipeLines(direction: string, indent: string): string[] {
-  const [sx, sy, ex, ey] = SWIPE_COORDS[direction] ?? SWIPE_COORDS.up;
-  return [
-    `${indent}await driver.touchAction([`,
-    `${indent}  { action: 'press',  x: ${sx}, y: ${sy} },`,
-    `${indent}  { action: 'moveTo', x: ${ex}, y: ${ey} },`,
-    `${indent}  { action: 'release' },`,
-    `${indent}]);`,
-  ];
+// ── WebdriverIO W3C actions used by generated specs
+function appiumActionHelpers(lines: string[]): void {
+  lines.push(`type TouchAction = {`);
+  lines.push(`  type: 'pointerMove' | 'pointerDown' | 'pointerUp' | 'pause';`);
+  lines.push(`  duration?: number; x?: number; y?: number; button?: number;`);
+  lines.push(`};`);
+  lines.push('');
+  lines.push(`async function performTouch(actions: TouchAction[]): Promise<void> {`);
+  lines.push(`  try {`);
+  lines.push(`    await browser.performActions([{`);
+  lines.push(`      type: 'pointer',`);
+  lines.push(`      id: 'metro-mcp-touch',`);
+  lines.push(`      parameters: { pointerType: 'touch' },`);
+  lines.push(`      actions,`);
+  lines.push(`    }]);`);
+  lines.push(`  } finally {`);
+  lines.push(`    await browser.releaseActions();`);
+  lines.push(`  }`);
+  lines.push(`}`);
+  lines.push('');
+  lines.push(`async function longPress(selector: string): Promise<void> {`);
+  lines.push(`  const element = await browser.$(selector);`);
+  lines.push(`  const location = await element.getLocation();`);
+  lines.push(`  const size = await element.getSize();`);
+  lines.push(`  const x = Math.round(location.x + size.width / 2);`);
+  lines.push(`  const y = Math.round(location.y + size.height / 2);`);
+  lines.push(`  await performTouch([`);
+  lines.push(`    { type: 'pointerMove', duration: 0, x, y },`);
+  lines.push(`    { type: 'pointerDown', button: 0 },`);
+  lines.push(`    { type: 'pause', duration: 800 },`);
+  lines.push(`    { type: 'pointerUp', button: 0 },`);
+  lines.push(`  ]);`);
+  lines.push(`}`);
+  lines.push('');
+  lines.push(`async function swipe(direction: string): Promise<void> {`);
+  lines.push(`  const { width, height } = await browser.getWindowSize();`);
+  lines.push(`  const cx = Math.round(width / 2);`);
+  lines.push(`  const cy = Math.round(height / 2);`);
+  lines.push(`  const distanceX = Math.round(width * 0.35);`);
+  lines.push(`  const distanceY = Math.round(height * 0.35);`);
+  lines.push(`  let from = { x: cx, y: cy };`);
+  lines.push(`  let to = { x: cx, y: cy - distanceY };`);
+  lines.push(`  if (direction === 'down') { from = { x: cx, y: cy - distanceY }; to = { x: cx, y: cy }; }`);
+  lines.push(`  if (direction === 'left') { from = { x: cx + distanceX, y: cy }; to = { x: cx, y: cy }; }`);
+  lines.push(`  if (direction === 'right') { from = { x: cx - distanceX, y: cy }; to = { x: cx, y: cy }; }`);
+  lines.push(`  await performTouch([`);
+  lines.push(`    { type: 'pointerMove', duration: 0, x: from.x, y: from.y },`);
+  lines.push(`    { type: 'pointerDown', button: 0 },`);
+  lines.push(`    { type: 'pointerMove', duration: 500, x: to.x, y: to.y },`);
+  lines.push(`    { type: 'pointerUp', button: 0 },`);
+  lines.push(`  ]);`);
+  lines.push(`}`);
+  lines.push('');
 }
 
 // ── Persistent state for the recording session
@@ -538,7 +593,7 @@ export const testRecorderPlugin = definePlugin({
     ctx.registerTool('generate_test_from_recording', {
       description:
         'Convert the most recent recording into a test file. ' +
-        'Supports three formats: appium (WebdriverIO + Jest), maestro (YAML), and detox (Jest). ' +
+        'Supports three formats: appium (WebdriverIO + Mocha), maestro (YAML), and detox (Jest). ' +
         'Call stop_test_recording first.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
@@ -546,7 +601,7 @@ export const testRecorderPlugin = definePlugin({
         testName: z.string().optional().describe('Name for the test / describe block'),
         platform: z.enum(['ios', 'android', 'both']).default('ios').describe('Target platform (appium only)'),
         bundleId: z.string().optional().describe('iOS bundle ID or Android app package'),
-        includeSetup: z.boolean().default(true).describe('Include driver setup / teardown boilerplate'),
+        includeSetup: z.boolean().default(true).describe('Include WDIO configuration usage comments (the runner owns setup and teardown)'),
       }),
       handler: async ({ format, testName, platform, bundleId, includeSetup }) => {
         if (!storedEvents || storedEvents.length === 0) {
@@ -568,7 +623,7 @@ export const testRecorderPlugin = definePlugin({
 
         if (format === 'maestro') return generateMaestro(name, events, bundleId, nextSelector);
         if (format === 'detox')   return generateDetox(name, events, includeSetup, nextSelector);
-        return generateAppium(name, events, platform, bundleId, includeSetup, nextSelector);
+        return generateAppium(name, events, includeSetup, nextSelector);
       },
     });
 
@@ -583,49 +638,37 @@ export const testRecorderPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'both']).default('ios'),
         bundleId: z.string().optional().describe('iOS bundle ID or Android app package'),
         appPath: z.string().optional().describe('Path to .app / .apk (leave empty to use a running simulator)'),
+        udid: z.string().optional().describe('Optional device UDID / serial'),
+        deviceName: z.string().optional().describe('Optional Appium device name'),
+        platformVersion: z.string().optional().describe('Optional OS version'),
         outputPath: z.string().default('./wdio.conf.ts').describe('Shown in the output, not written to disk'),
       }),
-      handler: async ({ platform, bundleId, appPath, outputPath }) => {
+      handler: async ({ platform, bundleId, appPath, udid, deviceName, platformVersion, outputPath }) => {
+        const connectedAppId = ctx.cdp.getTarget()?.appId;
+        const resolvedBundleId = bundleId ?? connectedAppId;
+        if (!appPath && !resolvedBundleId) {
+          return 'Cannot generate a runnable Appium config without an app target. Provide bundleId, appPath, or connect to a Metro app with a bundle ID first.';
+        }
         const lines: string[] = [];
 
         const buildCaps = (p: 'ios' | 'android'): string[] => {
           const cap: string[] = [];
           cap.push(`      {`);
-          if (p === 'ios') {
-            cap.push(`        platformName: 'iOS',`);
-            cap.push(`        'appium:automationName': 'XCUITest',`);
-            cap.push(`        'appium:deviceName': 'iPhone 16',`);
-            cap.push(`        'appium:platformVersion': '18.0',`);
-            cap.push(appPath
-              ? `        'appium:app': '${appPath}',`
-              : (bundleId ? `        'appium:bundleId': '${bundleId}',` : `        'appium:bundleId': 'com.example.app',`));
-          } else {
-            cap.push(`        platformName: 'Android',`);
-            cap.push(`        'appium:automationName': 'UiAutomator2',`);
-            cap.push(`        'appium:deviceName': 'emulator-5554',`);
-            if (appPath) {
-              cap.push(`        'appium:app': '${appPath}',`);
-            } else {
-              cap.push(bundleId ? `        'appium:appPackage': '${bundleId}',` : `        'appium:appPackage': 'com.example.app',`);
-              cap.push(`        'appium:appActivity': '.MainActivity',`);
-            }
-          }
+          pushCaps(cap, p, { bundleId: resolvedBundleId, appPath, udid, deviceName, platformVersion }, '        ');
           cap.push(`        'appium:newCommandTimeout': 240,`);
           cap.push(`      },`);
           return cap;
         };
 
-        lines.push(`// ${outputPath}`);
-        lines.push(`// Install deps: npm install --save-dev @wdio/cli @wdio/local-runner @wdio/mocha-framework @wdio/spec-reporter appium wdio-appium-service`);
-        lines.push(`import type { Options } from '@wdio/types';`);
+        lines.push(`// ${safeComment(outputPath)}`);
+        lines.push(`// Install deps: npm install --save-dev @wdio/cli @wdio/local-runner @wdio/globals @wdio/mocha-framework @wdio/spec-reporter @wdio/appium-service appium`);
+        lines.push(`import type {} from '@wdio/types';`);
         lines.push('');
-        lines.push(`export const config: Options.Testrunner = {`);
+        lines.push(`export const config: WebdriverIO.Config = {`);
         lines.push(`  runner: 'local',`);
-        lines.push(`  autoCompileOpts: { autoCompile: true, tsNodeOpts: { project: './tsconfig.json' } },`);
         lines.push('');
         lines.push(`  port: 4723,`);
         lines.push(`  services: ['appium'],`);
-        lines.push(`  appium: { command: 'appium' },`);
         lines.push('');
         lines.push(`  specs: ['./e2e/**/*.test.ts'],`);
         lines.push(`  exclude: [],`);
@@ -651,8 +694,8 @@ export const testRecorderPlugin = definePlugin({
         lines.push(`};`);
         lines.push('');
         lines.push(`/*`);
-        lines.push(` * Run a single test:  npx wdio run ${outputPath} --spec ./e2e/login.test.ts`);
-        lines.push(` * Run all tests:      npx wdio run ${outputPath}`);
+        lines.push(` * Run a single test:  npx wdio run ${safeComment(outputPath)} --spec ./e2e/login.test.ts`);
+        lines.push(` * Run all tests:      npx wdio run ${safeComment(outputPath)}`);
         lines.push(` *`);
         lines.push(` * Install Appium:     npm install -g appium`);
         lines.push(` *                     appium driver install xcuitest`);
@@ -812,55 +855,33 @@ export const testRecorderPlugin = definePlugin({
 // Code generators
 // ────────────────────────────────────────────────────────────────────────────────
 
+function safeComment(value: string): string {
+  return value.replace(/[\r\n]+/g, ' ').replace(/\*\//g, '* /');
+}
+
 function generateAppium(
   name: string,
   events: RecordedEvent[],
-  platform: 'ios' | 'android' | 'both',
-  bundleId: string | undefined,
   includeSetup: boolean,
   nextSelector: (i: number, fn: (e: RecordedEvent) => string | null) => string | null,
 ): string {
   const lines: string[] = [];
-  lines.push(`import { remote, Browser } from 'webdriverio';`);
+  lines.push(`import { browser } from '@wdio/globals';`);
   lines.push('');
 
+  // WDIO owns the session lifecycle in its runner configuration. Keep the
+  // option for compatibility, but never create a second remote session.
   if (includeSetup) {
-    if (platform === 'both') {
-      lines.push(`const IOS_CAPS = {`);
-      pushCaps(lines, 'ios', bundleId, '  ');
-      lines.push(`};`);
-      lines.push('');
-      lines.push(`const ANDROID_CAPS = {`);
-      pushCaps(lines, 'android', bundleId, '  ');
-      lines.push(`};`);
-      lines.push('');
-    }
+    lines.push(`// The WDIO config supplies the Appium service and runner session.`);
+    lines.push(`// Run with: npx wdio run wdio.conf.ts --spec ./e2e/recorded.test.ts`);
+    lines.push('');
+  }
+
+  if (events.some((event) => event.type === 'long_press' || event.type === 'swipe')) {
+    appiumActionHelpers(lines);
   }
 
   lines.push(`describe(${JSON.stringify(name)}, () => {`);
-
-  if (includeSetup) {
-    lines.push(`  let driver: Browser;`);
-    lines.push('');
-    lines.push(`  beforeAll(async () => {`);
-    if (platform === 'both') {
-      lines.push(`    // Run with IOS_CAPS or ANDROID_CAPS depending on target`);
-      lines.push(`    driver = await remote({ capabilities: IOS_CAPS });`);
-    } else {
-      lines.push(`    driver = await remote({`);
-      lines.push(`      capabilities: {`);
-      pushCaps(lines, platform, bundleId, '        ');
-      lines.push(`      },`);
-      lines.push(`    });`);
-    }
-    lines.push(`  });`);
-    lines.push('');
-    lines.push(`  afterAll(async () => {`);
-    lines.push(`    await driver.deleteSession();`);
-    lines.push(`  });`);
-    lines.push('');
-  }
-
   lines.push(`  it(${JSON.stringify(name)}, async () => {`);
 
   for (let i = 0; i < events.length; i++) {
@@ -870,41 +891,40 @@ function generateAppium(
     switch (ev.type) {
       case 'tap':
         lines.push(sel
-          ? `    await driver.$(${JSON.stringify(sel)}).click();`
-          : `    // TODO: tap ${ev.componentName ?? 'unknown element'}`);
+          ? `    await browser.$(${JSON.stringify(sel)}).click();`
+          : `    // TODO: tap ${JSON.stringify(ev.componentName ?? 'unknown element')}`);
         break;
 
       case 'long_press':
         lines.push(sel
-          ? `    await driver.$(${JSON.stringify(sel)}).longClick();`
-          : `    // TODO: long press ${ev.componentName ?? 'unknown element'}`);
+          ? `    await longPress(${JSON.stringify(sel)});`
+          : `    // TODO: long press ${JSON.stringify(ev.componentName ?? 'unknown element')}`);
         break;
 
-      case 'type': {
-        const inputSel = sel ?? '~TODO';
-        lines.push(`    await driver.$(${JSON.stringify(inputSel)}).setValue(${JSON.stringify(ev.text ?? '')});`);
+      case 'type':
+        if (sel) lines.push(`    await browser.$(${JSON.stringify(sel)}).setValue(${JSON.stringify(ev.text ?? '')});`);
+        else lines.push(`    // TODO: type ${JSON.stringify(ev.text ?? '')} into an element with an accessibility ID`);
         break;
-      }
 
       case 'submit':
-        lines.push(`    await driver.keys(['Enter']);`);
+        lines.push(`    await browser.keys(['Enter']);`);
         break;
 
       case 'swipe':
-        lines.push(...appiumSwipeLines(ev.direction ?? 'up', '    '));
+        lines.push(`    await swipe(${JSON.stringify(ev.direction ?? 'up')});`);
         break;
 
       case 'navigate': {
         const assertSel = nextSelector(i, appiumSelector);
-        lines.push(`    // navigated to: ${ev.route ?? 'new screen'}`);
+        lines.push(`    // navigated to: ${safeComment(ev.route ?? 'new screen')}`);
         lines.push(assertSel
-          ? `    await driver.$(${JSON.stringify(assertSel)}).waitForDisplayed({ timeout: 5000 });`
+          ? `    await browser.$(${JSON.stringify(assertSel)}).waitForDisplayed({ timeout: 5000 });`
           : `    // TODO: assert screen loaded`);
         break;
       }
 
       case 'annotation':
-        lines.push(`    // ${ev.note ?? ''}`);
+        lines.push(`    // ${safeComment(ev.note ?? '')}`);
         break;
     }
   }

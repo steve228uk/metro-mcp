@@ -35,7 +35,7 @@ This approach requires **zero app code changes** and works with Hermes on both i
 
 | Format | Framework | Generated file type |
 |--------|-----------|---------------------|
-| `appium` | WebdriverIO + Jest | `.test.ts` |
+| `appium` | WebdriverIO + Mocha | `.test.ts` |
 | `maestro` | Maestro | `.yaml` |
 | `detox` | Detox + Jest | `.test.js` |
 
@@ -83,7 +83,7 @@ For `generate_test_from_recording`, additional parameters:
 | `testName` | `"Recorded flow"` | Name for the describe/it block |
 | `platform` | `ios` | `ios`, `android`, or `both` (Appium only) |
 | `bundleId` | — | iOS bundle ID or Android app package |
-| `includeSetup` | `true` | Include driver setup/teardown boilerplate |
+| `includeSetup` | `true` | Include runner configuration comments in Appium output; WDIO always owns setup and teardown |
 
 ---
 
@@ -92,46 +92,34 @@ For `generate_test_from_recording`, additional parameters:
 ### Appium (WebdriverIO)
 
 ```typescript
-import { remote, Browser } from 'webdriverio';
+import { browser } from '@wdio/globals';
 
 describe('Guest checkout', () => {
-  let driver: Browser;
-
-  beforeAll(async () => {
-    driver = await remote({
-      capabilities: {
-        platformName: 'iOS',
-        'appium:automationName': 'XCUITest',
-        'appium:bundleId': 'com.example.app',
-      },
-    });
-  });
-
-  afterAll(async () => {
-    await driver.deleteSession();
-  });
-
   it('Guest checkout', async () => {
     // navigated to: WelcomeScreen
-    await driver.$('~startShoppingButton').waitForDisplayed({ timeout: 5000 });
+    await browser.$('~startShoppingButton').waitForDisplayed({ timeout: 5000 });
 
-    await driver.$('~startShoppingButton').click();
+    await browser.$('~startShoppingButton').click();
 
     // navigated to: ProductListScreen
-    await driver.$('~productCard').waitForDisplayed({ timeout: 5000 });
+    await browser.$('~productCard').waitForDisplayed({ timeout: 5000 });
 
-    await driver.$('~productCard').click();
-    await driver.$('~addToCartButton').click();
+    await browser.$('~productCard').click();
+    await browser.$('~addToCartButton').click();
 
     // navigated to: CartScreen
-    await driver.$('~checkoutButton').waitForDisplayed({ timeout: 5000 });
+    await browser.$('~checkoutButton').waitForDisplayed({ timeout: 5000 });
   });
 });
 ```
 
 Run with: `npx wdio run wdio.conf.ts`
 
-To generate the config file: `generate_wdio_config platform=ios bundleId=com.example.app`
+The runner owns the Appium session. Generate its configuration separately with `generate_wdio_config`; set `platform` to `ios`, `android`, or `both`, and optionally provide `bundleId`, `appPath`, `udid`, `deviceName`, and `platformVersion`. The generated spec uses WDIO's `browser` instance and does not create or tear down a second session. Swipes and long presses use W3C pointer actions, while submit events use `browser.keys`.
+
+The configuration requires an app target. If `bundleId` and `appPath` are omitted, the connected Metro app's ID is used. With no connected app, provide one of those arguments.
+
+For TypeScript checking, include `node`, `@wdio/globals/types`, and `@wdio/mocha-framework` in your `tsconfig.json` compiler `types`. This loads WDIO's browser and Mocha types for both generated setup modes.
 
 ---
 
