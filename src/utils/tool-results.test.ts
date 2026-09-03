@@ -23,6 +23,38 @@ test('serializes ordinary plugin results as text', () => {
   });
 });
 
+test('serializes a BigInt scalar using its JavaScript literal spelling', () => {
+  expect(normalizeToolResult(1n)).toEqual({
+    content: [{ type: 'text', text: '1n' }],
+  });
+});
+
+test('serializes nested BigInts without throwing', () => {
+  expect(normalizeToolResult({
+    count: 1n,
+    values: [2n, { total: 3n }],
+  })).toEqual({
+    content: [{
+      type: 'text',
+      text: '{"count":"1n","values":["2n",{"total":"3n"}]}',
+    }],
+  });
+});
+
+test('preserves existing JSON handling for non-BigInt primitives', () => {
+  expect(normalizeToolResult({
+    nan: Number.NaN,
+    positiveInfinity: Number.POSITIVE_INFINITY,
+    negativeInfinity: Number.NEGATIVE_INFINITY,
+    negativeZero: -0,
+  })).toEqual({
+    content: [{
+      type: 'text',
+      text: '{"nan":null,"positiveInfinity":null,"negativeInfinity":null,"negativeZero":0}',
+    }],
+  });
+});
+
 test('serializes content-shaped objects that are not valid MCP results', () => {
   const result = { content: [{ type: 'custom', value: 42 }] };
 
