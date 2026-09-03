@@ -40,8 +40,20 @@ export function selectReloadPeer(peers: unknown, target: MetroTarget): string | 
   return matches.length === 1 ? matches[0][0] : null;
 }
 
+/** Build Metro's message endpoint independently of any CDP proxy target URL. */
+export function createMetroMessageUrl(host: string, port: number): URL {
+  const normalizedHost = host.replace(/^\[|\]$/g, '');
+  const urlHost = normalizedHost.includes(':') ? `[${normalizedHost}]` : normalizedHost;
+  return new URL(`ws://${urlHost}:${port}/message`);
+}
+
 /** Send to one verified peer. A broadcast could reload unrelated apps. */
-export function sendTargetedReload(target: MetroTarget, deadline: number): Promise<{ dispatch: Dispatch; error?: string }> {
+export function sendTargetedReload(
+  target: MetroTarget,
+  deadline: number,
+  metroHost: string,
+  metroPort: number,
+): Promise<{ dispatch: Dispatch; error?: string }> {
   return new Promise((resolve) => {
     let dispatched = false;
     let settled = false;
@@ -58,8 +70,10 @@ export function sendTargetedReload(target: MetroTarget, deadline: number): Promi
       error instanceof Error ? error.message : String(error));
     try {
       if (Date.now() >= deadline) throw new Error('Reload deadline exceeded');
-      const url = new URL(target.webSocketDebuggerUrl!);
-      url.pathname = '/message';
+      // A target returned through the shared CDP multiplexer points at the
+      // proxy. The message protocol belongs to Metro, so use the actual
+      // server endpoint carried by the plugin context and always use ws.
+      const url = createMetroMessageUrl(metroHost, metroPort);
       url.search = '?role=metro-mcp';
       const origin = `${url.protocol === 'wss:' ? 'https:' : 'http:'}//${url.host}`;
       socket = new WebSocket(url, { origin, handshakeTimeout: deadline - Date.now() });
@@ -136,14 +150,7 @@ export async function reloadApp(ctx: PluginContext, timeout: number): Promise<Re
     dispatch = 'unknown';
     // Metro Bridge owns the transport timeout. Pass the remaining reload
     // budget through so a stalled CDP request cannot outlive this operation.
-    // Keep the cast local while older bridge typings are still in the tree;
-    // the runtime API accepts the optional third argument.
-    const sendWithTimeout = ctx.cdp.send as unknown as (
-      method: string,
-      params?: Record<string, unknown>,
-      options?: { timeoutMs?: number },
-    ) => Promise<unknown>;
-    await beforeDeadline(sendWithTimeout('Page.reload', undefined, {
+    await beforeDeadline(ctx.cdp.send.call(ctx.cdp, 'Page.reload', undefined, {
       timeoutMs: Math.max(1, deadline - Date.now()),
     }), deadline);
     dispatch = 'submitted';
@@ -154,7 +161,7 @@ export async function reloadApp(ctx: PluginContext, timeout: number): Promise<Re
       dispatch = 'not-sent';
       try {
         await requireOriginalRuntime();
-        const result = await sendTargetedReload(target, deadline);
+        const result = await sendTargetedReload(target, deadline, ctx.metro.host, ctx.metro.port);
         dispatch = result.dispatch;
         dispatchError = result.error;
       } catch (preflightError) {

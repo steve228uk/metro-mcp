@@ -3,7 +3,7 @@ import vm from 'node:vm';
 import { WebSocketServer } from 'ws';
 import type { MetroTarget } from 'metro-bridge';
 import type { PluginContext } from '../plugin.js';
-import { reloadApp, selectReloadPeer } from './reload-app.js';
+import { createMetroMessageUrl, reloadApp, selectReloadPeer } from './reload-app.js';
 
 const target: MetroTarget = {
   id: 'page-1', appId: 'com.example.app', deviceName: 'Test Device',
@@ -16,18 +16,25 @@ function harness(send: (options?: { timeoutMs?: number }) => Promise<unknown>, i
   let current = initial;
   let app = vm.createContext({ setTimeout: () => 0 });
   let reloads = 0;
-  const ctx = {
-    cdp: {
-      isConnected: true,
-      getTarget: () => current,
-      send: async (method: string, _params?: Record<string, unknown>, options?: { timeoutMs?: number }) => {
+  const targetUrl = new URL(initial.webSocketDebuggerUrl!);
+  const cdp = {
+    isConnected: true,
+    getTarget: () => current,
+    send: async function(this: unknown, method: string, _params?: Record<string, unknown>, options?: { timeoutMs?: number }) {
+        expect(this).toBe(cdp);
         expect(method).toBe('Page.reload');
         reloads++;
         return send(options);
       },
-    },
+  };
+  const ctx = {
+    cdp,
     evalInApp: async (expression: string) => new vm.Script(expression).runInContext(app),
-    metro: { fetch: async () => { throw new Error('Never use the HTTP reload endpoint'); } },
+    metro: {
+      host: targetUrl.hostname,
+      port: Number(targetUrl.port),
+      fetch: async () => { throw new Error('Never use the HTTP reload endpoint'); },
+    },
   } as unknown as PluginContext;
   return {
     ctx,
@@ -162,6 +169,24 @@ describe('verified app reload', () => {
     expect(app.reloads).toBe(1);
   });
 
+  test('uses the Metro message endpoint when the target URL belongs to a CDP proxy', async () => {
+    const messages: Record<string, unknown>[] = [];
+    const metroTarget = await messageServer({ selected: 'app=com.example.app&device=Test+Device' }, (message) => {
+      messages.push(message);
+    });
+    const metroPort = Number(new URL(metroTarget.webSocketDebuggerUrl!).port);
+    const proxyTarget = {
+      ...metroTarget,
+      webSocketDebuggerUrl: 'wss://proxy.example:1/inspector/debug?page=proxy',
+    };
+    const app = harness(async () => { throw new Error("'Page.reload' wasn't found"); }, proxyTarget);
+    app.ctx.metro.host = '127.0.0.1';
+    app.ctx.metro.port = metroPort;
+    expect(await reloadApp(app.ctx, 500)).toMatchObject({ status: 'unverified', method: 'metro-message' });
+    expect(messages).toEqual([{ version: 2, method: 'reload', target: 'selected' }]);
+    expect(app.reloads).toBe(1);
+  });
+
   test('does not send fallback to an unidentifiable sole peer', async () => {
     const messages: Record<string, unknown>[] = [];
     const socketTarget = await messageServer({ unknown: 'role=ios' }, (message) => messages.push(message));
@@ -176,4 +201,9 @@ test('message peer selection requires a unique app and device match', () => {
   expect(selectReloadPeer({ a: 'app=com.example.app&device=Test+Device', b: 'app=com.example.app&device=Test+Device' }, target)).toBeNull();
   expect(selectReloadPeer({ a: 'app=com.other.app&device=Test+Device' }, target)).toBeNull();
   expect(selectReloadPeer({ a: {} }, target)).toBeNull();
+});
+
+test('builds a ws Metro message URL with bracketed IPv6 hosts', () => {
+  expect(createMetroMessageUrl('::1', 8081).toString()).toBe('ws://[::1]:8081/message');
+  expect(createMetroMessageUrl('[::1]', 8081).toString()).toBe('ws://[::1]:8081/message');
 });
