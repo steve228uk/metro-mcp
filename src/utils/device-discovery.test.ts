@@ -17,6 +17,8 @@ const iosInventory = (devices: Array<Record<string, string>>) =>
 function runnerFor(options: {
   ios?: string[];
   android?: string;
+  iosFailure?: boolean;
+  androidFailure?: boolean;
 }): DeviceDiscoveryRunner & { calls: string[][] } {
   const ios = [...(options.ios ?? [iosInventory([
     { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
@@ -27,9 +29,11 @@ function runnerFor(options: {
     async execFile(command, args) {
       calls.push([command, ...args]);
       if (command === 'xcrun') {
+        if (options.iosFailure) throw new Error('simctl unavailable');
         const output = ios.shift() ?? ios.at(-1) ?? iosInventory([]);
         return Buffer.from(output);
       }
+      if (options.androidFailure) throw new Error('adb unavailable');
       return Buffer.from(options.android ?? 'List of devices attached\n');
     },
   };
@@ -66,6 +70,86 @@ describe('device discovery', () => {
     });
     const device = await resolveDevice(runner, 'auto');
     expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
+  test('does not use an Android name or sole fallback when iOS discovery fails for a connected target', async () => {
+    const runner = runnerFor({
+      iosFailure: true,
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).rejects.toThrow('iOS simulator discovery failed');
+  });
+
+  test('does not use a sole fallback for a connected target with no identity metadata', async () => {
+    const runner = runnerFor({
+      iosFailure: true,
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {})).rejects.toThrow(
+      'iOS simulator discovery failed',
+    );
+  });
+
+  test('does not use an iOS name or sole fallback when Android discovery fails for a connected target', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'Pixel 8', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      androidFailure: true,
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).rejects.toThrow('Android device discovery failed');
+  });
+
+  test('keeps exact connected IDs usable when the other inventory is unavailable', async () => {
+    const runner = runnerFor({
+      iosFailure: true,
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    expect(await resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'emulator-42' },
+    })).toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
+  test('keeps sole fallback usable without a connected target after an inventory failure', async () => {
+    const runner = runnerFor({
+      iosFailure: true,
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    expect(await resolveDevice(runner, 'auto')).toMatchObject({
+      platform: 'android', id: 'emulator-42',
+    });
+  });
+
+  test('reports ambiguity when an unmatched connected target has devices on both platforms', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Unknown device',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).rejects.toThrow('Ambiguous available devices across iOS and Android');
+  });
+
+  test('reports ambiguity when no target is connected and both platforms have candidates', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto')).rejects.toThrow(
+      'Ambiguous available devices across iOS and Android',
+    );
   });
 
   test('auto selection follows the connected Android target over booted iOS', async () => {
