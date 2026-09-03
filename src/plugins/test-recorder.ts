@@ -495,10 +495,32 @@ export const testRecorderPlugin = definePlugin({
       handler: async () => {
         storedEvents = null;
 
+        // Keep injection, readiness, activation, and the final route lookup
+        // inside one startup budget. EvalOptions.deadline also bounds any
+        // reconnect wait in the shared app evaluator; per-request timeouts
+        // must never reserve time beyond this deadline.
+        const deadline = Date.now() + 6000;
+        const evaluateStartup = async (expression: string, timeout: number) => {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error('recording startup deadline exceeded');
+          return ctx.evalInApp(expression, {
+            timeout: Math.min(timeout, remaining),
+            deadline,
+          });
+        };
+        const cleanupBestEffort = () => {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return;
+          void ctx.evalInApp(CLEANUP_RECORDING_JS, {
+            timeout: Math.min(1000, remaining),
+            deadline,
+          }).catch(() => {});
+        };
+
         let injected: unknown;
         let injectError = 'script returned false (check __REACT_DEVTOOLS_GLOBAL_HOOK__ availability)';
         try {
-          injected = await ctx.evalInApp(START_RECORDING_JS, { timeout: 6000 });
+          injected = await evaluateStartup(START_RECORDING_JS, 6000);
         } catch (err) {
           injectError = err instanceof Error ? err.message : String(err);
           injected = false;
@@ -507,7 +529,7 @@ export const testRecorderPlugin = definePlugin({
           // CDP can report a transport error after the app evaluated part of
           // the script. Always attempt cleanup for a partially-installed
           // session before returning the failure.
-          await ctx.evalInApp(CLEANUP_RECORDING_JS, { timeout: 1000 }).catch(() => {});
+          cleanupBestEffort();
           return `Could not inject recording hooks — ${injectError}`;
         }
 
@@ -515,33 +537,40 @@ export const testRecorderPlugin = definePlugin({
         // bounded scan after React has had a chance to refresh frozen props;
         // enabling capture before this point loses the first interaction or
         // silently misses a deep handler.
-        const deadline = Date.now() + 6000;
         let readiness: RecordingReadiness | null = null;
         while (Date.now() < deadline) {
           try {
-            readiness = await ctx.evalInApp(RECORDING_READINESS_JS, { timeout: 1000 }) as RecordingReadiness;
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            readiness = await evaluateStartup(RECORDING_READINESS_JS, Math.min(1000, remaining)) as RecordingReadiness;
             if (readiness?.ready) break;
           } catch (err) {
             injectError = err instanceof Error ? err.message : String(err);
           }
-          await new Promise((resolve) => setTimeout(resolve, 50));
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
         }
         if (!readiness?.ready) {
-          await ctx.evalInApp(CLEANUP_RECORDING_JS, { timeout: 1000 }).catch(() => {});
+          cleanupBestEffort();
           const reason = readiness?.traversal?.truncationReason
             ?? (readiness?.unwrapped?.length
               ? `unwrapped handlers: ${[...new Set(readiness.unwrapped)].join(', ')}`
               : injectError);
-          return `Could not start recording — React handler coverage did not become ready within 6000ms (${reason}). Instrumentation was cleaned up.`;
+          return `Could not start recording — React handler coverage did not become ready within 6000ms (${reason}). Cleanup was attempted within the startup deadline.`;
         }
 
-        const activated = await ctx.evalInApp(ACTIVATE_RECORDING_JS, { timeout: 1000 }).catch(() => false);
+        const activated = (deadline - Date.now() > 0
+          ? await evaluateStartup(ACTIVATE_RECORDING_JS, 1000).catch(() => false)
+          : false);
         if (!activated) {
-          await ctx.evalInApp(CLEANUP_RECORDING_JS, { timeout: 1000 }).catch(() => {});
-          return 'Could not start recording — capture activation failed. Instrumentation was cleaned up.';
+          cleanupBestEffort();
+          return 'Could not start recording — capture activation failed. Cleanup was attempted within the startup deadline.';
         }
 
-        const route = await ctx.evalInApp(CURRENT_ROUTE_JS, { timeout: 3000 }).catch(() => null) as string | null;
+        const route = (deadline - Date.now() > 0
+          ? await evaluateStartup(CURRENT_ROUTE_JS, 3000).catch(() => null)
+          : null) as string | null;
         const routeInfo = route ? ` on screen "${route}"` : '';
         return (
           `Recording started${routeInfo}. ` +
