@@ -287,6 +287,26 @@ describe('test recorder readiness', () => {
     expect(raw[0].testID).toBe('same-control');
   });
 
+  test('does not reuse a forwarded wrapper across handler kinds', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var forwarded = function() { handlerCalls++; };
+      var outerProps = { testID: 'same-control', onPress: forwarded };
+      Object.freeze(outerProps);
+      var childProps = { testID: 'same-control', onLongPress: outerProps.onPress };
+      Object.freeze(childProps);
+      leaf.memoizedProps = childProps;
+      leaf.memoizedProps.onLongPress();
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 long_press');
+    expect(vm.runInContext('handlerCalls', app)).toBe(1);
+    const raw = vm.runInContext('__METRO_MCP_REC_EVENTS__', app) as Array<{ type?: string }>;
+    expect(raw).toHaveLength(1);
+    expect(raw[0].type).toBe('long_press');
+  });
+
   test('keeps recorder and profiler commit hooks chained in either stop order', async () => {
     const app = appWithDeepButton();
     const call = await createHarness(app, [testRecorderPlugin, profilerPlugin]);

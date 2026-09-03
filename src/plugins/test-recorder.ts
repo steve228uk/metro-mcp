@@ -44,10 +44,10 @@ const SCROLLABLE_PROPS_JS = `
 `;
 
 const RECORDER_METADATA_JS = `
-  function hasMetadata(fn, tid, lbl) {
+  function hasMetadata(fn, tid, lbl, kind) {
     var metadata = fn && fn.__mcpRecMetadata;
     return typeof fn === 'function' && fn.__mcpRecSession === state.sessionId &&
-      metadata && metadata.testID === tid && metadata.label === lbl;
+      metadata && metadata.testID === tid && metadata.label === lbl && metadata.kind === kind;
   }
 `;
 
@@ -105,14 +105,14 @@ const START_RECORDING_JS = `
 
   function wrap(obj, name, tid, lbl, makeEvent) {
     var original = obj[name];
-    if (typeof original !== 'function' || hasMetadata(original, tid, lbl)) return false;
+    if (typeof original !== 'function' || hasMetadata(original, tid, lbl, name)) return false;
     var wrapped = function() {
       return invokeOriginal(original, this, arguments, makeEvent);
     };
     try {
       Object.defineProperty(wrapped, '__mcpRecSession', { value: state.sessionId });
       Object.defineProperty(wrapped, '__mcpRecOriginal', { value: original });
-      Object.defineProperty(wrapped, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
+      Object.defineProperty(wrapped, '__mcpRecMetadata', { value: { testID: tid, label: lbl, kind: name } });
       obj[name] = wrapped;
       return obj[name] === wrapped;
     } catch (_) {
@@ -154,12 +154,12 @@ const START_RECORDING_JS = `
         existingScrollState(originalEnd) ||
         existingScrollState(originalMomentumEnd) ||
         { x: null, y: null };
-      function tagScrollWrapper(fn) {
+      function tagScrollWrapper(fn, kind) {
         Object.defineProperty(fn, '__mcpRecSession', { value: state.sessionId });
-        Object.defineProperty(fn, '__mcpRecMetadata', { value: { testID: tid, label: lbl } });
+        Object.defineProperty(fn, '__mcpRecMetadata', { value: { testID: tid, label: lbl, kind: kind } });
         Object.defineProperty(fn, '__mcpRecScrollState', { value: scrollStart });
       }
-      if (!hasMetadata(originalBegin, tid, lbl)) {
+      if (!hasMetadata(originalBegin, tid, lbl, 'onScrollBeginDrag')) {
         var begin = function(e) {
           var outermost = state.invocationDepth === 0;
           state.invocationDepth++;
@@ -174,7 +174,7 @@ const START_RECORDING_JS = `
           } finally { state.invocationDepth--; }
         };
         try {
-          tagScrollWrapper(begin);
+          tagScrollWrapper(begin, 'onScrollBeginDrag');
           obj.onScrollBeginDrag = begin;
           wrapped = obj.onScrollBeginDrag === begin || wrapped;
         } catch (_) {}
@@ -195,26 +195,26 @@ const START_RECORDING_JS = `
         } catch (_) {}
         scrollStart.x = scrollStart.y = null;
       }
-      if (!hasMetadata(originalEnd, tid, lbl)) {
+      if (!hasMetadata(originalEnd, tid, lbl, 'onScrollEndDrag')) {
         var end = function(e) {
           state.invocationDepth++;
           try { emitSwipe(e); return originalEnd ? originalEnd.apply(this, arguments) : undefined; }
           finally { state.invocationDepth--; }
         };
         try {
-          tagScrollWrapper(end);
+          tagScrollWrapper(end, 'onScrollEndDrag');
           obj.onScrollEndDrag = end;
           wrapped = obj.onScrollEndDrag === end || wrapped;
         } catch (_) {}
       }
-      if (!hasMetadata(originalMomentumEnd, tid, lbl)) {
+      if (!hasMetadata(originalMomentumEnd, tid, lbl, 'onMomentumScrollEnd')) {
         var momentum = function(e) {
           state.invocationDepth++;
           try { emitSwipe(e); return originalMomentumEnd ? originalMomentumEnd.apply(this, arguments) : undefined; }
           finally { state.invocationDepth--; }
         };
         try {
-          tagScrollWrapper(momentum);
+          tagScrollWrapper(momentum, 'onMomentumScrollEnd');
           obj.onMomentumScrollEnd = momentum;
           wrapped = obj.onMomentumScrollEnd === momentum || wrapped;
         } catch (_) {}
@@ -287,7 +287,7 @@ const START_RECORDING_JS = `
     if (!props || typeof props !== 'object') return;
     var needsRefresh = false;
     for (var i = 0; i < HANDLERS.length; i++) {
-      if (typeof props[HANDLERS[i]] === 'function' && !hasMetadata(props[HANDLERS[i]], props.testID || null, props.accessibilityLabel || props['aria-label'] || null)) {
+      if (typeof props[HANDLERS[i]] === 'function' && !hasMetadata(props[HANDLERS[i]], props.testID || null, props.accessibilityLabel || props['aria-label'] || null, HANDLERS[i])) {
         needsRefresh = true;
         break;
       }
@@ -343,7 +343,7 @@ const RECORDING_READINESS_JS = buildFiberReadExpression(`
       handlerCount++;
       var propTestID = props.testID || null;
       var propLabel = props.accessibilityLabel || props['aria-label'] || null;
-      if (!hasMetadata(props[name], propTestID, propLabel))
+      if (!hasMetadata(props[name], propTestID, propLabel, name))
         unwrapped.push(name);
     }
     if (isScrollable(props)) {
@@ -352,7 +352,7 @@ const RECORDING_READINESS_JS = buildFiberReadExpression(`
         var scrollName = scrollHandlers[scrollIndex];
         var scrollTestID = props.testID || null;
         var scrollLabel = props.accessibilityLabel || props['aria-label'] || null;
-        if (typeof props[scrollName] !== 'function' || !hasMetadata(props[scrollName], scrollTestID, scrollLabel))
+        if (typeof props[scrollName] !== 'function' || !hasMetadata(props[scrollName], scrollTestID, scrollLabel, scrollName))
           unwrapped.push(scrollName);
       }
     }
