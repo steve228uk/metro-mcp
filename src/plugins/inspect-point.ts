@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { awaitAppResult } from '../utils/await-app-result.js';
 import {
   DEFAULT_FIBER_MAX_DEPTH,
   DEFAULT_FIBER_MAX_NODES,
@@ -184,7 +183,7 @@ export const inspectPointPlugin = definePlugin({
           true,
         );
 
-        return awaitAppResult(ctx.evalInApp, expression);
+        return ctx.evalInApp(expression, { awaitPromise: true });
       },
     });
   },

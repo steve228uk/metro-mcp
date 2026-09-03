@@ -4,24 +4,76 @@ import type { PluginContext } from '../plugin.js';
 
 type Evaluate = PluginContext['evalInApp'];
 
+export type AppEvaluationCompletion =
+  | {
+      /** Remote object handle for object and Promise completions. */
+      objectId: string;
+      value?: unknown;
+    }
+  | {
+      /** By-value completion, including an explicit undefined value. */
+      objectId?: undefined;
+      value: unknown;
+    };
+
+type EvaluateScript = (
+  expression: string,
+  options?: { timeout?: number; deadline?: number; objectGroup?: string },
+) => Promise<AppEvaluationCompletion>;
+
+type SettleRemote = (
+  objectId: string,
+  mailboxKey: string,
+  options: { timeout?: number; deadline: number },
+) => Promise<boolean>;
+
+type ReleaseObjectGroup = (
+  objectGroup: string,
+  options: { timeout?: number },
+) => Promise<void>;
+
 function timeoutError(timeout: number): Error {
   return new Error(`App evaluation timed out after ${timeout}ms`);
 }
 
-async function evaluateBeforeDeadline(
-  evaluate: Evaluate,
+type DeadlineEvaluate<T> = (
   expression: string,
-  options: { timeout?: number; deadline: number },
+  options: { timeout?: number; deadline: number; objectGroup?: string },
+) => Promise<T>;
+
+async function evaluateBeforeDeadline<T>(
+  evaluate: DeadlineEvaluate<T>,
+  expression: string,
+  options: { timeout?: number; deadline: number; objectGroup?: string },
   timeout: number,
-): Promise<unknown> {
+): Promise<T> {
   const remaining = options.deadline - Date.now();
+  if (remaining <= 0) throw timeoutError(timeout);
+  return awaitPromiseBeforeDeadline(
+    evaluate(expression, {
+      timeout: Math.max(
+        1,
+        Math.min(
+          options.timeout ?? remaining,
+          remaining,
+        ),
+      ),
+      deadline: options.deadline,
+    }),
+    options.deadline,
+    timeout,
+  );
+}
+
+async function awaitPromiseBeforeDeadline<T>(
+  operation: Promise<T>,
+  deadline: number,
+  timeout: number,
+): Promise<T> {
+  const remaining = deadline - Date.now();
   if (remaining <= 0) throw timeoutError(timeout);
 
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const operation = evaluate(expression, {
-    timeout: Math.max(1, Math.min(options.timeout ?? remaining, remaining)),
-    deadline: options.deadline,
-  });
   const deadlineReached = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(timeoutError(timeout)), remaining);
   });
@@ -40,6 +92,36 @@ export interface AwaitAppResultOptions {
   pollEvaluate?: Evaluate;
   /** Evaluation used to remove the mailbox during cleanup. */
   cleanupEvaluate?: Evaluate;
+  /** Execute the caller's source as a Runtime.evaluate script exactly once. */
+  evaluateScript?: EvaluateScript;
+  /** Attach mailbox settlement to a remote Promise/object completion. */
+  settleRemote?: SettleRemote;
+  /** Release handles if source evaluation completes after the host deadline. */
+  releaseObjectGroup?: ReleaseObjectGroup;
+}
+
+async function completeByValue(
+  evaluate: Evaluate,
+  key: string,
+  value: unknown,
+  options: { deadline: number; timeout: number },
+): Promise<void> {
+  const serialized = value === undefined ? 'void 0' : JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new Error('App evaluation result could not be serialized');
+  }
+  await evaluateBeforeDeadline(
+    evaluate,
+    `(function() {
+      var state = globalThis[${key}];
+      if (state) {
+        state.value = ${serialized};
+        state.status = 'fulfilled';
+      }
+    })()`,
+    options,
+    options.timeout,
+  );
 }
 
 /**
@@ -55,8 +137,25 @@ export async function awaitAppResult(
 ): Promise<unknown> {
   const pollEvaluate = options?.pollEvaluate ?? evaluate;
   const cleanupEvaluate = options?.cleanupEvaluate ?? evaluate;
-  const key = JSON.stringify(`__METRO_MCP_ASYNC_${randomUUID()}`);
+  const mailboxName = `__METRO_MCP_ASYNC_${randomUUID()}`;
+  const objectGroup = `__METRO_MCP_ASYNC_GROUP_${randomUUID()}`;
+  const key = JSON.stringify(mailboxName);
   const deadline = Date.now() + timeout;
+  let sourceCompletedByValue = false;
+  let remoteHandleReleased = false;
+  let sourceEvaluation: Promise<AppEvaluationCompletion> | undefined;
+  let sourceEvaluationSettled = false;
+
+  const releaseGroup = async (): Promise<void> => {
+    if (!options?.releaseObjectGroup) return;
+    const releaseDeadline = Date.now() + 100;
+    await awaitPromiseBeforeDeadline(
+      options.releaseObjectGroup(objectGroup, { timeout: 100 }),
+      releaseDeadline,
+      100,
+    ).catch(() => {});
+  };
+
   try {
     await evaluateBeforeDeadline(evaluate, `(function() {
       var state = { status: 'pending' };
@@ -66,22 +165,45 @@ export async function awaitAppResult(
       state.timer = setTimeout(function() {
         if (globalThis[${key}] === state) delete globalThis[${key}];
       }, ${timeout + 1000});
-      function reject(error) {
-        state.status = 'rejected';
-        state.error = String(error && error.message || error);
-      }
-      try {
-        // Evaluate the caller's source as a script so awaitPromise works for
-        // the same completion values as Runtime.evaluate (including multiple
-        // statements and declarations), rather than interpolating it into an
-        // expression. The source is evaluated exactly once before polling.
-        Promise.resolve((0, eval)(${JSON.stringify(expression)})).then(function(value) {
-          state.value = value;
-          state.status = 'fulfilled';
-        }, reject);
-      } catch (error) { reject(error); }
       return true;
     })()`, { timeout, deadline }, timeout);
+
+    // Runtime.evaluate must receive the user's source itself. Indirect eval
+    // runs in a separate variable environment and silently loses top-level
+    // let/const/class declarations. The evaluator supplied by the server
+    // requests a remote completion object so Hermes' Promise can settle the
+    // mailbox without replaying the source during a reconnect.
+    let completion: AppEvaluationCompletion;
+    if (options?.evaluateScript) {
+      if (Date.now() >= deadline) throw timeoutError(timeout);
+      sourceEvaluation = options.evaluateScript(expression, { timeout, deadline, objectGroup });
+      sourceEvaluation.then(
+        () => { sourceEvaluationSettled = true; },
+        () => { sourceEvaluationSettled = true; },
+      );
+      completion = await awaitPromiseBeforeDeadline(sourceEvaluation, deadline, timeout);
+    } else {
+      completion = { value: await evaluateBeforeDeadline(evaluate, expression, { timeout, deadline }, timeout) };
+      sourceCompletedByValue = true;
+    }
+
+    if (completion.objectId) {
+      if (!options?.settleRemote) {
+        throw new Error('App evaluation returned a remote object without settlement support');
+      }
+      if (Date.now() >= deadline) throw timeoutError(timeout);
+      remoteHandleReleased = await awaitPromiseBeforeDeadline(
+        options.settleRemote(completion.objectId, mailboxName, {
+          timeout,
+          deadline,
+        }),
+        deadline,
+        timeout,
+      );
+    } else {
+      sourceCompletedByValue = true;
+      await completeByValue(evaluate, key, completion.value, { deadline, timeout });
+    }
 
     while (Date.now() < deadline) {
       const result = await evaluateBeforeDeadline(pollEvaluate, `(function() {
@@ -104,6 +226,18 @@ export async function awaitAppResult(
     }
     throw timeoutError(timeout);
   } finally {
+    // Runtime.evaluate may still complete after the host-side deadline and
+    // return an object handle that never reaches settleRemote. Release the
+    // whole group best effort so late completions cannot accumulate handles.
+    if (!sourceCompletedByValue && !remoteHandleReleased) {
+      await releaseGroup();
+      if (sourceEvaluation && !sourceEvaluationSettled) {
+        // A transport timeout can race the engine's eventual response. Keep
+        // this continuation bounded and release the same unique group after
+        // that response arrives, without leaving a polling timer alive.
+        void sourceEvaluation.then(() => releaseGroup(), () => releaseGroup());
+      }
+    }
     // Also expires inside the app if the MCP process or CDP connection is lost.
     const remaining = deadline - Date.now();
     if (remaining > 0) {
