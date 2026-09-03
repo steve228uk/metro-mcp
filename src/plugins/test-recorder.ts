@@ -397,12 +397,14 @@ function pushCaps(
     udid?: string;
     deviceName?: string;
     platformVersion?: string;
+    noReset: boolean;
   },
   indent: string,
 ): void {
-  const push = (key: string, value: string) => lines.push(`${indent}${JSON.stringify(key)}: ${JSON.stringify(value)},`);
+  const push = (key: string, value: string | boolean) => lines.push(`${indent}${JSON.stringify(key)}: ${JSON.stringify(value)},`);
   push('platformName', platform === 'ios' ? 'iOS' : 'Android');
   push('appium:automationName', platform === 'ios' ? 'XCUITest' : 'UiAutomator2');
+  push('appium:noReset', options.noReset);
   if (options.udid) push('appium:udid', options.udid);
   if (options.deviceName) push('appium:deviceName', options.deviceName);
   if (options.platformVersion) push('appium:platformVersion', options.platformVersion);
@@ -636,9 +638,10 @@ export const testRecorderPlugin = definePlugin({
         udid: z.string().optional().describe('Optional device UDID / serial'),
         deviceName: z.string().optional().describe('Optional Appium device name'),
         platformVersion: z.string().optional().describe('Optional OS version'),
+        noReset: z.boolean().default(true).describe('Preserve installed app data; false allows Appium to reset the app'),
         outputPath: z.string().default('./wdio.conf.ts').describe('Shown in the output, not written to disk'),
       }),
-      handler: async ({ platform, bundleId, appPath, udid, deviceName, platformVersion, outputPath }) => {
+      handler: async ({ platform, bundleId, appPath, udid, deviceName, platformVersion, noReset, outputPath }) => {
         const connectedAppId = ctx.cdp.getTarget()?.appId;
         const resolvedBundleId = bundleId ?? connectedAppId;
         if (!appPath && !resolvedBundleId) {
@@ -649,7 +652,7 @@ export const testRecorderPlugin = definePlugin({
         const buildCaps = (p: 'ios' | 'android'): string[] => {
           const cap: string[] = [];
           cap.push(`      {`);
-          pushCaps(cap, p, { bundleId: resolvedBundleId, appPath, udid, deviceName, platformVersion }, '        ');
+          pushCaps(cap, p, { bundleId: resolvedBundleId, appPath, udid, deviceName, platformVersion, noReset }, '        ');
           cap.push(`        'appium:newCommandTimeout': 240,`);
           cap.push(`      },`);
           return cap;

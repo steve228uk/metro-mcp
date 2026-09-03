@@ -117,6 +117,8 @@ Run with: `npx wdio run wdio.conf.ts`
 
 The runner owns the Appium session. Generate its configuration separately with `generate_wdio_config`; set `platform` to `ios`, `android`, or `both`, and optionally provide `bundleId`, `appPath`, `udid`, `deviceName`, and `platformVersion`. The generated spec uses WDIO's `browser` instance and does not create or tear down a second session. Swipes and long presses use W3C pointer actions, while submit events use `browser.keys`.
 
+The generated configuration defaults `noReset` to `true` to preserve installed app data. Appium may launch the target if it is not running. Return the app to the recording’s starting screen before replaying it. Set `noReset: false` only when the test should let Appium reset the app; that can clear onboarding or login state.
+
 The configuration requires an app target. If `bundleId` and `appPath` are omitted, the connected Metro app's ID is used. With no connected app, provide one of those arguments.
 
 For TypeScript checking, include `node`, `@wdio/globals/types`, and `@wdio/mocha-framework` in your `tsconfig.json` compiler `types`. This loads WDIO's browser and Mocha types for both generated setup modes.

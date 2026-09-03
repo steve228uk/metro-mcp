@@ -374,8 +374,10 @@ describe('test recorder readiness', () => {
       udid: 'device-123',
       deviceName: 'QA phone',
       platformVersion: '26.5',
+      noReset: false,
       outputPath: './e2e/wdio.conf.ts',
     }));
+    expect(generated.match(/"appium:noReset": false/g)).toHaveLength(2);
     expect(generated).toContain('"appium:udid": "device-123"');
     expect(generated).toContain('"appium:deviceName": "QA phone"');
     expect(generated).toContain('"appium:platformVersion": "26.5"');
@@ -393,6 +395,7 @@ describe('test recorder readiness', () => {
     const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], 'com.connected.app');
     const generated = String(await call('generate_wdio_config', { platform: 'ios' }));
     expect(generated).toContain('"appium:bundleId": "com.connected.app"');
+    expect(generated).toContain('"appium:noReset": true');
     expect(generated).not.toContain('com.example.app');
     expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
   });
