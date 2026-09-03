@@ -17,11 +17,13 @@ metro-mcp can record real user interactions and generate production-ready automa
 
 ## How It Works
 
-When you call `start_test_recording`, metro-mcp injects a JavaScript interceptor into the app runtime via Chrome DevTools Protocol. The interceptor:
+When you call `start_test_recording`, metro-mcp injects a JavaScript interceptor into the app runtime via Chrome DevTools Protocol. Startup has a bounded readiness phase: existing mounted props are refreshed where React can schedule an update, and a complete fiber scan (up to depth 600 and 5,000 nodes) must confirm the handlers are wrapped before capture is enabled. If React cannot provide complete coverage, startup fails and removes its instrumentation rather than reporting a partial recording. The interceptor then:
 
 - **Wraps event handlers** on every React fiber: `onPress`, `onChangeText`, `onLongPress`, `onSubmitEditing`
 - **Patches scroll containers** to capture swipe direction via `onScrollBeginDrag`/`onScrollEndDrag`
 - **Hooks React's commit lifecycle** (`onCommitFiberRoot`) to automatically patch new fibers as screens mount after navigation
+
+The recorder and profiler can run together. Each one keeps the hook chain intact when the other starts or stops, and an old recorder session stops recording without allowing its wrappers to capture into a later session.
 
 Each interaction is recorded with the element's `testID`, `accessibilityLabel`, component name, current route, and timestamp. When you call `stop_test_recording`, the events are deduplicated (rapid-fire `onChangeText` keystrokes are collapsed to the final value) and stored for test generation.
 

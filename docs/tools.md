@@ -182,7 +182,7 @@ See the [profiling guide](profiling.md) for a full explanation of CDP CPU profil
 
 Records real user interactions via React fiber patching — no app code changes required. See the [testing guide](testing.md) for full details.
 
-- **`start_test_recording`** — Inject interaction interceptors into the running app. Captures taps, text entry, long presses, keyboard submits, and scroll/swipe gestures. Re-patches new fibers after each navigation so newly-loaded screens are always covered.
+- **`start_test_recording`** — Install interaction interceptors, refresh mounted props, and wait for complete bounded React fiber coverage before enabling capture. Captures taps, text entry, long presses, keyboard submits, and scroll/swipe gestures. Re-patches new fibers after each navigation so newly-loaded screens are always covered; startup fails and cleans up when the bounded scan cannot confirm coverage.
 - **`stop_test_recording`** — Stop recording and retrieve the captured event log. Deduplicates rapid-fire text input events (keeps the final value per field).
 - **`generate_test_from_recording`** — Convert the recording to a test file. Params: `format` (appium/maestro/detox), `testName`, `platform` (ios/android/both), `bundleId`, `includeSetup`.
 - **`generate_wdio_config`** — Generate a minimal `wdio.conf.ts` for Appium + React Native, including the install command for all required packages.
