@@ -335,4 +335,27 @@ describe('shared app evaluation policy', () => {
       .resolves.toBe(1);
     expect(Date.now() - started).toBeLessThan(500);
   });
+
+  test('does not delay a settled remote result for bounded group cleanup', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    let groupReleaseStarted = false;
+    transport.send = async (method, params, options) => {
+      if (method === 'Runtime.releaseObjectGroup') {
+        groupReleaseStarted = true;
+        return new Promise(() => {});
+      }
+      return originalSend(method, params, options);
+    };
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    const started = Date.now();
+
+    await expect(evalInApp(
+      'new Promise(resolve => setTimeout(() => resolve(42), 10));',
+      { awaitPromise: true, timeout: 40 },
+    )).resolves.toBe(42);
+    expect(Date.now() - started).toBeLessThan(100);
+    expect(groupReleaseStarted).toBe(true);
+    expect(calls.some((call) => call.method === 'Runtime.releaseObject')).toBe(false);
+  });
 });
