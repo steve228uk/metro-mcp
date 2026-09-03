@@ -227,7 +227,9 @@ function findAndroidTarget(
   const byId = connectedId ? devices.find((device) => device.id === connectedId) : undefined;
   if (byId) return byId;
   if (!connectedName) return undefined;
-  const matches = devices.filter((device) => device.model === connectedName);
+  // `adb devices -l` replaces spaces in model names with underscores.
+  const modelName = connectedName.replace(/_/g, ' ');
+  const matches = devices.filter((device) => device.model?.replace(/_/g, ' ') === modelName);
   if (matches.length > 1) {
     throw new Error(
       `Ambiguous Android devices named "${connectedName}": ${matches.map((device) => device.id).join(', ')}.`,
