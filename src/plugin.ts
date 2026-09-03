@@ -7,10 +7,18 @@ import {
 import type { CircularBuffer } from './utils/buffer.js';
 import type { MetroTarget } from 'metro-bridge';
 
+interface CDPSendOptions {
+  timeoutMs?: number;
+}
+
 // ── CDP Connection Interface ──
 
 export interface CDPConnection {
-  send(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  send(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: CDPSendOptions,
+  ): Promise<unknown>;
   on(event: string, handler: (params: Record<string, unknown>) => void): void;
   off(event: string, handler: (params: Record<string, unknown>) => void): void;
   isConnected: boolean;
@@ -164,6 +172,8 @@ export interface EvalOptions {
   timeout?: number;
   /** Internal absolute deadline used to bound reconnect and transport waits. */
   deadline?: number;
+  /** Internal CDP object group used to release late remote completions. */
+  objectGroup?: string;
 }
 
 // ── Metro Events ──

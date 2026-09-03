@@ -80,9 +80,9 @@ async function createHarness(
   commands: Partial<Pick<PluginContext, 'exec' | 'execFile'>> = {},
 ) {
   // Runtime.evaluate executes against a persistent global object. A VM
-  // context exercises that behavior, including indirect eval used by the
-  // awaited mailbox path; wrapping snippets in new Function(globalThis) does
-  // not provide equivalent global declaration semantics.
+  // context exercises that behavior. Wrapping snippets in new
+  // Function(globalThis) does not provide equivalent global declaration
+  // semantics.
   const appGlobal = vm.createContext({
     ...runtime,
     setTimeout,
@@ -129,9 +129,13 @@ async function createHarness(
       truncate: (value: string) => value,
       structureOnly: (value: ComponentNode) => value,
     },
-    evalInApp: async (expression) => {
+    evalInApp: async (expression, options) => {
       // Mirror returnByValue without assuming CDP awaits an app's JS Promise.
       const result = new vm.Script(expression).runInContext(appGlobal);
+      if (options?.awaitPromise && result && typeof result === 'object' &&
+          typeof (result as Promise<unknown>).then === 'function') {
+        return result;
+      }
       return result === undefined
         ? undefined
         : JSON.parse(JSON.stringify(result));
