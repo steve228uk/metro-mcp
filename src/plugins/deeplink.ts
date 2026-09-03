@@ -123,9 +123,6 @@ export const deeplinkPlugin = definePlugin({
       }),
       handler: async ({ platform, bundleId }) => {
         const targetInfo = ctx.cdp.getTarget();
-        const target = await resolveTarget(platform);
-        if (!target) return 'No simulator/emulator detected.';
-
         const requestedBundleId = bundleId?.trim() ||
           (platform === 'auto' ? targetInfo?.appId?.trim() : undefined);
         if (!requestedBundleId) {
@@ -133,6 +130,11 @@ export const deeplinkPlugin = definePlugin({
             ? 'Bundle ID is required when no connected app target is available.'
             : `Bundle ID is required when selecting the ${platform} platform explicitly.`;
         }
+
+        // Keep device selection and the connected app ID tied to one target
+        // snapshot if Metro changes its active runtime during discovery.
+        const target = await resolveDevice(ctx, platform, targetInfo);
+        if (!target) return 'No simulator/emulator detected.';
 
         if (target.platform === 'ios') {
           try {

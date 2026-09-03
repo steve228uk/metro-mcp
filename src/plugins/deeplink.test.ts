@@ -11,6 +11,7 @@ type RegisteredTool = {
 
 function createHarness(options: {
   target?: MetroTarget | null;
+  targets?: Array<MetroTarget | null>;
   iosPlist?: unknown;
   appContainer?: string;
   androidDump?: string;
@@ -27,6 +28,7 @@ function createHarness(options: {
     deviceName: 'iPhone 16',
     reactNative: { logicalDeviceId: 'SIM-UDID' },
   } satisfies MetroTarget : options.target;
+  let targetCallCount = 0;
   const registerTool: PluginContext['registerTool'] = (name, config) => {
     tools.set(name, {
       parameters: config.parameters,
@@ -38,7 +40,9 @@ function createHarness(options: {
       on: () => {},
       off: () => {},
       isConnected: true,
-      getTarget: () => target,
+      getTarget: () => options.targets?.[
+        Math.min(targetCallCount++, options.targets.length - 1)
+      ] ?? target,
       send: async () => ({}),
     },
     events: { on: () => {}, off: () => {}, isConnected: () => true },
@@ -79,7 +83,7 @@ function createHarness(options: {
     getActiveDeviceName: () => null,
     notifyResourceUpdated: () => {},
   };
-  return { ctx, calls, tools, setup: async () => {
+  return { ctx, calls, tools, getTargetCallCount: () => targetCallCount, setup: async () => {
     await deeplinkPlugin.setup(ctx);
     return tools.get('list_url_schemes')!;
   } };
@@ -174,15 +178,41 @@ describe('list_url_schemes', () => {
     expect(harness.calls.some(({ command }) => command === 'xcrun')).toBe(false);
   });
 
-  test('requires an explicit app ID when selecting a platform explicitly', async () => {
+  test('requires an explicit app ID before discovering an explicit platform', async () => {
+    for (const platform of ['ios', 'android'] as const) {
+      const harness = createHarness();
+      const tool = await harness.setup();
+      expect(await call(tool, { platform }))
+        .toBe(`Bundle ID is required when selecting the ${platform} platform explicitly.`);
+      expect(harness.calls).toEqual([]);
+    }
+  });
+
+  test('uses one connected-target snapshot for auto device and app ID selection', async () => {
+    const iosTarget = {
+      id: 'ios-target', title: 'iOS app', description: 'React Native', type: 'node',
+      appId: 'com.example.ios', deviceName: 'iPhone 16',
+      reactNative: { logicalDeviceId: 'SIM-UDID' },
+    } satisfies MetroTarget;
+    const androidTarget = {
+      id: 'android-target', title: 'Android app', description: 'React Native', type: 'node',
+      appId: 'com.example.android', deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'emulator-2' },
+    } satisfies MetroTarget;
     const harness = createHarness({
+      targets: [iosTarget, androidTarget],
       androidInventory: 'List of devices attached\nemulator-2\tdevice model:Pixel_8\n',
     });
     const tool = await harness.setup();
 
-    expect(await call(tool, { platform: 'android' }))
-      .toBe('Bundle ID is required when selecting the android platform explicitly.');
-    expect(harness.calls.some(({ args }) => args.includes('dump'))).toBe(false);
+    expect(await call(tool, {})).toBe('No URL schemes found.');
+    expect(harness.getTargetCallCount()).toBe(1);
+    expect(harness.calls).toContainEqual({
+      command: 'xcrun',
+      args: ['simctl', 'get_app_container', 'SIM-UDID', 'com.example.ios', 'app'],
+    });
+    expect(harness.calls.some(({ command, args }) =>
+      command === 'adb' && args.includes('dump'))).toBe(false);
   });
 });
 
