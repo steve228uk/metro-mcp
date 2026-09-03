@@ -32,7 +32,11 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 - **`list_devices`** — List connected debuggable targets from Metro.
 - **`get_app_info`** — Bundle URL, platform, device name, VM type.
 - **`get_connection_status`** — CDP connection state and Metro status.
-- **`reload_app`** — Reload the app. Tries Metro's HTTP reload endpoint first, then falls back to `DevSettings.reload()` via CDP.
+- **`reload_app`** — Request `Page.reload` and verify that a unique runtime marker disappears
+  on the same app. Returns separate dispatch and verification status; a submitted command
+  alone does not mean the app restarted. If CDP explicitly lacks reload support, the Metro
+  message fallback is directed only to a peer whose app and device identity match. Ambiguous
+  responses never trigger a second reload. `timeout` defaults to 15000ms (maximum 60000ms).
 
 ## Environment
 
