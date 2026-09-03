@@ -9,11 +9,14 @@ type Tool = {
 };
 
 async function createAppOnlyHarness(
-  evaluation: 'success' | 'failure' | 'pre-dispatch' = 'success',
+  evaluation: 'success' | 'failure' | 'pre-dispatch' | 'unhandled' | 'fabric-focused' = 'success',
   nativeAvailable = false,
 ) {
   const tools = new Map<string, Tool>();
   let nativeCalls = 0;
+  const evaluations: string[] = [];
+  const execCommands: string[] = [];
+  const reactCalls: string[] = [];
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
@@ -31,6 +34,7 @@ async function createAppOnlyHarness(
     metro: { host: 'localhost', port: 8081, fetch: async () => new Response() },
     exec: async (command) => {
       nativeCalls++;
+      execCommands.push(command);
       if (nativeAvailable) return '';
       throw new Error('native inventory unavailable');
     },
@@ -45,6 +49,9 @@ async function createAppOnlyHarness(
           },
         }));
       }
+      if (nativeAvailable && command === 'adb') {
+        return Buffer.from('List of devices attached\nemulator-42\tdevice model:Connected_app\n');
+      }
       throw new Error('native inventory unavailable');
     },
     format: {
@@ -52,10 +59,40 @@ async function createAppOnlyHarness(
       truncate: (value: string) => value, structureOnly: (value: ComponentNode) => value,
     },
     // A true result means the app-side handler was found and invoked.
-    evalInApp: async () => {
+    evalInApp: async (expression) => {
+      evaluations.push(expression);
       if (evaluation === 'failure') throw new Error('CDP disconnected');
       if (evaluation === 'pre-dispatch') {
         throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+      }
+      if (evaluation === 'unhandled') return false;
+      if (evaluation === 'fabric-focused') {
+        const host = {
+          stateNode: { canonical: { publicInstance: { isFocused: () => true } } },
+          child: null,
+          sibling: null,
+        };
+        const textInput = {
+          type: { displayName: 'TextInput' },
+          memoizedProps: {
+            value: 'hello',
+            onSubmitEditing: () => reactCalls.push('submit'),
+            onChangeText: () => reactCalls.push('change'),
+          },
+          stateNode: null,
+          child: host,
+          sibling: null,
+        };
+        const rootFiber = { type: 'Root', child: textInput, sibling: null };
+        const previousHook = (globalThis as Record<string, unknown>).__REACT_DEVTOOLS_GLOBAL_HOOK__;
+        (globalThis as Record<string, unknown>).__REACT_DEVTOOLS_GLOBAL_HOOK__ = {
+          getFiberRoots: () => new Set([{ current: rootFiber }]),
+        };
+        try {
+          return Function(`return (${expression});`)();
+        } finally {
+          (globalThis as Record<string, unknown>).__REACT_DEVTOOLS_GLOBAL_HOOK__ = previousHook;
+        }
       }
       return true;
     },
@@ -63,7 +100,7 @@ async function createAppOnlyHarness(
     notifyResourceUpdated: () => {},
   };
   await uiInteractPlugin.setup(ctx);
-  return { tools, getNativeCalls: () => nativeCalls };
+  return { tools, getNativeCalls: () => nativeCalls, evaluations, execCommands, reactCalls };
 }
 
 describe('UI handler actions without native inventory', () => {
@@ -99,6 +136,31 @@ describe('UI handler actions without native inventory', () => {
       expect(await press.handler(press.parameters.parse({ button }) as Record<string, unknown>))
         .toBe(`Pressed ${button}`);
     }
+    expect(harness.getNativeCalls()).toBe(0);
+  });
+
+  test('uses Android key events when no focused app handler accepts the action', async () => {
+    const harness = await createAppOnlyHarness('unhandled', true);
+    for (const button of ['ENTER', 'DELETE'] as const) {
+      const press = harness.tools.get('press_button')!;
+      expect(await press.handler(press.parameters.parse({ button, platform: 'android' }) as Record<string, unknown>))
+        .toBe(`Pressed ${button}`);
+    }
+    expect(harness.evaluations).toHaveLength(2);
+    expect(harness.execCommands).toEqual([
+      'adb -s "emulator-42" shell input keyevent 66',
+      'adb -s "emulator-42" shell input keyevent 67',
+    ]);
+  });
+
+  test('invokes focused Fabric TextInput key handlers without native inventory', async () => {
+    const harness = await createAppOnlyHarness('fabric-focused');
+    const press = harness.tools.get('press_button')!;
+    for (const button of ['ENTER', 'DELETE'] as const) {
+      expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
+        .toBe(`Pressed ${button}`);
+    }
+    expect(harness.reactCalls).toEqual(['submit', 'change']);
     expect(harness.getNativeCalls()).toBe(0);
   });
 

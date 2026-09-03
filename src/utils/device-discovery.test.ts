@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  adbPrefix,
   discoverBootedSimulators,
+  isSafeDeviceId,
   parseAndroidDevices,
   parseBootedSimulators,
   resolveDevice,
@@ -20,6 +22,7 @@ function runnerFor(options: {
   iosFailure?: boolean;
   iosUnavailable?: boolean;
   androidFailure?: boolean;
+  androidUnavailable?: boolean;
 }): DeviceDiscoveryRunner & { calls: string[][] } {
   const ios = [...(options.ios ?? [iosInventory([
     { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
@@ -37,6 +40,9 @@ function runnerFor(options: {
         const output = ios.shift() ?? ios.at(-1) ?? iosInventory([]);
         return Buffer.from(output);
       }
+      if (options.androidUnavailable) {
+        throw Object.assign(new Error('spawn adb ENOENT'), { code: 'ENOENT' });
+      }
       if (options.androidFailure) throw new Error('adb unavailable');
       return Buffer.from(options.android ?? 'List of devices attached\n');
     },
@@ -44,6 +50,15 @@ function runnerFor(options: {
 }
 
 describe('device discovery', () => {
+  test('accepts a valid bracketed IPv6 ADB serial and keeps it quoted', () => {
+    const serial = '[2001:db8::1]:5555';
+    expect(parseAndroidDevices(`List of devices attached\n${serial}\tdevice model:Pixel_8\n`))
+      .toEqual([{ id: serial, status: 'device', model: 'Pixel_8' }]);
+    expect(adbPrefix(serial)).toBe('adb -s "[2001:db8::1]:5555"');
+    expect(isSafeDeviceId('[not-an-ipv6]:5555')).toBe(false);
+    expect(isSafeDeviceId('[2001:db8::1]:70000')).toBe(false);
+  });
+
   test('uses literal simctl JSON arguments and resolves a connected target by UDID', async () => {
     const runner = runnerFor({});
     const device = await resolveDevice(runner, 'ios', {
@@ -95,6 +110,29 @@ describe('device discovery', () => {
     await expect(resolveDevice(runner, 'auto', {
       reactNative: { logicalDeviceId: 'opaque-inspector-id' },
     })).resolves.toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
+  test('uses a unique iOS name when adb is unavailable for a connected target', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
+        { name: 'iPhone 17', udid: 'IOS-17', state: 'Booted' },
+      ])],
+      androidUnavailable: true,
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'iPhone 17',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'ios', id: 'IOS-17' });
+  });
+
+  test('uses the sole iOS simulator when adb is unavailable and Metro ID is opaque', async () => {
+    const runner = runnerFor({
+      androidUnavailable: true,
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'ios', id: 'IOS-16' });
   });
 
   test('does not treat a generic iOS inventory error as a missing executable', async () => {

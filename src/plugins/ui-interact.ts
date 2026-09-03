@@ -452,46 +452,17 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ button, platform }) => {
-        // ENTER and DELETE first try the connected app handler. This path only
-        // needs CDP and must work when no local native inventory is available.
-        if (button === 'ENTER') {
-          let evaluationError: unknown;
-          const submitted = await ctx.evalInApp(`
-            (function() {
-              ${FIBER_ROOT_JS}
-              var target = null;
-              var stack = [{ f: rootFiber, d: 0 }];
-              while (stack.length && !target) {
-                var item = stack.pop();
-                var fiber = item.f; var depth = item.d;
-                if (!fiber || depth > 200) continue;
-                var name = typeof fiber.type === 'string' ? fiber.type :
-                           (fiber.type && (fiber.type.displayName || fiber.type.name));
-                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onSubmitEditing) target = fiber;
-                if (!target) {
-                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
-                }
-              }
-              if (!target) return false;
-              target.memoizedProps.onSubmitEditing({ nativeEvent: { text: target.memoizedProps.value || '' } });
-              return true;
-            })()
-          `).catch((error) => {
-            evaluationError = error;
-            return false;
-          });
-          if (submitted) return 'Pressed ENTER';
-          if (evaluationError && !isPreDispatchConnectionFailure(evaluationError)) {
-            return 'Could not evaluate the connected app while pressing ENTER.';
-          }
-        }
+        const keycodes: Record<string, number> = {
+          HOME: 3, BACK: 4, VOLUME_UP: 24, VOLUME_DOWN: 25,
+          POWER: 26, ENTER: 66, DELETE: 67,
+        };
 
-        if (button === 'DELETE') {
+        if (button === 'ENTER' || button === 'DELETE') {
           let evaluationError: unknown;
-          const deleted = await ctx.evalInApp(`
+          const handled = await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
+              var handlerName = ${JSON.stringify(button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText')};
               var target = null;
               var stack = [{ f: rootFiber, d: 0 }];
               while (stack.length && !target) {
@@ -500,24 +471,50 @@ export const uiInteractPlugin = definePlugin({
                 if (!fiber || depth > 200) continue;
                 var name = typeof fiber.type === 'string' ? fiber.type :
                            (fiber.type && (fiber.type.displayName || fiber.type.name));
-                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onChangeText) target = fiber;
+                var props = fiber.memoizedProps || {};
+                var current = fiber;
+                var focused = false;
+                var inspected = 0;
+                while (name === 'TextInput' && current && inspected++ < 32) {
+                  var node = current.stateNode;
+                  var instance = node && node.canonical && node.canonical.publicInstance ||
+                                 node && node.publicInstance ||
+                                 node && node.__internalInstanceHandle &&
+                                   node.__internalInstanceHandle.stateNode &&
+                                   node.__internalInstanceHandle.stateNode.canonical &&
+                                   node.__internalInstanceHandle.stateNode.canonical.publicInstance ||
+                                 node;
+                  try {
+                    if (instance && typeof instance.isFocused === 'function' && instance.isFocused() === true) {
+                      focused = true;
+                      break;
+                    }
+                  } catch (e) {}
+                  current = current.child;
+                }
+                if (name === 'TextInput' && focused && typeof props[handlerName] === 'function') target = fiber;
                 if (!target) {
                   if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
                   if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
                 }
               }
               if (!target) return false;
-              var val = (target.memoizedProps.value || '').slice(0, -1);
-              target.memoizedProps.onChangeText(val);
+              var targetProps = target.memoizedProps || {};
+              if (handlerName === 'onSubmitEditing') {
+                targetProps.onSubmitEditing({ nativeEvent: { text: targetProps.value || '' } });
+              } else {
+                var val = (targetProps.value || '').slice(0, -1);
+                targetProps.onChangeText(val);
+              }
               return true;
             })()
           `).catch((error) => {
             evaluationError = error;
             return false;
           });
-          if (deleted) return 'Pressed DELETE';
+          if (handled) return `Pressed ${button}`;
           if (evaluationError && !isPreDispatchConnectionFailure(evaluationError)) {
-            return 'Could not evaluate the connected app while pressing DELETE.';
+            return `Could not evaluate the connected app while pressing ${button}.`;
           }
         }
 
@@ -527,10 +524,6 @@ export const uiInteractPlugin = definePlugin({
 
         // ── Android: adb keycodes ─────────────────────────────────────────────
         if (p === 'android') {
-          const keycodes: Record<string, number> = {
-            HOME: 3, BACK: 4, VOLUME_UP: 24, VOLUME_DOWN: 25,
-            POWER: 26, ENTER: 66, DELETE: 67,
-          };
           await ctx.exec(`${adbPrefix(target.id)} shell input keyevent ${keycodes[button]}`);
           return `Pressed ${button}`;
         }

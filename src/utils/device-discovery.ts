@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import type { PluginContext } from '../plugin.js';
 
 /** A booted simulator as reported by CoreSimulatorService. */
@@ -12,7 +13,11 @@ export interface BootedSimulator {
 // commands. Keep only identifier characters so inventory data cannot turn into
 // shell syntax before those commands are migrated to execFile.
 export function isSafeDeviceId(value: string): boolean {
-  return /^[A-Za-z0-9._:-]+$/.test(value);
+  if (/^[A-Za-z0-9._:-]+$/.test(value)) return true;
+  const networkSerial = value.match(/^\[([^\]]+)\]:(\d{1,5})$/);
+  if (!networkSerial || isIP(networkSerial[1]) !== 6) return false;
+  const port = Number(networkSerial[2]);
+  return port >= 1 && port <= 65_535;
 }
 
 /** Safely scope a legacy shell based adb command to one resolved serial. */
@@ -235,6 +240,20 @@ export async function resolveDevice(
       if (targetId(target) && authorized.length === 1) {
         const device = authorized[0];
         return { platform: 'android', id: device.id, name: device.model };
+      }
+    }
+    if (
+      androidResult.status === 'rejected' &&
+      iosResult.status === 'fulfilled' &&
+      isUnavailableToolError(androidResult.reason)
+    ) {
+      const nameMatches = findIosNames(iosResult.value, connectedName);
+      if (nameMatches.length === 1) return toResolvedIos(nameMatches[0]);
+      // A connected opaque inspector ID plus one booted simulator is the
+      // symmetric iOS case: the missing Android executable cannot hide a
+      // competing local Android device.
+      if (targetId(target) && iosResult.value.length === 1) {
+        return toResolvedIos(iosResult.value[0]);
       }
     }
     const failed = [
