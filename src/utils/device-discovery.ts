@@ -188,13 +188,30 @@ export async function resolveDevice(
   // simulator happens to be booted.
   const connectedId = targetId(target);
   const connectedName = target?.deviceName?.trim();
+  // Check concrete IDs across both inventories before considering names. A
+  // Metro logical ID is the only evidence that can unambiguously identify the
+  // connected runtime when another platform has a colliding device name.
+  const ios = iosResult.status === 'fulfilled'
+    ? findIosId(iosResult.value, connectedId)
+    : undefined;
+  const android = androidResult.status === 'fulfilled'
+    ? androidResult.value
+        .filter((device) => device.status === 'device')
+        .find((device) => device.id === connectedId)
+    : undefined;
+  if (ios && android) {
+    throw new Error(`Ambiguous connected device ID "${connectedId}" across iOS and Android.`);
+  }
+  if (ios) return toResolvedIos(ios);
+  if (android) return { platform: 'android', id: android.id, name: android.model };
+
   if (iosResult.status === 'fulfilled') {
-    const iosMatch = findIosTarget(iosResult.value, connectedId, connectedName);
+    const iosMatch = findIosName(iosResult.value, connectedName);
     if (iosMatch) return toResolvedIos(iosMatch);
   }
   if (androidResult.status === 'fulfilled') {
     const android = androidResult.value.filter((device) => device.status === 'device');
-    const match = findAndroidTarget(android, connectedId, connectedName);
+    const match = findAndroidTarget(android, undefined, connectedName);
     if (match) return { platform: 'android', id: match.id, name: match.model };
   }
   // A valid iOS inventory wins when both runtimes are present, matching the
@@ -227,9 +244,9 @@ function findAndroidTarget(
   const byId = connectedId ? devices.find((device) => device.id === connectedId) : undefined;
   if (byId) return byId;
   if (!connectedName) return undefined;
-  // `adb devices -l` replaces spaces in model names with underscores.
-  const modelName = connectedName.replace(/_/g, ' ');
-  const matches = devices.filter((device) => device.model?.replace(/_/g, ' ') === modelName);
+  // ADB sanitizes every non-alphanumeric UTF-8 byte in its model field.
+  const modelName = Buffer.from(connectedName, 'utf8').toString('latin1').replace(/[^a-zA-Z0-9]/g, '_');
+  const matches = devices.filter((device) => device.model === modelName);
   if (matches.length > 1) {
     throw new Error(
       `Ambiguous Android devices named "${connectedName}": ${matches.map((device) => device.id).join(', ')}.`,
@@ -244,7 +261,7 @@ function resolveIosDevice(
 ): ResolvedDevice | null {
   if (devices.length === 0) return null;
 
-  const match = findIosTarget(devices, targetId(target), target?.deviceName?.trim());
+  const match = findIosId(devices, targetId(target)) ?? findIosName(devices, target?.deviceName?.trim());
   if (match) return toResolvedIos(match);
 
   if (devices.length === 1) {
@@ -260,15 +277,19 @@ function toResolvedIos(device: BootedSimulator): ResolvedDevice {
   return { platform: 'ios', id: device.udid, name: device.name, runtime: device.runtime };
 }
 
-function findIosTarget(
+function findIosId(
   devices: BootedSimulator[],
   connectedId?: string,
-  connectedName?: string,
 ): BootedSimulator | undefined {
-  const byId = connectedId
+  return connectedId
     ? devices.find((device) => device.udid.toLowerCase() === connectedId.toLowerCase())
     : undefined;
-  if (byId) return byId;
+}
+
+function findIosName(
+  devices: BootedSimulator[],
+  connectedName?: string,
+): BootedSimulator | undefined {
   const byName = connectedName
     ? devices.filter((device) => device.name === connectedName)
     : [];
