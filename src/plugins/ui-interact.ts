@@ -97,12 +97,11 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ label, x, y, platform }) => {
-        const target = await resolveTarget(platform);
-        if (!target) return 'No simulator/emulator detected.';
-        const p = target.platform;
-
         // ── Coordinate tap ──────────────────────────────────────────────────
         if (x !== undefined && y !== undefined) {
+          const target = await resolveTarget(platform);
+          if (!target) return 'No simulator/emulator detected.';
+          const p = target.platform;
           if (p === 'android') {
             await ctx.exec(`${adbPrefix(target.id)} shell input tap ${x} ${y}`);
             return `Tapped at (${x}, ${y})`;
@@ -123,14 +122,23 @@ export const uiInteractPlugin = definePlugin({
 
         // ── Label/testID tap: CDP fiber tree (works on both platforms) ───────
         const jsLabel = JSON.stringify(label);
+        let evaluationFailed = false;
         const tapped = await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             ${FIND_AND_INVOKE_JS}
             return findAndInvoke(${jsLabel}, 'onPress');
           })()
-        `).catch(() => false);
+        `).catch(() => {
+          evaluationFailed = true;
+          return false;
+        });
         if (tapped) return `Tapped "${label}"`;
+        if (evaluationFailed) return `Could not evaluate the connected app while tapping "${label}".`;
+
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         // ── Android fallback: adb uiautomator ───────────────────────────────
         if (p === 'android') {
@@ -190,13 +198,10 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ text, testID, platform }) => {
-        const target = await resolveTarget(platform);
-        if (!target) return 'No simulator/emulator detected.';
-        const p = target.platform;
-
         // ── CDP: find TextInput and call onChangeText ─────────────────────────
         const jsText = JSON.stringify(text);
         const jsTestID = testID ? JSON.stringify(testID) : 'null';
+        let evaluationFailed = false;
         const typed = await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
@@ -229,8 +234,16 @@ export const uiInteractPlugin = definePlugin({
             }
             return false;
           })()
-        `).catch(() => false);
+        `).catch(() => {
+          evaluationFailed = true;
+          return false;
+        });
         if (typed) return `Typed "${text}"`;
+        if (evaluationFailed) return 'Could not evaluate the connected app while typing text.';
+
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         // ── Android fallback: adb input text ─────────────────────────────────
         if (p === 'android') {
@@ -269,25 +282,29 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ label, x, y, duration, platform }) => {
-        const target = await resolveTarget(platform);
-        if (!target) return 'No simulator/emulator detected.';
-        const p = target.platform;
-
         // ── CDP: find element by label/testID and call onLongPress ────────────
         if (label) {
           const jsLabel = JSON.stringify(label);
+          let evaluationFailed = false;
           const pressed = await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
               return findAndInvoke(${jsLabel}, 'onLongPress');
             })()
-          `).catch(() => false);
+          `).catch(() => {
+            evaluationFailed = true;
+            return false;
+          });
           if (pressed) return `Long pressed "${label}"`;
+          if (evaluationFailed) return `Could not evaluate the connected app while long pressing "${label}".`;
         }
 
         // ── Coordinate fallbacks ──────────────────────────────────────────────
         if (x !== undefined && y !== undefined) {
+          const target = await resolveTarget(platform);
+          if (!target) return 'No simulator/emulator detected.';
+          const p = target.platform;
           if (p === 'android') {
             await ctx.exec(`${adbPrefix(target.id)} shell input swipe ${x} ${y} ${x} ${y} ${duration}`);
             return `Long pressed at (${x}, ${y}) for ${duration}ms`;
@@ -314,14 +331,11 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ direction, platform }) => {
-        const target = await resolveTarget(platform);
-        if (!target) return 'No simulator/emulator detected.';
-        const p = target.platform;
-
         let result: string | null = null;
 
         // ── CDP: find ScrollView and invoke scrollTo on its native node ────────
         const jsDir = JSON.stringify(direction);
+        let evaluationFailed = false;
         const scrolled = await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
@@ -364,10 +378,17 @@ export const uiInteractPlugin = definePlugin({
             } catch(e) {}
             return false;
           })()
-        `).catch(() => false);
+        `).catch(() => {
+          evaluationFailed = true;
+          return false;
+        });
         if (scrolled) result = `Swiped ${direction}`;
+        if (evaluationFailed) return 'Could not evaluate the connected app while swiping.';
 
         if (!result) {
+          const target = await resolveTarget(platform);
+          if (!target) return 'No simulator/emulator detected.';
+          const p = target.platform;
           // ── Native fallbacks (fixed midpoint coordinates) ───────────────────
           const [sx, sy, ex, ey] = SWIPE_COORDS[direction];
 
@@ -408,6 +429,71 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ button, platform }) => {
+        // ENTER and DELETE first try the connected app handler. This path only
+        // needs CDP and must work when no local native inventory is available.
+        if (button === 'ENTER') {
+          let evaluationFailed = false;
+          const submitted = await ctx.evalInApp(`
+            (function() {
+              ${FIBER_ROOT_JS}
+              var target = null;
+              var stack = [{ f: rootFiber, d: 0 }];
+              while (stack.length && !target) {
+                var item = stack.pop();
+                var fiber = item.f; var depth = item.d;
+                if (!fiber || depth > 200) continue;
+                var name = typeof fiber.type === 'string' ? fiber.type :
+                           (fiber.type && (fiber.type.displayName || fiber.type.name));
+                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onSubmitEditing) target = fiber;
+                if (!target) {
+                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
+                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
+                }
+              }
+              if (!target) return false;
+              target.memoizedProps.onSubmitEditing({ nativeEvent: { text: target.memoizedProps.value || '' } });
+              return true;
+            })()
+          `).catch(() => {
+            evaluationFailed = true;
+            return false;
+          });
+          if (submitted) return 'Pressed ENTER';
+          if (evaluationFailed) return 'Could not evaluate the connected app while pressing ENTER.';
+        }
+
+        if (button === 'DELETE') {
+          let evaluationFailed = false;
+          const deleted = await ctx.evalInApp(`
+            (function() {
+              ${FIBER_ROOT_JS}
+              var target = null;
+              var stack = [{ f: rootFiber, d: 0 }];
+              while (stack.length && !target) {
+                var item = stack.pop();
+                var fiber = item.f; var depth = item.d;
+                if (!fiber || depth > 200) continue;
+                var name = typeof fiber.type === 'string' ? fiber.type :
+                           (fiber.type && (fiber.type.displayName || fiber.type.name));
+                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onChangeText) target = fiber;
+                if (!target) {
+                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
+                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
+                }
+              }
+              if (!target) return false;
+              var val = (target.memoizedProps.value || '').slice(0, -1);
+              target.memoizedProps.onChangeText(val);
+              return true;
+            })()
+          `).catch(() => {
+            evaluationFailed = true;
+            return false;
+          });
+          if (deleted) return 'Pressed DELETE';
+          if (evaluationFailed) return 'Could not evaluate the connected app while pressing DELETE.';
+        }
+
         const target = await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const p = target.platform;
@@ -430,64 +516,6 @@ export const uiInteractPlugin = definePlugin({
             );
             return 'Pressed HOME';
           } catch {}
-        }
-
-        // ── iOS ENTER/DELETE: CDP on focused TextInput ─────────────────────────
-        if (p === 'ios' && button === 'ENTER') {
-          const submitted = await ctx.evalInApp(`
-            (function() {
-              ${FIBER_ROOT_JS}
-              var target = null;
-              var stack = [{ f: rootFiber, d: 0 }];
-              while (stack.length && !target) {
-                var item = stack.pop();
-                var fiber = item.f; var depth = item.d;
-                if (!fiber || depth > 200) continue;
-                var name = typeof fiber.type === 'string' ? fiber.type :
-                           (fiber.type && (fiber.type.displayName || fiber.type.name));
-                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onSubmitEditing) {
-                  target = fiber;
-                }
-                if (!target) {
-                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
-                }
-              }
-              if (!target) return false;
-              target.memoizedProps.onSubmitEditing({ nativeEvent: { text: target.memoizedProps.value || '' } });
-              return true;
-            })()
-          `).catch(() => false);
-          if (submitted) return 'Pressed ENTER';
-        }
-
-        if (p === 'ios' && button === 'DELETE') {
-          const deleted = await ctx.evalInApp(`
-            (function() {
-              ${FIBER_ROOT_JS}
-              var target = null;
-              var stack = [{ f: rootFiber, d: 0 }];
-              while (stack.length && !target) {
-                var item = stack.pop();
-                var fiber = item.f; var depth = item.d;
-                if (!fiber || depth > 200) continue;
-                var name = typeof fiber.type === 'string' ? fiber.type :
-                           (fiber.type && (fiber.type.displayName || fiber.type.name));
-                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onChangeText) {
-                  target = fiber;
-                }
-                if (!target) {
-                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
-                }
-              }
-              if (!target) return false;
-              var val = (target.memoizedProps.value || '').slice(0, -1);
-              target.memoizedProps.onChangeText(val);
-              return true;
-            })()
-          `).catch(() => false);
-          if (deleted) return 'Pressed DELETE';
         }
 
         // ── iOS fallback: IDB ─────────────────────────────────────────────────
