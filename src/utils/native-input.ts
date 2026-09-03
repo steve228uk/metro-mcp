@@ -778,6 +778,10 @@ export class NativeInputController {
       }
       if ((operation === 'tap' || operation === 'long_press' || operation === 'swipe') && input?.touch !== true) return result('simview', 'unsupported', false, 'SimView does not support touch input');
       if (operation === 'press_button' && (!Array.isArray(input?.buttons) || !input.buttons.includes(args.button))) return result('simview', 'unsupported', false, `SimView does not support button ${String(args.button)}`);
+      // SimView 0.4.0 exposes press_key without a per-device key list. Newer
+      // versions advertise one, so honor it when present while retaining
+      // compatibility with that public release.
+      if (operation === 'press_key' && Array.isArray(input?.keys) && !input.keys.includes(args.key)) return result('simview', 'unsupported', false, `SimView does not support key ${String(args.key)}`);
       const normalized = this.normalizeArgs(operation, args, session.width, session.height);
       try {
         const response = await session.client.callTool({ name: tool, arguments: normalized });

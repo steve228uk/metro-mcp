@@ -195,7 +195,7 @@ describe('native input providers', () => {
       listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'press_key'].map((name) => ({ name })) }),
       callTool: async ({ name, arguments: args }: { name: string; arguments: Record<string, unknown> }) => {
         calls.push({ name, arguments: args });
-        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:key-device', capabilities: { input: { touch: true } } } } };
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:key-device', capabilities: { input: { touch: true, keys: ['return', 'delete'] } } } } };
         if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
         return { structuredContent: { accepted: true } };
       },
@@ -242,7 +242,36 @@ describe('native input providers', () => {
     expect(runner.calls).toContainEqual({ command: 'idb', args: ['ui', 'key', '40', '--udid', 'key-device'] });
   });
 
-  test('does not fall through after an accepted or ambiguous SimView key receipt', async () => {
+  test('falls through to IDB when SimView excludes a key before dispatch', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args) => {
+      if (command === 'idb' && args.at(-1) === '--help' && args.at(-2) === 'ui') return Buffer.from('{key}');
+      return baseExecFile(command, args);
+    };
+    const calls: string[] = [];
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'press_key'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push(name);
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:key-device', capabilities: { input: { touch: true, keys: [] } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        return { structuredContent: { accepted: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+    await expect(controller.button({ platform: 'ios', id: 'key-device' }, 'DELETE')).resolves.toMatchObject({ backend: 'idb', status: 'handled', dispatched: true });
+    expect(calls).not.toContain('press_key');
+    expect(runner.calls).toContainEqual({ command: 'idb', args: ['ui', 'key', '42', '--udid', 'key-device'] });
+  });
+
+  test('does not fall through after an accepted SimView key receipt', async () => {
     const runner = fakeRunner();
     const client = {
       connect: async () => {},
