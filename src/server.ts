@@ -243,6 +243,7 @@ export async function createMetroRuntime(
   const MAX_BURST_ATTEMPTS = 15; // fast retries; after this, switch to slow background probe
   let reconnectAttempts = 0;
   let isReconnecting = false;
+  let runtimeGeneration = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectStabilityTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -309,6 +310,7 @@ export async function createMetroRuntime(
 
   // Enable required CDP domains on every connection (initial and reconnect).
   cdpSession.on('reconnected', async () => {
+    runtimeGeneration++;
     isReconnecting = false;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -327,6 +329,7 @@ export async function createMetroRuntime(
 
   // Drive all reconnection through connectToMetro() so we always get a fresh target URL.
   cdpSession.on('disconnected', () => {
+    runtimeGeneration++;
     clearReconnectStabilityTimer();
     cleanProxyLock();
     scheduleReconnect();
@@ -338,6 +341,7 @@ export async function createMetroRuntime(
   // Metro fires 'bundle_build_done' once the new bundle is ready to run.
   eventsClient.on('bundle_build_done', async () => {
     if (!cdpSession.isConnected) return;
+    runtimeGeneration++;
     logger.info('Metro bundle rebuilt — re-enabling CDP domains');
     await enableCDPDomains();
   });
@@ -392,6 +396,7 @@ export async function createMetroRuntime(
       },
       waitForReconnect,
       isReconnecting: () => isReconnecting,
+      getGeneration: () => runtimeGeneration,
       reconnect: async () => {
         reconnectAttempts = 0;
         await connectToMetro();

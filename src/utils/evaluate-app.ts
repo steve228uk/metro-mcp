@@ -15,6 +15,8 @@ export interface AppEvaluationLifecycle {
   reconnect(): Promise<void>;
   /** Whether a reconnect attempt is already running. */
   isReconnecting(): boolean;
+  /** Monotonic runtime generation; changes invalidate remote handles. */
+  getGeneration?: () => number;
 }
 
 function isTransportError(error: unknown): boolean {
@@ -29,6 +31,23 @@ function isTransportError(error: unknown): boolean {
 
 function timeoutError(timeout: number): Error {
   return new Error(`App evaluation timed out after ${timeout}ms`);
+}
+
+function decodeUnserializableValue(value: unknown): unknown {
+  if (value === 'NaN') return Number.NaN;
+  if (value === 'Infinity') return Number.POSITIVE_INFINITY;
+  if (value === '-Infinity') return Number.NEGATIVE_INFINITY;
+  if (value === '-0') return -0;
+  if (typeof value === 'string' && /^-?(?:0|[1-9]\d*)n$/.test(value)) {
+    return BigInt(value.slice(0, -1));
+  }
+  throw new Error('Unsupported CDP unserializable value');
+}
+
+function remoteObjectValue(remote: Record<string, unknown>): unknown {
+  return Object.prototype.hasOwnProperty.call(remote, 'unserializableValue')
+    ? decodeUnserializableValue(remote.unserializableValue)
+    : remote.value;
 }
 
 async function sendRuntimeEvaluate(
@@ -70,7 +89,7 @@ export async function evaluateAppScript(
     awaitPromise: false,
     ...(options?.timeout === undefined ? {} : { timeout: options.timeout }),
   }, options?.timeout);
-  return (result.result as Record<string, unknown>).value;
+  return remoteObjectValue((result.result ?? {}) as Record<string, unknown>);
 }
 
 /**
@@ -91,13 +110,14 @@ export async function evaluateAppScriptCompletion(
     ...(options?.objectGroup ? { objectGroup: options.objectGroup } : {}),
   }, options?.timeout);
   const remote = (result.result ?? {}) as Record<string, unknown>;
+  const value = remoteObjectValue(remote);
   if (typeof remote.objectId === 'string') {
     return {
       objectId: remote.objectId,
-      ...(remote.value === undefined ? {} : { value: remote.value }),
+      ...(value === undefined ? {} : { value }),
     };
   }
-  return { value: remote.value };
+  return { value };
 }
 
 const SETTLE_REMOTE_FUNCTION = `function(key) {
@@ -105,7 +125,16 @@ const SETTLE_REMOTE_FUNCTION = `function(key) {
   if (!state) return false;
   function fulfill(value) {
     if (globalThis[key] !== state) return;
-    state.value = value;
+    state.unserializableValue = undefined;
+    if (typeof value === 'number') {
+      if (value !== value) state.unserializableValue = 'NaN';
+      else if (value === Infinity) state.unserializableValue = 'Infinity';
+      else if (value === -Infinity) state.unserializableValue = '-Infinity';
+      else if (value === 0 && 1 / value === -Infinity) state.unserializableValue = '-0';
+    } else if (typeof value === 'bigint') {
+      state.unserializableValue = String(value) + 'n';
+    }
+    state.value = state.unserializableValue === undefined ? value : undefined;
     state.status = 'fulfilled';
   }
   function reject(error) {
@@ -146,9 +175,21 @@ export function createAppEvaluator(
 
   const evaluateScript = async (
     expression: string,
-    options?: { timeout?: number; deadline?: number; objectGroup?: string },
+    options?: {
+      timeout?: number;
+      deadline?: number;
+      objectGroup?: string;
+      generation?: number;
+    },
   ): Promise<AppEvaluationCompletion> => {
     await lifecycle.ensureConnected();
+    if (
+      options?.generation !== undefined &&
+      lifecycle.getGeneration &&
+      options.generation !== lifecycle.getGeneration()
+    ) {
+      throw new Error('App evaluation context changed before source dispatch');
+    }
     if (options?.deadline !== undefined && Date.now() >= options.deadline) {
       throw timeoutError(options.timeout ?? 10_000);
     }
@@ -156,6 +197,30 @@ export function createAppEvaluator(
       ? options?.timeout
       : Math.min(options.timeout ?? 10_000, Math.max(1, options.deadline - Date.now()));
     return evaluateAppScriptCompletion(cdp, expression, { timeout, objectGroup: options?.objectGroup });
+  };
+
+  const setupMailbox = async (
+    expression: string,
+    options: { timeout?: number; deadline: number },
+  ): Promise<number | undefined> => {
+    await lifecycle.ensureConnected();
+    if (Date.now() >= options.deadline) {
+      throw timeoutError(options.timeout ?? 10_000);
+    }
+    const generation = lifecycle.getGeneration?.();
+    const timeout = Math.min(
+      options.timeout ?? 10_000,
+      Math.max(1, options.deadline - Date.now()),
+    );
+    await evaluateAppScript(cdp, expression, { timeout });
+    if (
+      generation !== undefined &&
+      lifecycle.getGeneration &&
+      generation !== lifecycle.getGeneration()
+    ) {
+      throw new Error('App evaluation context changed during mailbox setup');
+    }
+    return generation;
   };
 
   const settleRemote = async (
@@ -193,10 +258,11 @@ export function createAppEvaluator(
       return await attachRemoteSettlement();
     } catch (error) {
       if (!isTransportError(error)) throw error;
-      // Attaching the same settlement callback twice is safe: it only writes
-      // the private mailbox and never re-runs the caller's source. Bound the
-      // reconnect itself by the same deadline as the attach and re-check it
-      // before dispatching the retry, since reconnect may finish late.
+      // The request may have run the user's thenable before its response was
+      // lost. Remote handles are invalid after reconnect, so replaying this
+      // callFunctionOn could invoke a side-effecting thenable twice. Recover
+      // transport and continue mailbox polling; a pre-dispatch loss remains
+      // pending and is allowed to time out.
       await awaitPromiseBeforeDeadline(
         recoverTransport(),
         options.deadline,
@@ -205,7 +271,7 @@ export function createAppEvaluator(
       if (Date.now() >= options.deadline) {
         throw timeoutError(options.timeout ?? 10_000);
       }
-      return attachRemoteSettlement();
+      return false;
     }
   };
 
@@ -254,6 +320,8 @@ export function createAppEvaluator(
           evaluateScript,
           settleRemote,
           releaseObjectGroup,
+          getRuntimeGeneration: lifecycle.getGeneration,
+          setupMailbox,
         },
       );
     }
