@@ -302,6 +302,9 @@ export async function createMetroRuntime(
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectStabilityTimer: ReturnType<typeof setTimeout> | null = null;
 
+  const waitForCurrentReconnect = (deadline?: number): Promise<void> =>
+    waitForReconnect(() => isReconnecting, deadline);
+
   function clearReconnectStabilityTimer(): void {
     if (reconnectStabilityTimer) {
       clearTimeout(reconnectStabilityTimer);
@@ -419,7 +422,7 @@ export async function createMetroRuntime(
           if (isReconnecting) {
             // A reconnect is already in flight — wait for it rather than
             // starting another one.
-            await waitForReconnect(() => isReconnecting, deadline);
+            await waitForCurrentReconnect(deadline);
           } else {
             // Reset the attempt counter so the background scheduler can resume
             // after this tool-triggered reconnect, rather than staying capped.
@@ -434,8 +437,7 @@ export async function createMetroRuntime(
           );
         }
       },
-      waitForReconnect: (deadline?: number) =>
-        waitForReconnect(() => isReconnecting, deadline),
+      waitForReconnect: waitForCurrentReconnect,
       isReconnecting: () => isReconnecting,
       getGeneration: () => runtimeGeneration,
       reconnect: async () => {
@@ -790,7 +792,7 @@ export async function createMetroRuntime(
   // Idempotent: concurrent callers wait for the in-flight attempt to finish.
   async function connectToMetro(): Promise<boolean> {
     if (isReconnecting) {
-      await waitForReconnect(() => isReconnecting);
+      await waitForCurrentReconnect();
       return cdpSession.isConnected;
     }
     isReconnecting = true;
