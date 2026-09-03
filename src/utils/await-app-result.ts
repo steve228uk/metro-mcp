@@ -230,7 +230,9 @@ export async function awaitAppResult(
     // return an object handle that never reaches settleRemote. Release the
     // whole group best effort so late completions cannot accumulate handles.
     if (!sourceCompletedByValue && !remoteHandleReleased) {
-      await releaseGroup();
+      // Cleanup has its own transport and host deadline. Keep it detached so
+      // a result found within the caller's deadline is never delayed past it.
+      void releaseGroup();
       if (sourceEvaluation && !sourceEvaluationSettled) {
         // A transport timeout can race the engine's eventual response. Keep
         // this continuation bounded and release the same unique group after
