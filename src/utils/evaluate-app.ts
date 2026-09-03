@@ -11,9 +11,9 @@ import {
 
 export interface AppEvaluationLifecycle {
   /** Ensure a request can be sent before it is dispatched. */
-  ensureConnected(): Promise<void>;
+  ensureConnected(deadline?: number): Promise<void>;
   /** Wait for an already running reconnect attempt. */
-  waitForReconnect(): Promise<void>;
+  waitForReconnect(deadline?: number): Promise<void>;
   /** Start a reconnect attempt when a safe mailbox read loses transport. */
   reconnect(): Promise<void>;
   /** Whether a reconnect attempt is already running. */
@@ -165,7 +165,7 @@ export function createAppEvaluator(
     expression: string,
     options?: EvalOptions,
   ): Promise<unknown> => {
-    await lifecycle.ensureConnected();
+    await lifecycle.ensureConnected(options?.deadline);
     const timeout = boundedRequestTimeout(options);
     return evaluateAppScript(cdp, expression, { ...options, timeout });
   };
@@ -179,7 +179,7 @@ export function createAppEvaluator(
       generation?: number;
     },
   ): Promise<AppEvaluationCompletion> => {
-    await lifecycle.ensureConnected();
+    await lifecycle.ensureConnected(options?.deadline);
     if (
       options?.generation !== undefined &&
       lifecycle.getGeneration &&
@@ -195,7 +195,7 @@ export function createAppEvaluator(
     expression: string,
     options: { timeout?: number; deadline: number },
   ): Promise<number | undefined> => {
-    await lifecycle.ensureConnected();
+    await lifecycle.ensureConnected(options.deadline);
     const generation = lifecycle.getGeneration?.();
     const timeout = boundedRequestTimeout(options);
     await evaluateAppScript(cdp, expression, { timeout });
@@ -250,7 +250,7 @@ export function createAppEvaluator(
       // transport and continue mailbox polling; a pre-dispatch loss remains
       // pending and is allowed to time out.
       await awaitPromiseBeforeDeadline(
-        recoverTransport(),
+        recoverTransport(options.deadline),
         options.deadline,
         options.timeout ?? 10_000,
       );
@@ -272,9 +272,9 @@ export function createAppEvaluator(
     );
   };
 
-  async function recoverTransport(): Promise<void> {
+  async function recoverTransport(deadline?: number): Promise<void> {
     if (lifecycle.isReconnecting()) {
-      await lifecycle.waitForReconnect();
+      await lifecycle.waitForReconnect(deadline);
     } else {
       await lifecycle.reconnect();
     }
@@ -288,7 +288,7 @@ export function createAppEvaluator(
       return await rawEvaluate(expression, options);
     } catch (error) {
       if (!isTransportError(error)) throw error;
-      await recoverTransport();
+      await recoverTransport(options?.deadline);
       // This expression is a mailbox read. The original caller source is
       // never passed here after Runtime.evaluate has been dispatched.
       return rawEvaluate(expression, options);
