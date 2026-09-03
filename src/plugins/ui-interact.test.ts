@@ -222,6 +222,20 @@ describe('UI handler actions without native inventory', () => {
     }
   });
 
+  test('uses IDB HID keys for uncontrolled Paper and Fabric inputs on iOS', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await pressTextInputKeys(
+        { renderer, defaultValue: 'hello' },
+        { nativeAvailable: true, platform: 'ios' },
+      );
+      expect(harness.reactCalls).toEqual([]);
+      expect(harness.execCommands.filter((command) => command.startsWith('idb ui key'))).toEqual([
+        'idb ui key 40 --udid "SIMULATOR123"',
+        'idb ui key 42 --udid "SIMULATOR123"',
+      ]);
+    }
+  });
+
   test('does not replay a possibly dispatched action after a CDP rejection', async () => {
     const harness = await createAppOnlyHarness('failure');
     const tool = harness.tools.get('tap_element')!;
