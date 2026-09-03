@@ -227,9 +227,9 @@ function findAndroidTarget(
   const byId = connectedId ? devices.find((device) => device.id === connectedId) : undefined;
   if (byId) return byId;
   if (!connectedName) return undefined;
-  // `adb devices -l` replaces spaces in model names with underscores.
-  const modelName = connectedName.replace(/_/g, ' ');
-  const matches = devices.filter((device) => device.model?.replace(/_/g, ' ') === modelName);
+  // ADB sanitizes every non-alphanumeric UTF-8 byte in its model field.
+  const modelName = Buffer.from(connectedName, 'utf8').toString('latin1').replace(/[^a-zA-Z0-9]/g, '_');
+  const matches = devices.filter((device) => device.model === modelName);
   if (matches.length > 1) {
     throw new Error(
       `Ambiguous Android devices named "${connectedName}": ${matches.map((device) => device.id).join(', ')}.`,
