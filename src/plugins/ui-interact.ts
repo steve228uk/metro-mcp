@@ -12,7 +12,11 @@ import {
   SWIPE_COORDS,
   buildFiberReadExpression,
 } from '../utils/fiber.js';
-import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
+import {
+  adbPrefix,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
 
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let idbAvailableCache: boolean | null = null;
@@ -36,7 +40,7 @@ export const uiInteractPlugin = definePlugin({
 
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
-      resolveDevice(ctx, platform, ctx.cdp.getTarget());
+      resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
 
     async function isIDBAvailable(): Promise<boolean> {
       if (idbAvailableCache !== null) return idbAvailableCache;

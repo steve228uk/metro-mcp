@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   adbPrefix,
   discoverBootedSimulators,
+  getConnectedDeviceTarget,
   isSafeDeviceId,
   parseAndroidDevices,
   parseBootedSimulators,
@@ -50,6 +51,20 @@ function runnerFor(options: {
 }
 
 describe('device discovery', () => {
+  test('ignores stale target metadata after CDP disconnects', () => {
+    const target = {
+      deviceName: 'Old simulator',
+      reactNative: { logicalDeviceId: 'OLD-UDID' },
+    };
+    const cdp = {
+      getTarget: () => target,
+      isConnected: false,
+    };
+
+    expect(getConnectedDeviceTarget({ cdp })).toBeUndefined();
+    expect(getConnectedDeviceTarget({ cdp: { ...cdp, isConnected: true } })).toBe(target);
+  });
+
   test('accepts a valid bracketed IPv6 ADB serial and keeps it quoted', () => {
     const serial = '[2001:db8::1]:5555';
     expect(parseAndroidDevices(`List of devices attached\n${serial}\tdevice model:Pixel_8\n`))

@@ -51,6 +51,7 @@ async function createSimulatorHarness(
     execFileCalls?: Array<{ command: string; args: string[] }>;
     androidOutput?: string;
     targetId?: string;
+    connected?: boolean;
   } = {},
 ) {
   const tools = new Map<string, RegisteredTool>();
@@ -75,7 +76,7 @@ async function createSimulatorHarness(
     cdp: {
       on: () => {},
       off: () => {},
-      isConnected: false,
+      isConnected: options.connected ?? false,
       getTarget: () => target,
       send: async () => ({}),
     },
@@ -152,6 +153,19 @@ async function capture(
 }
 
 describe('take_screenshot', () => {
+  test('resolves a replacement sole simulator when the Metro target is stale', async () => {
+    const tool = await createSimulatorHarness({
+      targetId: 'stale-target-id',
+      androidOutput: 'List of devices attached\n',
+    });
+
+    const result = await capture(tool, { platform: 'auto' });
+
+    expect(result).toMatchObject({
+      structuredContent: { platform: 'ios' },
+    });
+  });
+
   test('uses direct executable arguments instead of shell path quoting', async () => {
     const execFileCalls: Array<{ command: string; args: string[] }> = [];
     const tool = await createSimulatorHarness({ execFileCalls });
@@ -178,6 +192,7 @@ describe('take_screenshot', () => {
     const tool = await createSimulatorHarness({
       execFileCalls,
       targetId: 'emulator-2',
+      connected: true,
       androidOutput: 'List of devices attached\nemulator-1\tdevice model:Pixel_8\nemulator-2\tdevice model:Pixel_9\n',
     });
     await capture(tool, { platform: 'android' });
