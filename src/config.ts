@@ -25,6 +25,9 @@ const DEFAULT_CONFIG: Required<MetroMCPConfig> = {
     enabled: true,
     port: 0,
   },
+  input: {
+    nativeBackend: 'auto',
+  },
 };
 
 function valueAfter(args: string[], flag: string): string | undefined {
@@ -205,5 +208,13 @@ function mergeConfig(
     if (source.proxy.enabled !== undefined)
       target.proxy.enabled = source.proxy.enabled;
     if (source.proxy.port !== undefined) target.proxy.port = source.proxy.port;
+  }
+  if (source.input) {
+    if (source.input.nativeBackend !== undefined)
+      target.input.nativeBackend = source.input.nativeBackend;
+    if (source.input.simviewCommand !== undefined)
+      target.input.simviewCommand = source.input.simviewCommand;
+    if (source.input.idbCommand !== undefined)
+      target.input.idbCommand = source.input.idbCommand;
   }
 }

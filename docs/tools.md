@@ -127,14 +127,14 @@ Inspect and manage app permissions on iOS Simulator and Android Emulator without
 
 ## UI Interact
 
-All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB as a last resort. IDB is optional — tools will prompt you to install it when needed.
+UI actions try the connected app's React handlers first. Coordinate actions then use the installed SimView MCP provider on iOS, followed by supported IDB commands; Android actions use the selected ADB serial. Native results include the backend and whether dispatch was submitted, refused, or uncertain. Providers are optional and are detected with read-only probes.
 
 - **`list_elements`** — Get interactive elements from the React component tree (labels, testIDs, roles) with traversal completeness metadata. No IDB needed.
-- **`tap_element`** — Tap by label/testID (CDP fiber tree) or coordinates (simctl/adb → IDB fallback).
-- **`type_text`** — Type into a TextInput by testID/label or the first visible input (CDP → adb → IDB).
-- **`long_press`** — Long press by label/testID (CDP) or coordinates (adb → IDB).
-- **`swipe`** — Scroll/swipe in a direction (CDP ScrollView → adb → IDB).
-- **`press_button`** — Press HOME (simctl), BACK/ENTER/DELETE (CDP + adb), VOLUME/POWER (adb → IDB).
+- **`tap_element`** — Tap by label/testID through the React fiber tree, or send logical device-point coordinates directly through SimView/IDB on iOS or the selected ADB serial on Android.
+- **`type_text`** — Type into a TextInput by testID/label or the first visible input (bounded Fiber handler → SimView → IDB on iOS, or the selected ADB serial on Android). Native results include the provider and dispatch status.
+- **`long_press`** — Long press through a React handler by label/testID, or send logical device-point coordinates through the native provider.
+- **`swipe`** — Scroll through a React handler, or derive a directional native swipe from the current device geometry.
+- **`press_button`** — Invoke React text-input handlers for ENTER/DELETE before using a supported native button capability.
 
 ## Navigation
 

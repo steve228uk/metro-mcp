@@ -9,35 +9,30 @@ import {
   GET_ROUTE_FUNC_JS,
   MAX_FIBER_DEPTH,
   MAX_FIBER_NODES,
-  SWIPE_COORDS,
   buildFiberReadExpression,
 } from '../utils/fiber.js';
 import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
-
-// Module-level caches — persist across tool handler calls for the lifetime of the server.
-let idbAvailableCache: boolean | null = null;
+import { NativeInputController, type NativeDispatchResult, type NativeInputConfig } from '../utils/native-input.js';
 
 export const uiInteractPlugin = definePlugin({
   name: 'ui-interact',
 
-  description: 'UI automation via fiber tree, simctl, adb, and IDB',
+  description: 'UI automation via React handlers, SimView, IDB, and adb',
 
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
       resolveDevice(ctx, platform, ctx.cdp.getTarget());
-
-    async function isIDBAvailable(): Promise<boolean> {
-      if (idbAvailableCache !== null) return idbAvailableCache;
-      try {
-        await ctx.exec('which idb 2>/dev/null');
-        idbAvailableCache = true;
-      } catch {
-        idbAvailableCache = false;
-      }
-      return idbAvailableCache;
-    }
-
-    const IDB_INSTALL = 'Install IDB with: brew install idb-companion';
+    const nativeInput = new NativeInputController({
+      projectRoot: typeof ctx.config.projectRoot === 'string' ? ctx.config.projectRoot : undefined,
+      config: (ctx.config.input ?? {}) as NativeInputConfig,
+      runner: { execFile: ctx.execFile, exec: ctx.exec },
+      registerCleanup: ctx.registerCleanup,
+      logger: ctx.logger,
+    });
+    const nativeResult = (action: string, dispatch: NativeDispatchResult): string => {
+      const outcome = dispatch.status === 'handled' ? action : `${action} failed`;
+      return `${outcome} [backend=${dispatch.backend}, dispatch=${dispatch.dispatch}, dispatched=${dispatch.dispatched}, status=${dispatch.status}]${dispatch.message ? `: ${dispatch.message}` : ''}`;
+    };
 
     ctx.registerTool('list_elements', {
       description:
@@ -88,7 +83,7 @@ export const uiInteractPlugin = definePlugin({
 
     ctx.registerTool('tap_element', {
       description:
-        'Tap an element by label, testID, or coordinates. Uses CDP fiber tree, then simctl/adb, then IDB.',
+        'Tap by label, testID, or logical device-point coordinates. Uses React handlers, then installed SimView or IDB on iOS and adb on Android. Coordinates use native input directly; native results identify the backend and dispatch state.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         label: z.string().optional().describe('Accessibility label, aria-label, or testID to tap'),
@@ -101,47 +96,28 @@ export const uiInteractPlugin = definePlugin({
         if (x !== undefined && y !== undefined) {
           const target = await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
-          const p = target.platform;
-          if (p === 'android') {
-            await ctx.exec(`${adbPrefix(target.id)} shell input tap ${x} ${y}`);
-            return `Tapped at (${x}, ${y})`;
-          }
-          // iOS: simctl first (Xcode 14+), then IDB
-          try {
-            await ctx.exec(`xcrun simctl io "${target.id}" tap ${x} ${y}`);
-            return `Tapped at (${x}, ${y})`;
-          } catch {}
-          if (!(await isIDBAvailable())) {
-            return `Coordinate tap failed. ${IDB_INSTALL}`;
-          }
-          await ctx.exec(`idb ui tap ${x} ${y} --udid "${target.id}"`);
-          return `Tapped at (${x}, ${y})`;
+          const dispatch = await nativeInput.tap(target, x, y);
+          return nativeResult(`Tapped at (${x}, ${y})`, dispatch);
         }
 
         if (!label) return 'Provide a label/testID or x,y coordinates.';
 
         // ── Label/testID tap: CDP fiber tree (works on both platforms) ───────
         const jsLabel = JSON.stringify(label);
-        let evaluationFailed = false;
         const tapped = await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             ${FIND_AND_INVOKE_JS}
             return findAndInvoke(${jsLabel}, 'onPress');
           })()
-        `).catch(() => {
-          evaluationFailed = true;
-          return false;
-        });
+        `);
         if (tapped) return `Tapped "${label}"`;
-        if (evaluationFailed) return `Could not evaluate the connected app while tapping "${label}".`;
 
         const target = await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
-        const p = target.platform;
 
         // ── Android fallback: adb uiautomator ───────────────────────────────
-        if (p === 'android') {
+        if (target.platform === 'android') {
           const tmpFile = '/tmp/metro-mcp-uidump.xml';
           let content = '';
           try {
@@ -168,26 +144,14 @@ export const uiInteractPlugin = definePlugin({
           return `Element "${label}" not found.`;
         }
 
-        // ── iOS fallback: IDB --by-label ─────────────────────────────────────
-        if (!(await isIDBAvailable())) {
-          return `Element "${label}" not found via fiber tree. ${IDB_INSTALL}`;
-        }
-        try {
-          await ctx.exec(`idb ui tap --by-label "${label}" --udid "${target.id}"`);
-          return `Tapped "${label}"`;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : '';
-          if (msg.includes('117')) {
-            return `IDB exit 117: companion not running. Try: idb_companion --udid ${target.id} &`;
-          }
-          return `Element "${label}" not found.`;
-        }
+        const dispatch = await nativeInput.tapLabel(target, label);
+        return nativeResult(`Tapped "${label}"`, dispatch);
       },
     });
 
     ctx.registerTool('type_text', {
       description:
-        'Type text into an input field. Targets a specific input by testID/label, or the first visible TextInput. Uses CDP fiber tree, then adb/IDB.',
+        'Type text into an input field. Targets a specific input by testID/label, or the first visible TextInput. Uses the React handler first, then SimView or IDB on iOS and the selected ADB serial on Android.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         text: z.string().describe('Text to type'),
@@ -201,78 +165,38 @@ export const uiInteractPlugin = definePlugin({
         // ── CDP: find TextInput and call onChangeText ─────────────────────────
         const jsText = JSON.stringify(text);
         const jsTestID = testID ? JSON.stringify(testID) : 'null';
-        let evaluationFailed = false;
-        const typed = await ctx.evalInApp(`
-          (function() {
-            ${FIBER_ROOT_JS}
-            var targetID = ${jsTestID};
-            var target = null;
-            var stack = [{ f: rootFiber, d: 0 }];
-            while (stack.length && !target) {
-              var item = stack.pop();
-              var fiber = item.f; var depth = item.d;
-              if (!fiber || depth > 200) continue;
-              var name = typeof fiber.type === 'string' ? fiber.type :
-                         (fiber.type && (fiber.type.displayName || fiber.type.name));
-              if (name === 'TextInput') {
-                var props = fiber.memoizedProps || {};
-                if (!targetID || props.testID === targetID || props.accessibilityLabel === targetID) {
-                  target = fiber;
-                }
-              }
-              if (!target) {
-                if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
-              }
-            }
-            if (!target) return false;
-            var props = target.memoizedProps || {};
-            if (props.onChangeText) { props.onChangeText(${jsText}); return true; }
-            if (props.onChange) {
-              props.onChange({ nativeEvent: { text: ${jsText}, target: 0, eventCount: 1 } });
-              return true;
-            }
-            return false;
-          })()
-        `).catch(() => {
-          evaluationFailed = true;
+        const typed = await ctx.evalInApp(buildFiberReadExpression(`
+          ${FIBER_ROOT_JS}
+          var targetID = ${jsTestID};
+          var target = null;
+          metroWalkFibers(FIBER_OPTIONS, function(fiber) {
+            if (target) return { prune: true };
+            if (metroFiberName(fiber) !== 'TextInput') return;
+            var props = fiber.memoizedProps || {};
+            if (!targetID || props.testID === targetID || props.accessibilityLabel === targetID) target = fiber;
+            return target ? { prune: true } : undefined;
+          });
+          if (!target) return false;
+          var props = target.memoizedProps || {};
+          if (props.onChangeText) { props.onChangeText(${jsText}); return true; }
+          if (props.onChange) {
+            props.onChange({ nativeEvent: { text: ${jsText}, target: 0, eventCount: 1 } });
+            return true;
+          }
           return false;
-        });
+        `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES }));
         if (typed) return `Typed "${text}"`;
-        if (evaluationFailed) return 'Could not evaluate the connected app while typing text.';
 
         const target = await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
-        const p = target.platform;
-
-        // ── Android fallback: adb input text ─────────────────────────────────
-        if (p === 'android') {
-          // adb shell input text uses %s for spaces; other shell metacharacters need escaping.
-          const escaped = text
-            .replace(/\\/g, '\\\\')
-            .replace(/ /g, '%s')
-            .replace(/"/g, '\\"')
-            .replace(/&/g, '\\&')
-            .replace(/\|/g, '\\|')
-            .replace(/;/g, '\\;')
-            .replace(/\$/g, '\\$')
-            .replace(/`/g, '\\`');
-          await ctx.exec(`${adbPrefix(target.id)} shell input text "${escaped}"`);
-          return `Typed "${text}"`;
-        }
-
-        // ── iOS fallback: IDB ─────────────────────────────────────────────────
-        if (!(await isIDBAvailable())) {
-          return `Could not find a TextInput via fiber tree. ${IDB_INSTALL}`;
-        }
-        await ctx.exec(`idb ui text "${text}" --udid "${target.id}"`);
-        return `Typed "${text}"`;
+        const dispatch = await nativeInput.typeText(target, text);
+        return nativeResult(`Typed "${text}"`, dispatch);
       },
     });
 
     ctx.registerTool('long_press', {
       description:
-        'Long press an element by label/testID, or at coordinates. Uses CDP fiber tree, then adb/IDB.',
+        'Long press using a React handler by label/testID, or native input at logical device-point coordinates. Native results identify the backend and dispatch state.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         label: z.string().optional().describe('Accessibility label or testID of the element to long press'),
@@ -283,37 +207,24 @@ export const uiInteractPlugin = definePlugin({
       }),
       handler: async ({ label, x, y, duration, platform }) => {
         // ── CDP: find element by label/testID and call onLongPress ────────────
-        if (label) {
+        if (label && x === undefined && y === undefined) {
           const jsLabel = JSON.stringify(label);
-          let evaluationFailed = false;
           const pressed = await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
               return findAndInvoke(${jsLabel}, 'onLongPress');
             })()
-          `).catch(() => {
-            evaluationFailed = true;
-            return false;
-          });
+          `);
           if (pressed) return `Long pressed "${label}"`;
-          if (evaluationFailed) return `Could not evaluate the connected app while long pressing "${label}".`;
         }
 
         // ── Coordinate fallbacks ──────────────────────────────────────────────
         if (x !== undefined && y !== undefined) {
           const target = await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
-          const p = target.platform;
-          if (p === 'android') {
-            await ctx.exec(`${adbPrefix(target.id)} shell input swipe ${x} ${y} ${x} ${y} ${duration}`);
-            return `Long pressed at (${x}, ${y}) for ${duration}ms`;
-          }
-          if (!(await isIDBAvailable())) {
-            return `Coordinate long press requires IDB on iOS. ${IDB_INSTALL}`;
-          }
-          await ctx.exec(`idb ui long-press ${x} ${y} --duration ${duration / 1000} --udid "${target.id}"`);
-          return `Long pressed at (${x}, ${y}) for ${duration}ms`;
+          const dispatch = await nativeInput.longPress(target, x, y, duration);
+          return nativeResult(`Long pressed at (${x}, ${y}) for ${duration}ms`, dispatch);
         }
 
         return label
@@ -324,7 +235,7 @@ export const uiInteractPlugin = definePlugin({
 
     ctx.registerTool('swipe', {
       description:
-        'Swipe or scroll in a direction. Tries CDP ScrollView scrollTo, then adb/IDB.',
+        'Scroll through React, then use installed SimView or IDB on iOS and the selected ADB serial on Android. Native results identify the backend and dispatch state.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         direction: z.enum(['up', 'down', 'left', 'right']).describe('Swipe direction'),
@@ -335,7 +246,6 @@ export const uiInteractPlugin = definePlugin({
 
         // ── CDP: find ScrollView and invoke scrollTo on its native node ────────
         const jsDir = JSON.stringify(direction);
-        let evaluationFailed = false;
         const scrolled = await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
@@ -362,45 +272,30 @@ export const uiInteractPlugin = definePlugin({
             if (!hf || !hf.stateNode) return false;
             var node = hf.stateNode;
             var delta = 400;
-            try {
-              if (typeof node.scrollTo === 'function') {
-                node.scrollTo({
-                  x: dir === 'left' ? delta : dir === 'right' ? -delta : 0,
-                  y: dir === 'up' ? delta : dir === 'down' ? -delta : 0,
-                  animated: true,
-                });
-                return true;
-              }
-              if (typeof node.scrollToOffset === 'function') {
-                node.scrollToOffset({ offset: dir === 'up' ? delta : 0, animated: true });
-                return true;
-              }
-            } catch(e) {}
+            if (typeof node.scrollTo === 'function') {
+              node.scrollTo({
+                x: dir === 'left' ? delta : dir === 'right' ? -delta : 0,
+                y: dir === 'up' ? delta : dir === 'down' ? -delta : 0,
+                animated: true,
+              });
+              return true;
+            }
+            if (typeof node.scrollToOffset === 'function') {
+              node.scrollToOffset({ offset: dir === 'up' ? delta : 0, animated: true });
+              return true;
+            }
             return false;
           })()
-        `).catch(() => {
-          evaluationFailed = true;
-          return false;
-        });
+        `);
         if (scrolled) result = `Swiped ${direction}`;
-        if (evaluationFailed) return 'Could not evaluate the connected app while swiping.';
 
         if (!result) {
           const target = await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
-          const p = target.platform;
-          // ── Native fallbacks (fixed midpoint coordinates) ───────────────────
-          const [sx, sy, ex, ey] = SWIPE_COORDS[direction];
-
-          if (p === 'android') {
-            await ctx.exec(`${adbPrefix(target.id)} shell input swipe ${sx} ${sy} ${ex} ${ey} 300`);
-            result = `Swiped ${direction}`;
-          } else if (!(await isIDBAvailable())) {
-            return `Swipe requires IDB on iOS. ${IDB_INSTALL}`;
-          } else {
-            await ctx.exec(`idb ui swipe ${sx} ${sy} ${ex} ${ey} --udid "${target.id}"`);
-            result = `Swiped ${direction}`;
-          }
+          // ── Native fallback using current device geometry ───────────────────
+          const dispatch = await nativeInput.swipeDirection(target, direction, 300);
+          result = nativeResult(`Swiped ${direction}`, dispatch);
+          if (dispatch.status !== 'handled') return result;
         }
 
         // ── Log to test recorder if a recording is active ─────────────────────
@@ -429,104 +324,33 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ button, platform }) => {
-        // ENTER and DELETE first try the connected app handler. This path only
-        // needs CDP and must work when no local native inventory is available.
-        if (button === 'ENTER') {
-          let evaluationFailed = false;
-          const submitted = await ctx.evalInApp(`
-            (function() {
-              ${FIBER_ROOT_JS}
-              var target = null;
-              var stack = [{ f: rootFiber, d: 0 }];
-              while (stack.length && !target) {
-                var item = stack.pop();
-                var fiber = item.f; var depth = item.d;
-                if (!fiber || depth > 200) continue;
-                var name = typeof fiber.type === 'string' ? fiber.type :
-                           (fiber.type && (fiber.type.displayName || fiber.type.name));
-                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onSubmitEditing) target = fiber;
-                if (!target) {
-                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
-                }
+        // ── ENTER/DELETE: bounded CDP handler on every platform ───────────────
+        if (button === 'ENTER' || button === 'DELETE') {
+          const handler = button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText';
+          const handled = await ctx.evalInApp(buildFiberReadExpression(`
+            var handled = false;
+            metroWalkFibers(FIBER_OPTIONS, function(fiber) {
+              if (handled || metroFiberName(fiber) !== 'TextInput') return;
+              var props = fiber.memoizedProps || {};
+              if (typeof props[${JSON.stringify(handler)}] !== 'function') return;
+              if (${JSON.stringify(button)} === 'ENTER') {
+                props.onSubmitEditing({ nativeEvent: { text: props.value || '' } });
+              } else {
+                props.onChangeText(String(props.value || '').slice(0, -1));
               }
-              if (!target) return false;
-              target.memoizedProps.onSubmitEditing({ nativeEvent: { text: target.memoizedProps.value || '' } });
-              return true;
-            })()
-          `).catch(() => {
-            evaluationFailed = true;
-            return false;
-          });
-          if (submitted) return 'Pressed ENTER';
-          if (evaluationFailed) return 'Could not evaluate the connected app while pressing ENTER.';
-        }
-
-        if (button === 'DELETE') {
-          let evaluationFailed = false;
-          const deleted = await ctx.evalInApp(`
-            (function() {
-              ${FIBER_ROOT_JS}
-              var target = null;
-              var stack = [{ f: rootFiber, d: 0 }];
-              while (stack.length && !target) {
-                var item = stack.pop();
-                var fiber = item.f; var depth = item.d;
-                if (!fiber || depth > 200) continue;
-                var name = typeof fiber.type === 'string' ? fiber.type :
-                           (fiber.type && (fiber.type.displayName || fiber.type.name));
-                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onChangeText) target = fiber;
-                if (!target) {
-                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
-                }
-              }
-              if (!target) return false;
-              var val = (target.memoizedProps.value || '').slice(0, -1);
-              target.memoizedProps.onChangeText(val);
-              return true;
-            })()
-          `).catch(() => {
-            evaluationFailed = true;
-            return false;
-          });
-          if (deleted) return 'Pressed DELETE';
-          if (evaluationFailed) return 'Could not evaluate the connected app while pressing DELETE.';
+              handled = true;
+              return { prune: true };
+            });
+            return handled;
+          `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES }));
+          if (handled) return `Pressed ${button}`;
         }
 
         const target = await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
-        const p = target.platform;
 
-        // ── Android: adb keycodes ─────────────────────────────────────────────
-        if (p === 'android') {
-          const keycodes: Record<string, number> = {
-            HOME: 3, BACK: 4, VOLUME_UP: 24, VOLUME_DOWN: 25,
-            POWER: 26, ENTER: 66, DELETE: 67,
-          };
-          await ctx.exec(`${adbPrefix(target.id)} shell input keyevent ${keycodes[button]}`);
-          return `Pressed ${button}`;
-        }
-
-        // ── iOS HOME: simctl (no IDB needed) ──────────────────────────────────
-        if (button === 'HOME') {
-          try {
-            await ctx.exec(
-              `xcrun simctl spawn "${target.id}" launchctl kickstart -k system/com.apple.SpringBoard 2>/dev/null`
-            );
-            return 'Pressed HOME';
-          } catch {}
-        }
-
-        // ── iOS fallback: IDB ─────────────────────────────────────────────────
-        if (!(await isIDBAvailable())) {
-          return `Button ${button} requires IDB on iOS. ${IDB_INSTALL}`;
-        }
-        const idbMap: Record<string, string> = {
-          HOME: 'HOME', VOLUME_UP: 'VOLUME_UP', VOLUME_DOWN: 'VOLUME_DOWN', POWER: 'LOCK', BACK: 'HOME',
-        };
-        await ctx.exec(`idb ui button ${idbMap[button] || button} --udid "${target.id}"`);
-        return `Pressed ${button}`;
+        const dispatch = await nativeInput.button(target, button);
+        return nativeResult(`Pressed ${button}`, dispatch);
       },
     });
   },

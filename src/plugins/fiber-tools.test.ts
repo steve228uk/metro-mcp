@@ -77,6 +77,7 @@ function runtimeFor(
 async function createHarness(
   runtime: Record<string, unknown>,
   plugins: PluginDefinition[],
+  commands: Partial<Pick<PluginContext, 'exec' | 'execFile'>> = {},
 ) {
   // Runtime.evaluate executes against a persistent global object. A VM
   // context exercises that behavior, including indirect eval used by the
@@ -97,7 +98,12 @@ async function createHarness(
   // Also works when the screenshot plugin's execFile context API is present.
   const commandStubs = {
     exec: async () => '',
-    execFile: async () => Buffer.alloc(0),
+    execFile: async (command: string, args: string[]) => {
+      if (command === 'xcrun' && args.join(' ') === 'simctl list devices booted --json') {
+        return Buffer.from(JSON.stringify({ devices: { 'com.apple.CoreSimulator.SimRuntime.iOS-26-0': [{ name: 'Test iPhone', udid: 'TEST-UDID', state: 'Booted' }] } }));
+      }
+      return Buffer.alloc(0);
+    },
   };
   const ctx: PluginContext = {
     cdp: {
@@ -116,6 +122,7 @@ async function createHarness(
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
     metro: { host: 'localhost', port: 8081, fetch: async () => new Response() },
     ...commandStubs,
+    ...commands,
     format: {
       summarize: () => '',
       compact: (value: unknown) => JSON.stringify(value),
@@ -392,6 +399,80 @@ describe('fiber read tools', () => {
       complete: true,
       depthReached: 210,
     });
+  });
+
+  test('types into an immediate deep TextInput handler beyond depth 200', async () => {
+    const root = fiber('Root');
+    let current = root;
+    let received = '';
+    for (let depth = 1; depth <= 255; depth++) {
+      const child = fiber(depth === 255 ? 'TextInput' : `Wrapper${depth}`, depth === 255 ? { onChangeText: (value: string) => { received = value; } } : {});
+      append(current, child);
+      current = child;
+    }
+    const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
+    expect(await call('type_text', { text: 'immediate', platform: 'ios' })).toBe('Typed "immediate"');
+    expect(received).toBe('immediate');
+  });
+
+  test('presses ENTER through a deep TextInput handler before native input', async () => {
+    const root = fiber('Root');
+    let current = root;
+    let submitted = false;
+    for (let depth = 1; depth <= 255; depth++) {
+      const child = fiber(
+        depth === 255 ? 'TextInput' : `Wrapper${depth}`,
+        depth === 255
+          ? { value: 'ready', onSubmitEditing: () => { submitted = true; } }
+          : {},
+      );
+      append(current, child);
+      current = child;
+    }
+    const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
+    expect(await call('press_button', { button: 'ENTER', platform: 'ios' })).toBe('Pressed ENTER');
+    expect(submitted).toBe(true);
+  });
+
+  test('does not replay a scroll whose React method throws after invocation', async () => {
+    const host = fiber('RCTScrollView', {}, true);
+    host.stateNode = { scrollTo: () => { throw new Error('scroll dispatch uncertain'); } };
+    const root = append(fiber('ScrollView'), host);
+    const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
+    await expect(call('swipe', { direction: 'up', platform: 'ios' }))
+      .rejects.toThrow('scroll dispatch uncertain');
+  });
+
+  test('does not record a native swipe when no provider can dispatch it', async () => {
+    const events: unknown[] = [];
+    const call = await createHarness({
+      ...runtimeFor([fiber('Root')]),
+      __METRO_MCP_REC_ACTIVE__: true,
+      __METRO_MCP_REC_EVENTS__: events,
+    }, [uiInteractPlugin], {
+      execFile: async (command) => {
+        if (command === 'xcrun') return Buffer.from(JSON.stringify({
+          devices: { 'com.apple.CoreSimulator.SimRuntime.iOS-26-0': [
+            { name: 'Test iPhone', udid: 'TEST-UDID', state: 'Booted' },
+          ] },
+        }));
+        throw new Error('Native provider unavailable');
+      },
+    });
+    expect(await call('swipe', { direction: 'up', platform: 'ios' })).toContain('failed');
+    expect(events).toEqual([]);
+  });
+
+  test('does not fall through to native input when a React handler rejects', async () => {
+    const root = fiber('Root');
+    let current = root;
+    for (let depth = 1; depth <= 255; depth++) {
+      const child = fiber(depth === 255 ? 'TextInput' : `Wrapper${depth}`, depth === 255 ? { onChangeText: () => { throw new Error('handler failed'); } } : {});
+      append(current, child);
+      current = child;
+    }
+    const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
+    await expect(call('type_text', { text: 'reject', platform: 'ios' })).rejects.toThrow('handler failed');
   });
 });
 

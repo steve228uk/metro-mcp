@@ -201,6 +201,7 @@ export async function createMetroRuntime(
   const sessions = new Set<McpSession>();
   const modernStdioServers = new Set<McpServer>();
   const runtimeRegistrations: RuntimeRegistration[] = [];
+  const runtimeCleanups = new Set<() => void | Promise<void>>();
   const resourceSubscriptions = new ResourceSubscriptionManager();
   let isInitializingPlugins = false;
   let runtimeClosed = false;
@@ -567,6 +568,15 @@ export async function createMetroRuntime(
         } catch (err) {
           pluginLogger.error(`Failed to register prompt ${name}:`, err);
         }
+      },
+      registerCleanup: (callback) => {
+        let called = false;
+        const once = () => {
+          if (called) return;
+          called = true;
+          return callback();
+        };
+        runtimeCleanups.add(once);
       },
       evalInApp,
       config: cfg as unknown as Record<string, unknown>,
@@ -1021,6 +1031,15 @@ export async function createMetroRuntime(
         sessionsToClose.map((session) => session.server.close().catch(() => {})),
       );
       await stdioToClose?.close().catch(() => {});
+      const cleanups = [...runtimeCleanups];
+      runtimeCleanups.clear();
+      await Promise.all(cleanups.map(async (cleanup) => {
+        try {
+          await cleanup();
+        } catch (err) {
+          logger.warn('Plugin cleanup failed:', err);
+        }
+      }));
       eventsClient.disconnect();
       cleanProxyLock();
       await cdpMultiplexer?.stop().catch(() => {});

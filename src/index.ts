@@ -9,6 +9,7 @@ import {
   removeDaemonRecordForProcess,
   startStdioProxy,
   writeDaemonRecord,
+  type DaemonIdentityOverrides,
 } from './daemon.js';
 import { createLogger } from './utils/logger.js';
 
@@ -99,15 +100,17 @@ Examples:
 
   try {
     const config = await loadConfig(serverArgs);
+    const daemonIdentityOverrides: DaemonIdentityOverrides = {
+      projectRoot: config.projectRoot,
+      input: config.input,
+    };
     logger.info(
       `Starting metro-mcp (Metro: ${config.metro.host}:${config.metro.port})`,
     );
 
     if (subcommand === 'serve') {
       const mcpPort = resolveMcpPort(serverArgs);
-      const identity = createDaemonIdentity(serverArgs, {
-        projectRoot: config.projectRoot,
-      });
+      const identity = createDaemonIdentity(serverArgs, daemonIdentityOverrides);
       const key = getDaemonKeyFromEnv(serverArgs, identity);
       const managed = isManagedDaemonProcess();
       const cleanupDaemonRecord = () =>
@@ -145,7 +148,7 @@ Examples:
       return;
     }
 
-    await startStdioProxy(serverArgs);
+    await startStdioProxy(serverArgs, daemonIdentityOverrides);
   } catch (err) {
     logger.error('Fatal error:', err);
     process.exit(1);

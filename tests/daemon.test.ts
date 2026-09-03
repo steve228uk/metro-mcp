@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { Client } from '@modelcontextprotocol/client';
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import {
   cleanupStaleDaemonRecords,
   createDaemonIdentity,
@@ -141,6 +143,109 @@ describe('daemon identity', () => {
 
     expect(getDaemonKey(installed.args, installed)).not.toBe(getDaemonKey(local.args, local));
     expect(getDaemonKey(installed.args, installed)).not.toBe(getDaemonKey(node.args, node));
+  });
+
+  test('starts and reuses a daemon with the loaded input identity', async () => {
+    const configFile = path.join(tempDir, 'metro-mcp.shared.config.ts');
+    fs.writeFileSync(
+      configFile,
+      "export default { metro: { host: '127.0.0.1', port: 65535, autoDiscover: false }, proxy: { enabled: false }, input: { nativeBackend: 'simview', simviewCommand: '/tmp/uninstalled-simview' } };\n",
+    );
+    const args = ['--project-root', tempDir, '--config', configFile];
+    const entrypoint = path.resolve(import.meta.dir, '../src/index.ts');
+    const config = await loadConfig(args);
+    const identity = createDaemonIdentity(args, {
+      projectRoot: config.projectRoot,
+      input: config.input,
+      entrypoint,
+      runtime: fs.realpathSync(process.execPath),
+    });
+    const key = getDaemonKey(args, identity);
+    const environment = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] =>
+        entry[1] !== undefined,
+      ),
+    );
+    for (const variable of [
+      'METRO_HOST',
+      'METRO_PORT',
+      'METRO_MCP_CONFIG',
+      'METRO_MCP_PLUGINS',
+      'METRO_MCP_PROJECT_ROOT',
+      'METRO_MCP_PROXY_PORT',
+      'METRO_MCP_PROXY_ENABLED',
+      'METRO_MCP_DAEMON_KEY',
+      'METRO_MCP_MULTIPLEX',
+    ]) delete environment[variable];
+    environment.METRO_MCP_DAEMON_CONFIG_DIR = tempDir;
+
+    const clients: Client[] = [];
+    const transports: StdioClientTransport[] = [];
+    let daemonPid: number | undefined;
+    try {
+      for (const name of ['first', 'second']) {
+        const transport = new StdioClientTransport({
+          command: process.execPath,
+          args: [entrypoint, ...args],
+          cwd: tempDir,
+          env: environment,
+          stderr: 'pipe',
+        });
+        const client = new Client({ name: `daemon-${name}`, version: '1.0.0' });
+        transports.push(transport);
+        clients.push(client);
+        await client.connect(transport);
+        const tools = await client.listTools();
+        expect(tools.tools.some((tool) => tool.name === 'list_devices')).toBe(true);
+
+        const record = JSON.parse(
+          fs.readFileSync(getDaemonRecordPath(key), 'utf8'),
+        ) as DaemonRecord;
+        expect(record.key).toBe(key);
+        expect(record.identity).toEqual(identity);
+        if (daemonPid === undefined) daemonPid = record.pid;
+        expect(record.pid).toBe(daemonPid);
+        expect(transport.pid).not.toBe(daemonPid);
+      }
+    } finally {
+      for (const client of clients) await client.close().catch(() => {});
+      for (const transport of transports) await transport.close().catch(() => {});
+      if (daemonPid === undefined) {
+        try {
+          const record = JSON.parse(
+            fs.readFileSync(getDaemonRecordPath(key), 'utf8'),
+          ) as DaemonRecord;
+          if (record.cwd === tempDir && Number.isInteger(record.pid)) {
+            daemonPid = record.pid;
+          }
+        } catch {
+          // The proxy may have failed before its owned daemon wrote a record.
+        }
+      }
+      if (daemonPid !== undefined) {
+        try {
+          process.kill(daemonPid, 'SIGTERM');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+        }
+        const deadline = Date.now() + 2_000;
+        while (Date.now() < deadline) {
+          try {
+            process.kill(daemonPid, 0);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ESRCH') break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        try {
+          process.kill(daemonPid, 0);
+          process.kill(daemonPid, 'SIGKILL');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+        }
+        removeDaemonRecordForProcess(key, daemonPid);
+      }
+    }
   });
 });
 

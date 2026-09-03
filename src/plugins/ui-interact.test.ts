@@ -83,8 +83,8 @@ describe('UI handler actions without native inventory', () => {
   test('does not replay a possibly dispatched action after a CDP rejection', async () => {
     const harness = await createAppOnlyHarness('failure');
     const tool = harness.tools.get('tap_element')!;
-    const result = await tool.handler(tool.parameters.parse({ label: 'Save' }) as Record<string, unknown>);
-    expect(result).toContain('Could not evaluate');
+    await expect(tool.handler(tool.parameters.parse({ label: 'Save' }) as Record<string, unknown>))
+      .rejects.toThrow('CDP disconnected');
     expect(harness.getNativeCalls()).toBe(0);
   });
 });

@@ -191,6 +191,8 @@ export interface PluginContext {
   ): void;
   registerResource(uri: string, config: ResourceConfig): void;
   registerPrompt(name: string, config: PromptConfig): void;
+  /** Register asynchronous resource cleanup for runtime shutdown. */
+  registerCleanup?: (callback: () => void | Promise<void>) => void;
   config: Record<string, unknown>;
   logger: Logger;
   metro: {
@@ -278,6 +280,14 @@ export interface MetroMCPConfig {
     enabled?: boolean;
     /** Port for the proxy server. Use 0 for OS-assigned. Defaults to 0. */
     port?: number;
+  };
+  input?: {
+    /** Native input provider order. Defaults to React handler, SimView, IDB. */
+    nativeBackend?: 'auto' | 'simview' | 'idb';
+    /** Optional executable path for the packaged SimView MCP server. */
+    simviewCommand?: string;
+    /** Optional executable path for IDB. */
+    idbCommand?: string;
   };
 }
 
