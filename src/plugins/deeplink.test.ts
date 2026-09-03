@@ -173,6 +173,17 @@ describe('list_url_schemes', () => {
     });
     expect(harness.calls.some(({ command }) => command === 'xcrun')).toBe(false);
   });
+
+  test('requires an explicit app ID when selecting a platform explicitly', async () => {
+    const harness = createHarness({
+      androidInventory: 'List of devices attached\nemulator-2\tdevice model:Pixel_8\n',
+    });
+    const tool = await harness.setup();
+
+    expect(await call(tool, { platform: 'android' }))
+      .toBe('Bundle ID is required when selecting the android platform explicitly.');
+    expect(harness.calls.some(({ args }) => args.includes('dump'))).toBe(false);
+  });
 });
 
 test('extractAndroidSchemeDump preserves matching lines and their context', () => {

@@ -113,8 +113,10 @@ Browse and read files inside the app's private sandbox. Useful for inspecting SQ
   `CFBundleURLTypes` from the selected installed app's `Info.plist` using its
   concrete simulator UDID. Provide `bundleId` to inspect a specific app, or
   omit it to use the connected Metro target's app ID. Android uses the
-  package manager dump on the selected device serial for compatibility. Use
-  `platform` to select iOS or Android when both are available.
+  package manager dump on the selected device serial for compatibility.
+  `platform` accepts `ios`, `android`, or the default `auto`; selecting an
+  explicit platform requires `bundleId` so an app ID from a connected target
+  on another platform is never reused.
 
 ## Permissions
 

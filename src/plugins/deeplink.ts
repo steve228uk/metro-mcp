@@ -126,9 +126,12 @@ export const deeplinkPlugin = definePlugin({
         const target = await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
 
-        const requestedBundleId = bundleId?.trim() || targetInfo?.appId?.trim();
+        const requestedBundleId = bundleId?.trim() ||
+          (platform === 'auto' ? targetInfo?.appId?.trim() : undefined);
         if (!requestedBundleId) {
-          return 'Bundle ID is required when no connected app target is available.';
+          return platform === 'auto'
+            ? 'Bundle ID is required when no connected app target is available.'
+            : `Bundle ID is required when selecting the ${platform} platform explicitly.`;
         }
 
         if (target.platform === 'ios') {
