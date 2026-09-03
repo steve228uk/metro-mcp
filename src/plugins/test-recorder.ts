@@ -691,13 +691,37 @@ export const testRecorderPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'both']).default('ios'),
         bundleId: z.string().optional().describe('iOS bundle ID or Android app package'),
         appPath: z.string().optional().describe('Path to .app / .apk (leave empty to use a running simulator)'),
-        udid: z.string().optional().describe('Optional device UDID / serial'),
-        deviceName: z.string().optional().describe('Optional Appium device name'),
-        platformVersion: z.string().optional().describe('Optional OS version'),
+        udid: z.string().optional().describe('Optional device UDID / serial for a single-platform config'),
+        deviceName: z.string().optional().describe('Optional Appium device name for a single-platform config'),
+        platformVersion: z.string().optional().describe('Optional OS version for a single-platform config'),
+        iosUdid: z.string().optional().describe('Optional iOS simulator UDID when platform is both'),
+        androidUdid: z.string().optional().describe('Optional Android device serial when platform is both'),
+        iosDeviceName: z.string().optional().describe('Optional iOS Appium device name when platform is both'),
+        androidDeviceName: z.string().optional().describe('Optional Android Appium device name when platform is both'),
+        iosPlatformVersion: z.string().optional().describe('Optional iOS version when platform is both'),
+        androidPlatformVersion: z.string().optional().describe('Optional Android version when platform is both'),
         noReset: z.boolean().default(true).describe('Preserve installed app data; false allows Appium to reset the app'),
         outputPath: z.string().default('./wdio.conf.ts').describe('Shown in the output, not written to disk'),
       }),
-      handler: async ({ platform, bundleId, appPath, udid, deviceName, platformVersion, noReset, outputPath }) => {
+      handler: async ({
+        platform,
+        bundleId,
+        appPath,
+        udid,
+        deviceName,
+        platformVersion,
+        iosUdid,
+        androidUdid,
+        iosDeviceName,
+        androidDeviceName,
+        iosPlatformVersion,
+        androidPlatformVersion,
+        noReset,
+        outputPath,
+      }) => {
+        if (platform === 'both' && (udid || deviceName || platformVersion)) {
+          return 'For platform "both", use iosUdid/androidUdid, iosDeviceName/androidDeviceName, and iosPlatformVersion/androidPlatformVersion so each Appium capability targets the correct device.';
+        }
         const connectedAppId = ctx.cdp.getTarget()?.appId;
         const resolvedBundleId = bundleId ?? connectedAppId;
         if (!appPath && !resolvedBundleId) {
@@ -708,7 +732,14 @@ export const testRecorderPlugin = definePlugin({
         const buildCaps = (p: 'ios' | 'android'): string[] => {
           const cap: string[] = [];
           cap.push(`      {`);
-          pushCaps(cap, p, { bundleId: resolvedBundleId, appPath, udid, deviceName, platformVersion, noReset }, '        ');
+          pushCaps(cap, p, {
+            bundleId: resolvedBundleId,
+            appPath,
+            udid: p === 'ios' ? (iosUdid ?? udid) : (androidUdid ?? udid),
+            deviceName: p === 'ios' ? (iosDeviceName ?? deviceName) : (androidDeviceName ?? deviceName),
+            platformVersion: p === 'ios' ? (iosPlatformVersion ?? platformVersion) : (androidPlatformVersion ?? platformVersion),
+            noReset,
+          }, '        ');
           cap.push(`        'appium:newCommandTimeout': 240,`);
           cap.push(`      },`);
           return cap;

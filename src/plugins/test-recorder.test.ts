@@ -561,10 +561,10 @@ describe('test recorder readiness', () => {
     }
   });
 
-  test('generates configurable iOS and Android capabilities without fixed simulator values', async () => {
+  test('generates configurable single-platform capabilities without fixed simulator values', async () => {
     const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
     const generated = String(await call('generate_wdio_config', {
-      platform: 'both',
+      platform: 'ios',
       bundleId: "com.example.special'app",
       appPath: '/tmp/My App.app',
       udid: 'device-123',
@@ -573,7 +573,7 @@ describe('test recorder readiness', () => {
       noReset: false,
       outputPath: './e2e/wdio.conf.ts',
     }));
-    expect(generated.match(/"appium:noReset": false/g)).toHaveLength(2);
+    expect(generated.match(/"appium:noReset": false/g)).toHaveLength(1);
     expect(generated).toContain('"appium:udid": "device-123"');
     expect(generated).toContain('"appium:deviceName": "QA phone"');
     expect(generated).toContain('"appium:platformVersion": "26.5"');
@@ -584,6 +584,41 @@ describe('test recorder readiness', () => {
     expect(generated).toContain('config: WebdriverIO.Config');
     expect(generated).not.toContain('autoCompileOpts');
     expect(generated).not.toContain('appium: { command');
+    expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('requires per-platform device overrides for both-platform configs', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
+    await expect(call('generate_wdio_config', {
+      platform: 'both',
+      bundleId: 'com.example.app',
+      udid: 'shared-device',
+    })).resolves.toContain('use iosUdid/androidUdid');
+
+    const generated = String(await call('generate_wdio_config', {
+      platform: 'both',
+      bundleId: 'com.example.app',
+      iosUdid: 'ios-device',
+      androidUdid: 'android-device',
+      iosDeviceName: 'iPhone QA',
+      androidDeviceName: 'Pixel QA',
+      iosPlatformVersion: '18.0',
+      androidPlatformVersion: '35',
+    }));
+    const iosStart = generated.indexOf('"platformName": "iOS"');
+    const androidStart = generated.indexOf('"platformName": "Android"');
+    expect(iosStart).toBeGreaterThanOrEqual(0);
+    expect(androidStart).toBeGreaterThan(iosStart);
+    const iosCaps = generated.slice(iosStart, androidStart);
+    const androidCaps = generated.slice(androidStart);
+    expect(iosCaps).toContain('"appium:udid": "ios-device"');
+    expect(iosCaps).toContain('"appium:deviceName": "iPhone QA"');
+    expect(iosCaps).toContain('"appium:platformVersion": "18.0"');
+    expect(androidCaps).toContain('"appium:udid": "android-device"');
+    expect(androidCaps).toContain('"appium:deviceName": "Pixel QA"');
+    expect(androidCaps).toContain('"appium:platformVersion": "35"');
+    expect(iosCaps).not.toContain('android-device');
+    expect(androidCaps).not.toContain('ios-device');
     expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
   });
 
