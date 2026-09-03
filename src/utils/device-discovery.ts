@@ -237,6 +237,20 @@ export async function resolveDevice(
         return { platform: 'android', id: device.id, name: device.model };
       }
     }
+    if (
+      androidResult.status === 'rejected' &&
+      iosResult.status === 'fulfilled' &&
+      isUnavailableToolError(androidResult.reason)
+    ) {
+      const nameMatches = findIosNames(iosResult.value, connectedName);
+      if (nameMatches.length === 1) return toResolvedIos(nameMatches[0]);
+      // A connected opaque inspector ID plus one booted simulator is the
+      // symmetric iOS case: the missing Android executable cannot hide a
+      // competing local Android device.
+      if (targetId(target) && iosResult.value.length === 1) {
+        return toResolvedIos(iosResult.value[0]);
+      }
+    }
     const failed = [
       iosResult.status === 'rejected' ? 'iOS simulator' : null,
       androidResult.status === 'rejected' ? 'Android device' : null,

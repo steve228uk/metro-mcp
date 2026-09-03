@@ -93,15 +93,18 @@ export const filesystemPlugin = definePlugin({
         try {
           target = await resolveTarget(platform);
         } catch (error) {
-          if (platform !== 'android') throw error;
+          // Directory discovery has an in-app fallback that works without a
+          // local device transport. Keep explicit iOS strict because its
+          // bundle container path must come from simctl; auto and Android may
+          // continue through the connected app.
+          if (platform === 'ios') throw error;
           target = null;
         }
-        if (!target && platform !== 'android') {
+        if (!target && platform === 'ios') {
           return { error: 'No simulator/emulator detected' };
         }
-        const p = target?.platform ?? 'android';
 
-        if (p === 'ios') {
+        if (target?.platform === 'ios') {
           if (!target) return { error: 'No simulator/emulator detected' };
           if (!bundleId) return { error: 'bundleId is required for iOS' };
           try {
@@ -121,7 +124,7 @@ export const filesystemPlugin = definePlugin({
         }
 
         // Android — try adb first, fall back to evalInApp
-        if (bundleId) {
+        if (bundleId && target?.platform === 'android') {
           try {
             const homeOut = target
               ? await ctx.exec(`${adbPrefix(target.id)} shell ${runAs(bundleId)}sh -c 'echo $HOME' 2>/dev/null`)
