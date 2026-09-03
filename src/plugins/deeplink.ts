@@ -41,9 +41,10 @@ export function parseBundleUrlSchemes(plist: unknown): string[] {
 export function extractAndroidSchemeDump(output: string): string {
   const lines = output.split(/\r?\n/);
   const selected: string[] = [];
+  let contextEnd = -1;
   for (let index = 0; index < lines.length; index += 1) {
-    if (!/scheme/i.test(lines[index] ?? '')) continue;
-    selected.push(...lines.slice(index, index + 6));
+    if (/scheme/i.test(lines[index] ?? '')) contextEnd = index + 5;
+    if (index <= contextEnd) selected.push(lines[index]);
   }
   return selected.join('\n').trim();
 }

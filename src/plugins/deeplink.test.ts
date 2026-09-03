@@ -158,6 +158,7 @@ describe('list_url_schemes', () => {
 });
 
 test('extractAndroidSchemeDump preserves matching lines and their context', () => {
-  expect(extractAndroidSchemeDump('before\nscheme:\n  Scheme: "x"\nafter\n')).toContain('Scheme: "x"');
+  expect(extractAndroidSchemeDump('before\nscheme:\n  Scheme: "x"\nafter\n')).toBe('scheme:\n  Scheme: "x"\nafter');
+  expect(extractAndroidSchemeDump('scheme one\n1\n2\n3\nscheme two\n5\n6\n7\n8\n9\nexcluded\n')).toBe('scheme one\n1\n2\n3\nscheme two\n5\n6\n7\n8\n9');
   expect(extractAndroidSchemeDump('nothing here')).toBe('');
 });
