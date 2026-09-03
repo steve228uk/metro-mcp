@@ -234,6 +234,59 @@ describe('test recorder readiness', () => {
     expect(await call('stop_test_recording')).toContain('1 tap');
   });
 
+  test('uses the most specific metadata when a forwarded handler is wrapped twice', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var receiver = { calls: 0 };
+      var forwarded = function(first, second) {
+        this.calls++;
+        if (first === 'throw') throw new Error('forwarded failure');
+        return [this, first, second];
+      };
+      var outerProps = { testID: 'outer-control', onPress: forwarded };
+      Object.freeze(outerProps);
+      var childProps = { testID: 'inner-control', onPress: outerProps.onPress };
+      Object.freeze(childProps);
+      leaf.memoizedProps = childProps;
+    `, app);
+    const result = vm.runInContext('leaf.memoizedProps.onPress.call(receiver, "first", "second")', app) as unknown[];
+    expect(result[0]).toBe(vm.runInContext('receiver', app));
+    expect(result.slice(1)).toEqual(['first', 'second']);
+    expect(vm.runInContext('receiver.calls', app)).toBe(1);
+    expect(() => vm.runInContext('leaf.memoizedProps.onPress.call(receiver, "throw")', app)).toThrow('forwarded failure');
+    expect(vm.runInContext('receiver.calls', app)).toBe(2);
+    const stopped = await call('stop_test_recording');
+    expect(stopped).toContain('2 taps');
+    const events = JSON.parse(await call.resource('metro://recording/status'));
+    expect(events.eventCount).toBe(2);
+    const raw = vm.runInContext('__METRO_MCP_REC_EVENTS__', app) as Array<{ testID?: string }>;
+    expect(raw).toHaveLength(2);
+    expect(raw[0].testID).toBe('inner-control');
+    expect(raw[1].testID).toBe('inner-control');
+  });
+
+  test('does not add a second wrapper when forwarded identifiers are unchanged', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var forwarded = function() { handlerCalls++; };
+      var outerProps = { testID: 'same-control', onPress: forwarded };
+      Object.freeze(outerProps);
+      var childProps = { testID: 'same-control', onPress: outerProps.onPress };
+      Object.freeze(childProps);
+      leaf.memoizedProps = childProps;
+      leaf.memoizedProps.onPress();
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('handlerCalls', app)).toBe(1);
+    const raw = vm.runInContext('__METRO_MCP_REC_EVENTS__', app) as Array<{ testID?: string }>;
+    expect(raw).toHaveLength(1);
+    expect(raw[0].testID).toBe('same-control');
+  });
+
   test('keeps recorder and profiler commit hooks chained in either stop order', async () => {
     const app = appWithDeepButton();
     const call = await createHarness(app, [testRecorderPlugin, profilerPlugin]);
