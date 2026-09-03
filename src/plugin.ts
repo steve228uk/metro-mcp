@@ -162,6 +162,8 @@ export interface EvalOptions {
   awaitPromise?: boolean;
   /** CDP timeout in milliseconds (default: 10000) */
   timeout?: number;
+  /** Internal absolute deadline used to bound reconnect and transport waits. */
+  deadline?: number;
 }
 
 // ── Metro Events ──

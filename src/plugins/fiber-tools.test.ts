@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import vm from 'node:vm';
 import type { z } from 'zod';
 import type {
   ComponentNode,
@@ -77,6 +78,15 @@ async function createHarness(
   runtime: Record<string, unknown>,
   plugins: PluginDefinition[],
 ) {
+  // Runtime.evaluate executes against a persistent global object. A VM
+  // context exercises that behavior, including indirect eval used by the
+  // awaited mailbox path; wrapping snippets in new Function(globalThis) does
+  // not provide equivalent global declaration semantics.
+  const appGlobal = vm.createContext({
+    ...runtime,
+    setTimeout,
+    clearTimeout,
+  });
   const tools = new Map<string, RegisteredTool>();
   const registerTool: PluginContext['registerTool'] = (name, config) => {
     tools.set(name, {
@@ -113,12 +123,8 @@ async function createHarness(
       structureOnly: (value: ComponentNode) => value,
     },
     evalInApp: async (expression) => {
-      const evaluate = new Function(
-        'globalThis',
-        `return ${expression};`,
-      ) as (globalObject: Record<string, unknown>) => unknown;
       // Mirror returnByValue without assuming CDP awaits an app's JS Promise.
-      const result = evaluate(runtime);
+      const result = new vm.Script(expression).runInContext(appGlobal);
       return result === undefined
         ? undefined
         : JSON.parse(JSON.stringify(result));
