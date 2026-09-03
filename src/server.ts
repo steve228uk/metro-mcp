@@ -34,7 +34,6 @@ import type {
   ResourceConfig,
   AppResourceConfig,
   PromptConfig,
-  EvalOptions,
 } from './plugin.js';
 import {
   CDPSession,
@@ -47,7 +46,7 @@ import type { MetroTarget } from 'metro-bridge';
 import { MetroEventsClient } from './metro/events.js';
 import { createLogger } from './utils/logger.js';
 import { createFormatUtils } from './utils/format.js';
-import { extractCDPExceptionMessage } from './utils/cdp.js';
+import { createAppEvaluator } from './utils/evaluate-app.js';
 import { createPreferredFrameSizeMeta, withAppSizing } from './utils/apps.js';
 import { ResourceSubscriptionManager } from './utils/resource-subscriptions.js';
 import { createResourceUpdateScheduler } from './utils/resource-updates.js';
@@ -370,6 +369,34 @@ export async function createMetroRuntime(
     cfg: Required<MetroMCPConfig>,
   ): PluginContext {
     const pluginLogger = createLogger(plugin.name);
+    const evalInApp = createAppEvaluator(cdpSession, {
+      ensureConnected: async () => {
+        if (!cdpSession.isConnected) {
+          if (isReconnecting) {
+            // A reconnect is already in flight — wait for it rather than
+            // starting another one.
+            await waitForReconnect();
+          } else {
+            // Reset the attempt counter so the background scheduler can resume
+            // after this tool-triggered reconnect, rather than staying capped.
+            reconnectAttempts = 0;
+            const connected = await cdpSession.waitForConnection();
+            if (!connected) await connectToMetro();
+          }
+        }
+        if (!cdpSession.isConnected) {
+          throw new Error(
+            'Not connected to Metro. Use list_devices to check connection status.',
+          );
+        }
+      },
+      waitForReconnect,
+      isReconnecting: () => isReconnecting,
+      reconnect: async () => {
+        reconnectAttempts = 0;
+        await connectToMetro();
+      },
+    });
     return {
       cdp: cdpSession,
       events: eventsClient,
@@ -541,61 +568,7 @@ export async function createMetroRuntime(
           pluginLogger.error(`Failed to register prompt ${name}:`, err);
         }
       },
-      evalInApp: async (expression: string, options?: EvalOptions) => {
-        async function tryEval() {
-          if (!cdpSession.isConnected) {
-            if (isReconnecting) {
-              // A reconnect is already in flight — wait for it rather than starting another
-              await waitForReconnect();
-            } else {
-              // Reset the attempt counter so the background scheduler can resume
-              // after this tool-triggered reconnect, rather than staying capped out.
-              reconnectAttempts = 0;
-              const connected = await cdpSession.waitForConnection();
-              if (!connected) await connectToMetro();
-            }
-          }
-          if (!cdpSession.isConnected) {
-            throw new Error(
-              'Not connected to Metro. Use list_devices to check connection status.',
-            );
-          }
-          const result = (await cdpSession.send('Runtime.evaluate', {
-            expression,
-            returnByValue: true,
-            awaitPromise: options?.awaitPromise ?? false,
-            timeout: options?.timeout,
-          })) as Record<string, unknown>;
-          if (result.exceptionDetails) {
-            throw new Error(
-              extractCDPExceptionMessage(
-                result.exceptionDetails as Record<string, unknown>,
-              ),
-            );
-          }
-          return (result.result as Record<string, unknown>).value;
-        }
-        try {
-          return await tryEval();
-        } catch (err) {
-          if (
-            err instanceof Error &&
-            (err.message === 'WebSocket closed' ||
-              err.message === 'Not connected to CDP target' ||
-              err.message ===
-                'Not connected to Metro. Use list_devices to check connection status.')
-          ) {
-            if (isReconnecting) {
-              await waitForReconnect();
-            } else {
-              reconnectAttempts = 0;
-              await connectToMetro();
-            }
-            return await tryEval();
-          }
-          throw err;
-        }
-      },
+      evalInApp,
       config: cfg as unknown as Record<string, unknown>,
       logger: pluginLogger,
       metro: {
