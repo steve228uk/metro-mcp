@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { definePlugin, nativeToolResult } from '../plugin.js';
+import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
 
 const SCREENSHOT_PREFIX = 'metro-mcp-screenshot-';
 const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -90,17 +91,8 @@ export const simulatorPlugin = definePlugin({
   description: 'Unified iOS simulator / Android emulator device control',
 
   async setup(ctx) {
-    async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      try {
-        await ctx.exec('xcrun simctl list booted 2>/dev/null');
-        return 'ios';
-      } catch {}
-      try {
-        await ctx.exec('adb devices 2>/dev/null');
-        return 'android';
-      } catch {}
-      return null;
-    }
+    const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
+      resolveDevice(ctx, platform, ctx.cdp.getTarget());
 
     ctx.registerTool('take_screenshot', {
       description: 'Capture a screenshot from the connected iOS simulator or Android device.',
@@ -113,8 +105,9 @@ export const simulatorPlugin = definePlugin({
           .describe('Return a retained temporary file path or an inline MCP image'),
       }),
       handler: async ({ platform, delivery }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         await prepareScreenshotDirectory();
         await cleanupOldScreenshots();
@@ -127,13 +120,13 @@ export const simulatorPlugin = definePlugin({
           if (p === 'ios') {
             await ctx.execFile(
               'xcrun',
-              ['simctl', 'io', 'booted', 'screenshot', tmpFile],
+              ['simctl', 'io', target.id, 'screenshot', tmpFile],
               { maxBuffer: SCREENSHOT_MAX_BYTES },
             );
           } else {
             const capture = await ctx.execFile(
               'adb',
-              ['exec-out', 'screencap', '-p'],
+              [ '-s', target.id, 'exec-out', 'screencap', '-p'],
               { maxBuffer: SCREENSHOT_MAX_BYTES },
             );
             await writeFile(tmpFile, capture, { flag: 'wx', mode: 0o600 });
@@ -240,14 +233,15 @@ export const simulatorPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ certPath, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         if (p === 'ios') {
-          await ctx.exec(`xcrun simctl keychain booted add-root-cert "${certPath}"`);
+          await ctx.exec(`xcrun simctl keychain "${target.id}" add-root-cert "${certPath}"`);
           return 'Certificate installed on iOS simulator.';
         } else {
-          await ctx.exec(`adb push "${certPath}" /sdcard/cert.pem`);
+          await ctx.exec(`${adbPrefix(target.id)} push "${certPath}" /sdcard/cert.pem`);
           return 'Certificate pushed to Android device at /sdcard/cert.pem. You may need to install it manually via Settings > Security.';
         }
       },
@@ -262,8 +256,9 @@ export const simulatorPlugin = definePlugin({
         lines: z.number().default(50).describe('Number of log lines to return'),
       }),
       handler: async ({ platform, filter, lines }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         try {
           if (p === 'ios') {
@@ -271,13 +266,13 @@ export const simulatorPlugin = definePlugin({
               ? `--predicate 'processImagePath contains "${filter}"'`
               : '';
             const output = await ctx.exec(
-              `xcrun simctl spawn booted log show --last 1m ${predicate} --style compact 2>/dev/null | tail -${lines}`
+              `xcrun simctl spawn "${target.id}" log show --last 1m ${predicate} --style compact 2>/dev/null | tail -${lines}`
             );
             return output || 'No logs found.';
           } else {
             const tagFilter = filter ? `-s "${filter}:*"` : '';
             const output = await ctx.exec(
-              `adb logcat -d ${tagFilter} -t ${lines} 2>/dev/null`
+              `${adbPrefix(target.id)} logcat -d ${tagFilter} -t ${lines} 2>/dev/null`
             );
             return output || 'No logs found.';
           }
@@ -297,21 +292,22 @@ export const simulatorPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ action, bundleId, appPath, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         const commands: Record<string, Record<string, string>> = {
           ios: {
-            launch: `xcrun simctl launch booted "${bundleId}"`,
-            terminate: `xcrun simctl terminate booted "${bundleId}"`,
-            install: `xcrun simctl install booted "${appPath}"`,
-            uninstall: `xcrun simctl uninstall booted "${bundleId}"`,
+            launch: `xcrun simctl launch "${target.id}" "${bundleId}"`,
+            terminate: `xcrun simctl terminate "${target.id}" "${bundleId}"`,
+            install: `xcrun simctl install "${target.id}" "${appPath}"`,
+            uninstall: `xcrun simctl uninstall "${target.id}" "${bundleId}"`,
           },
           android: {
-            launch: `adb shell am start -n "${bundleId}/.MainActivity"`,
-            terminate: `adb shell am force-stop "${bundleId}"`,
-            install: `adb install "${appPath}"`,
-            uninstall: `adb uninstall "${bundleId}"`,
+            launch: `${adbPrefix(target.id)} shell am start -n "${bundleId}/.MainActivity"`,
+            terminate: `${adbPrefix(target.id)} shell am force-stop "${bundleId}"`,
+            install: `${adbPrefix(target.id)} install "${appPath}"`,
+            uninstall: `${adbPrefix(target.id)} uninstall "${bundleId}"`,
           },
         };
 
@@ -330,11 +326,12 @@ export const simulatorPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         if (p === 'android') {
-          const output = await ctx.exec('adb shell settings get system user_rotation 2>/dev/null');
+          const output = await ctx.exec(`${adbPrefix(target.id)} shell settings get system user_rotation 2>/dev/null`);
           const rotation = parseInt(output.trim());
           const orientations: Record<number, string> = {
             0: 'portrait',
