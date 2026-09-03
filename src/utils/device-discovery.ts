@@ -282,7 +282,6 @@ export async function resolveDevice(
   const androidNameMatches = connectedName
     ? findAndroidNameMatches(authorizedAndroid, connectedName)
     : [];
-  const hasConnectedIdentity = Boolean(connectedId || connectedName);
   if (iosNameMatches.length > 0 && androidNameMatches.length > 0) {
     throw new Error(
       `Ambiguous connected device name "${connectedName}" across iOS and Android: ` +
@@ -319,11 +318,12 @@ export async function resolveDevice(
       `${authorizedAndroid.map((device) => `${device.model ?? device.id} (${device.id})`).join(', ')}.`,
     );
   }
-  // A sole inventory is safe to use only when the connected target has no
-  // identity metadata. Any unmatched ID or name means this may be a sole
-  // device on the other platform; exact matches returned above already win.
+  // A sole inventory is safe to use when the connected target only exposes an
+  // opaque logical ID. A device name is useful contradiction evidence, while
+  // an unmatched logical ID may simply be an inspector-generated identifier;
+  // exact matches returned above already win.
   if (bootedIos.length > 0) {
-    if (bootedIos.length === 1 && hasConnectedIdentity) {
+    if (bootedIos.length === 1 && connectedName) {
       throw new Error(
         'Connected Metro target does not match the sole available iOS simulator.',
       );
@@ -332,7 +332,7 @@ export async function resolveDevice(
   }
   if (authorizedAndroid.length > 0) {
     if (authorizedAndroid.length === 1) {
-      if (hasConnectedIdentity) {
+      if (connectedName) {
         throw new Error(
           'Connected Metro target does not match the sole available Android device.',
         );

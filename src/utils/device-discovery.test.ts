@@ -250,6 +250,28 @@ describe('device discovery', () => {
     expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
   });
 
+  test('uses a sole iOS simulator when Android discovery is successfully empty and the Metro ID is opaque', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'ios', id: 'IOS-16' });
+  });
+
+  test('uses a sole Android device when iOS discovery is successfully empty and the Metro ID is opaque', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([])],
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
   test('does not use a sole iOS fallback for a contradictory connected Android target', async () => {
     const runner = runnerFor({
       ios: [iosInventory([
