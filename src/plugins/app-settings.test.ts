@@ -13,11 +13,59 @@ interface RegisteredTool {
 async function harness(runtime: Record<string, unknown>, appId: string | null = 'com.example.app') {
   let tool: RegisteredTool;
   let evaluations = 0;
+  // Model the CDP completion-object path used by awaitPromise: true. Hermes
+  // returns a remote Promise handle for Runtime.evaluate, then the evaluator
+  // attaches the mailbox settlement callback with Runtime.callFunctionOn.
+  // Keeping the handle in this VM avoids accidentally awaiting or replaying
+  // the source expression in the test harness.
   const app = vm.createContext({ ...runtime, setTimeout, clearTimeout });
+  let nextObjectId = 0;
+  const remoteObjects = new Map<string, { value: unknown; objectGroup?: string }>();
   const evaluate = createAppEvaluator({
-    send: async (_method, params) => {
-      const value = new vm.Script(String(params?.expression)).runInContext(app);
-      return { result: { value: value === undefined ? undefined : JSON.parse(JSON.stringify(value)) } };
+    send: async (method, params = {}) => {
+      if (method === 'Runtime.evaluate') {
+        const value = new vm.Script(String(params.expression)).runInContext(app);
+        if (params.returnByValue === false && value !== null &&
+            (typeof value === 'object' || typeof value === 'function')) {
+          const objectId = `remote-${++nextObjectId}`;
+          remoteObjects.set(objectId, {
+            value,
+            ...(typeof params.objectGroup === 'string' ? { objectGroup: params.objectGroup } : {}),
+          });
+          return {
+            result: {
+              type: 'object',
+              ...(value instanceof Promise ? { subtype: 'promise' } : {}),
+              objectId,
+            },
+          };
+        }
+        return {
+          result: {
+            value: value === undefined ? undefined : JSON.parse(JSON.stringify(value)),
+          },
+        };
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const remote = remoteObjects.get(String(params.objectId));
+        if (!remote) return { result: { value: false } };
+        const fn = new vm.Script(`(${String(params.functionDeclaration)})`).runInContext(app) as Function;
+        const args = (params.arguments as Array<{ value: unknown }> | undefined)
+          ?.map((arg) => arg.value) ?? [];
+        const value = fn.call(remote.value, ...args);
+        return { result: { value: value === undefined ? undefined : JSON.parse(JSON.stringify(value)) } };
+      }
+      if (method === 'Runtime.releaseObject') {
+        remoteObjects.delete(String(params.objectId));
+        return { result: { value: undefined } };
+      }
+      if (method === 'Runtime.releaseObjectGroup') {
+        for (const [objectId, remote] of remoteObjects) {
+          if (remote.objectGroup === params.objectGroup) remoteObjects.delete(objectId);
+        }
+        return { result: { value: undefined } };
+      }
+      return { result: { value: undefined } };
     },
   }, {
     ensureConnected: async () => {},
