@@ -69,6 +69,16 @@ export const inspectPointPlugin = definePlugin({
                   typeof instance.measure === 'function'
                 )) return instance;
               }
+              // Fabric may not create a public instance until a ref is used.
+              var fabricManager = globalThis.nativeFabricUIManager;
+              if (stateNode && stateNode.node && fabricManager &&
+                  typeof fabricManager.measure === 'function') {
+                return {
+                  measure: function(callback) {
+                    fabricManager.measure(stateNode.node, callback);
+                  }
+                };
+              }
               return null;
             }
 

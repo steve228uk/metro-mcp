@@ -21,6 +21,15 @@ interface Fiber {
   return?: Fiber | null;
 }
 
+type MeasureCallback = (
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  pageX: number,
+  pageY: number,
+) => void;
+
 interface RegisteredTool {
   parameters: z.ZodType;
   handler: (
@@ -415,19 +424,41 @@ describe('inspect_at_point', () => {
     expect(envelope.traversal.complete).toBe(true);
   });
 
+  test('measures Fabric shadow nodes before their public instance exists', async () => {
+    const host = fiber('RCTText', {}, true);
+    const shadowNode = {};
+    const canonical = { publicInstance: null };
+    host.stateNode = { node: shadowNode, canonical };
+    const root = append(fiber('Label'), host);
+    const runtime = {
+      ...runtimeFor([root]),
+      nativeFabricUIManager: {
+        measure: (node: unknown, callback: MeasureCallback) => {
+          expect(node).toBe(shadowNode);
+          setTimeout(() => callback(0, 0, 80, 30, 5, 6), 5);
+        },
+      },
+    };
+    const call = await createHarness(runtime, [inspectPointPlugin]);
+    const envelope = (await call('inspect_at_point', { x: 10, y: 10 })) as {
+      result: Record<string, unknown>;
+      traversal: { complete: boolean };
+    };
+
+    expect(envelope.result).toMatchObject({
+      found: true,
+      hostComponent: 'RCTText',
+      reactComponent: 'Label',
+      layout: { x: 5, y: 6, width: 80, height: 30 },
+    });
+    expect(envelope.traversal.complete).toBe(true);
+    expect(canonical.publicInstance).toBeNull();
+  });
+
   test('awaits callback-based Paper measurement', async () => {
     const host = fiber('Text', {}, true);
     host.stateNode = {
-      measure: (
-        callback: (
-          x: number,
-          y: number,
-          width: number,
-          height: number,
-          pageX: number,
-          pageY: number,
-        ) => void,
-      ) => callback(0, 0, 80, 30, 5, 6),
+      measure: (callback: MeasureCallback) => callback(0, 0, 80, 30, 5, 6),
     };
     const root = append(fiber('Label'), host);
     const call = await createHarness(runtimeFor([root]), [inspectPointPlugin]);
