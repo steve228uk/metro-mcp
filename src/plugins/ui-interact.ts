@@ -12,11 +12,10 @@ import {
   SWIPE_COORDS,
   buildFiberReadExpression,
 } from '../utils/fiber.js';
+import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
 
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let idbAvailableCache: boolean | null = null;
-let platformCache: { value: 'ios' | 'android' | null; ts: number } | null = null;
-const PLATFORM_TTL_MS = 5000;
 
 export const uiInteractPlugin = definePlugin({
   name: 'ui-interact',
@@ -24,23 +23,8 @@ export const uiInteractPlugin = definePlugin({
   description: 'UI automation via fiber tree, simctl, adb, and IDB',
 
   async setup(ctx) {
-    async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      const now = Date.now();
-      if (platformCache && now - platformCache.ts < PLATFORM_TTL_MS) return platformCache.value;
-      const [iosResult, androidResult] = await Promise.allSettled([
-        ctx.exec('xcrun simctl list booted 2>/dev/null | grep -q Booted'),
-        ctx.exec('adb devices 2>/dev/null'),
-      ]);
-      let platform: 'ios' | 'android' | null = null;
-      if (iosResult.status === 'fulfilled') {
-        platform = 'ios';
-      } else if (androidResult.status === 'fulfilled') {
-        const output = (androidResult as PromiseFulfilledResult<string>).value;
-        if (output.trim().split('\n').length > 1) platform = 'android';
-      }
-      platformCache = { value: platform, ts: now };
-      return platform;
-    }
+    const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
+      resolveDevice(ctx, platform, ctx.cdp.getTarget());
 
     async function isIDBAvailable(): Promise<boolean> {
       if (idbAvailableCache !== null) return idbAvailableCache;
@@ -113,24 +97,25 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ label, x, y, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         // ── Coordinate tap ──────────────────────────────────────────────────
         if (x !== undefined && y !== undefined) {
           if (p === 'android') {
-            await ctx.exec(`adb shell input tap ${x} ${y}`);
+            await ctx.exec(`${adbPrefix(target.id)} shell input tap ${x} ${y}`);
             return `Tapped at (${x}, ${y})`;
           }
           // iOS: simctl first (Xcode 14+), then IDB
           try {
-            await ctx.exec(`xcrun simctl io booted tap ${x} ${y}`);
+            await ctx.exec(`xcrun simctl io "${target.id}" tap ${x} ${y}`);
             return `Tapped at (${x}, ${y})`;
           } catch {}
           if (!(await isIDBAvailable())) {
             return `Coordinate tap failed. ${IDB_INSTALL}`;
           }
-          await ctx.exec(`idb ui tap ${x} ${y} --udid booted`);
+          await ctx.exec(`idb ui tap ${x} ${y} --udid "${target.id}"`);
           return `Tapped at (${x}, ${y})`;
         }
 
@@ -153,7 +138,7 @@ export const uiInteractPlugin = definePlugin({
           let content = '';
           try {
             await ctx.exec(
-              `adb shell uiautomator dump /sdcard/uidump.xml && adb pull /sdcard/uidump.xml ${tmpFile} 2>/dev/null`
+              `${adbPrefix(target.id)} shell uiautomator dump /sdcard/uidump.xml && ${adbPrefix(target.id)} pull /sdcard/uidump.xml ${tmpFile} 2>/dev/null`
             );
             content = await readFile(tmpFile, 'utf8');
           } finally {
@@ -168,7 +153,7 @@ export const uiInteractPlugin = definePlugin({
             if (match) {
               const cx = Math.round((parseInt(match[1]) + parseInt(match[3])) / 2);
               const cy = Math.round((parseInt(match[2]) + parseInt(match[4])) / 2);
-              await ctx.exec(`adb shell input tap ${cx} ${cy}`);
+              await ctx.exec(`${adbPrefix(target.id)} shell input tap ${cx} ${cy}`);
               return `Tapped "${label}" at (${cx}, ${cy})`;
             }
           } catch {}
@@ -180,12 +165,12 @@ export const uiInteractPlugin = definePlugin({
           return `Element "${label}" not found via fiber tree. ${IDB_INSTALL}`;
         }
         try {
-          await ctx.exec(`idb ui tap --by-label "${label}" --udid booted`);
+          await ctx.exec(`idb ui tap --by-label "${label}" --udid "${target.id}"`);
           return `Tapped "${label}"`;
         } catch (err) {
           const msg = err instanceof Error ? err.message : '';
           if (msg.includes('117')) {
-            return `IDB exit 117: companion not running. Try: idb_companion --udid booted &`;
+            return `IDB exit 117: companion not running. Try: idb_companion --udid ${target.id} &`;
           }
           return `Element "${label}" not found.`;
         }
@@ -205,8 +190,9 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ text, testID, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         // ── CDP: find TextInput and call onChangeText ─────────────────────────
         const jsText = JSON.stringify(text);
@@ -258,7 +244,7 @@ export const uiInteractPlugin = definePlugin({
             .replace(/;/g, '\\;')
             .replace(/\$/g, '\\$')
             .replace(/`/g, '\\`');
-          await ctx.exec(`adb shell input text "${escaped}"`);
+          await ctx.exec(`${adbPrefix(target.id)} shell input text "${escaped}"`);
           return `Typed "${text}"`;
         }
 
@@ -266,7 +252,7 @@ export const uiInteractPlugin = definePlugin({
         if (!(await isIDBAvailable())) {
           return `Could not find a TextInput via fiber tree. ${IDB_INSTALL}`;
         }
-        await ctx.exec(`idb ui text "${text}" --udid booted`);
+        await ctx.exec(`idb ui text "${text}" --udid "${target.id}"`);
         return `Typed "${text}"`;
       },
     });
@@ -283,8 +269,9 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ label, x, y, duration, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         // ── CDP: find element by label/testID and call onLongPress ────────────
         if (label) {
@@ -302,13 +289,13 @@ export const uiInteractPlugin = definePlugin({
         // ── Coordinate fallbacks ──────────────────────────────────────────────
         if (x !== undefined && y !== undefined) {
           if (p === 'android') {
-            await ctx.exec(`adb shell input swipe ${x} ${y} ${x} ${y} ${duration}`);
+            await ctx.exec(`${adbPrefix(target.id)} shell input swipe ${x} ${y} ${x} ${y} ${duration}`);
             return `Long pressed at (${x}, ${y}) for ${duration}ms`;
           }
           if (!(await isIDBAvailable())) {
             return `Coordinate long press requires IDB on iOS. ${IDB_INSTALL}`;
           }
-          await ctx.exec(`idb ui long-press ${x} ${y} --duration ${duration / 1000} --udid booted`);
+          await ctx.exec(`idb ui long-press ${x} ${y} --duration ${duration / 1000} --udid "${target.id}"`);
           return `Long pressed at (${x}, ${y}) for ${duration}ms`;
         }
 
@@ -327,8 +314,9 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ direction, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         let result: string | null = null;
 
@@ -384,12 +372,12 @@ export const uiInteractPlugin = definePlugin({
           const [sx, sy, ex, ey] = SWIPE_COORDS[direction];
 
           if (p === 'android') {
-            await ctx.exec(`adb shell input swipe ${sx} ${sy} ${ex} ${ey} 300`);
+            await ctx.exec(`${adbPrefix(target.id)} shell input swipe ${sx} ${sy} ${ex} ${ey} 300`);
             result = `Swiped ${direction}`;
           } else if (!(await isIDBAvailable())) {
             return `Swipe requires IDB on iOS. ${IDB_INSTALL}`;
           } else {
-            await ctx.exec(`idb ui swipe ${sx} ${sy} ${ex} ${ey} --udid booted`);
+            await ctx.exec(`idb ui swipe ${sx} ${sy} ${ex} ${ey} --udid "${target.id}"`);
             result = `Swiped ${direction}`;
           }
         }
@@ -420,8 +408,9 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ button, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         // ── Android: adb keycodes ─────────────────────────────────────────────
         if (p === 'android') {
@@ -429,7 +418,7 @@ export const uiInteractPlugin = definePlugin({
             HOME: 3, BACK: 4, VOLUME_UP: 24, VOLUME_DOWN: 25,
             POWER: 26, ENTER: 66, DELETE: 67,
           };
-          await ctx.exec(`adb shell input keyevent ${keycodes[button]}`);
+          await ctx.exec(`${adbPrefix(target.id)} shell input keyevent ${keycodes[button]}`);
           return `Pressed ${button}`;
         }
 
@@ -437,7 +426,7 @@ export const uiInteractPlugin = definePlugin({
         if (button === 'HOME') {
           try {
             await ctx.exec(
-              'xcrun simctl spawn booted launchctl kickstart -k system/com.apple.SpringBoard 2>/dev/null'
+              `xcrun simctl spawn "${target.id}" launchctl kickstart -k system/com.apple.SpringBoard 2>/dev/null`
             );
             return 'Pressed HOME';
           } catch {}
@@ -508,7 +497,7 @@ export const uiInteractPlugin = definePlugin({
         const idbMap: Record<string, string> = {
           HOME: 'HOME', VOLUME_UP: 'VOLUME_UP', VOLUME_DOWN: 'VOLUME_DOWN', POWER: 'LOCK', BACK: 'HOME',
         };
-        await ctx.exec(`idb ui button ${idbMap[button] || button} --udid booted`);
+        await ctx.exec(`idb ui button ${idbMap[button] || button} --udid "${target.id}"`);
         return `Pressed ${button}`;
       },
     });
