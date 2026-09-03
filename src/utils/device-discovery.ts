@@ -205,15 +205,34 @@ export async function resolveDevice(
   if (ios) return toResolvedIos(ios);
   if (android) return { platform: 'android', id: android.id, name: android.model };
 
+  // If one inventory failed, names and sole-device fallbacks are unsafe while
+  // a Metro target is connected: the surviving inventory may describe an
+  // unrelated device. Require concrete identity evidence in that case and
+  // let callers retry after the failed discovery has recovered.
+  if (
+    (iosResult.status === 'rejected' || androidResult.status === 'rejected') &&
+    target != null
+  ) {
+    const failed = [
+      iosResult.status === 'rejected' ? 'iOS simulator' : null,
+      androidResult.status === 'rejected' ? 'Android device' : null,
+    ].filter(Boolean).join(' and ');
+    throw new Error(
+      `Unable to verify the connected device because ${failed} discovery failed. ` +
+      'Retry after device discovery is available.',
+    );
+  }
+
   // Resolve name evidence for both platforms before selecting either one.
   // A Metro target's name is not platform-qualified, so selecting the first
   // inventory to report a match can silently target an unrelated app when
   // both runtimes use the same model name.
-  const iosNameMatches = iosResult.status === 'fulfilled'
-    ? findIosNames(iosResult.value, connectedName)
-    : [];
+  const bootedIos = iosResult.status === 'fulfilled' ? iosResult.value : [];
   const authorizedAndroid = androidResult.status === 'fulfilled'
     ? androidResult.value.filter((device) => device.status === 'device')
+    : [];
+  const iosNameMatches = iosResult.status === 'fulfilled'
+    ? findIosNames(iosResult.value, connectedName)
     : [];
   const androidNameMatches = connectedName
     ? findAndroidNameMatches(authorizedAndroid, connectedName)
@@ -244,19 +263,26 @@ export async function resolveDevice(
     const match = androidNameMatches[0];
     return { platform: 'android', id: match.id, name: match.model };
   }
-  // A valid iOS inventory wins when both runtimes are present, matching the
-  // historical auto-selection order while making ambiguity explicit.
-  if (iosResult.status === 'fulfilled' && iosResult.value.length > 0) {
-    return resolveIosDevice(iosResult.value, target);
+  // Once the connected target's concrete identity and name evidence have
+  // been exhausted, runtime ordering cannot identify which platform it is on.
+  // Refuse to choose iOS merely because it happens to be listed first.
+  if (bootedIos.length > 0 && authorizedAndroid.length > 0) {
+    throw new Error(
+      'Ambiguous available devices across iOS and Android: ' +
+      `${bootedIos.map((device) => `${device.name} (${device.udid})`).join(', ')}; ` +
+      `${authorizedAndroid.map((device) => `${device.model ?? device.id} (${device.id})`).join(', ')}.`,
+    );
   }
-  if (androidResult.status === 'fulfilled') {
-    const authorized = androidResult.value.filter((device) => device.status === 'device');
-    if (authorized.length === 1) {
-      return { platform: 'android', id: authorized[0].id, name: authorized[0].model };
+  if (bootedIos.length > 0) {
+    return resolveIosDevice(bootedIos, target);
+  }
+  if (authorizedAndroid.length > 0) {
+    if (authorizedAndroid.length === 1) {
+      return { platform: 'android', id: authorizedAndroid[0].id, name: authorizedAndroid[0].model };
     }
-    if (authorized.length > 1) {
+    if (authorizedAndroid.length > 1) {
       throw new Error(
-        `Ambiguous Android devices: ${authorized.map((device) => device.id).join(', ')}.`,
+        `Ambiguous Android devices: ${authorizedAndroid.map((device) => device.id).join(', ')}.`,
       );
     }
   }
