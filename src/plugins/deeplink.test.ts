@@ -40,9 +40,12 @@ function createHarness(options: {
       on: () => {},
       off: () => {},
       isConnected: true,
-      getTarget: () => options.targets?.[
-        Math.min(targetCallCount++, options.targets.length - 1)
-      ] ?? target,
+      getTarget: () => {
+        if (!options.targets) return target;
+        const index = Math.min(targetCallCount, options.targets.length - 1);
+        targetCallCount += 1;
+        return options.targets[index] ?? target;
+      },
       send: async () => ({}),
     },
     events: { on: () => {}, off: () => {}, isConnected: () => true },

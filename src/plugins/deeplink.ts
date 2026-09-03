@@ -88,8 +88,10 @@ export const deeplinkPlugin = definePlugin({
   description: 'Cross-platform deep link testing',
 
   async setup(ctx) {
-    const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
-      resolveDevice(ctx, platform, ctx.cdp.getTarget());
+    const resolveTarget = (
+      platform: 'ios' | 'android' | 'auto',
+      connectedTarget = ctx.cdp.getTarget(),
+    ) => resolveDevice(ctx, platform, connectedTarget);
 
     ctx.registerTool('open_deeplink', {
       description: 'Open a URL or deep link on the connected iOS simulator or Android device.',
@@ -133,7 +135,7 @@ export const deeplinkPlugin = definePlugin({
 
         // Keep device selection and the connected app ID tied to one target
         // snapshot if Metro changes its active runtime during discovery.
-        const target = await resolveDevice(ctx, platform, targetInfo);
+        const target = await resolveTarget(platform, targetInfo);
         if (!target) return 'No simulator/emulator detected.';
 
         if (target.platform === 'ios') {
