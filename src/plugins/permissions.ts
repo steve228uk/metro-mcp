@@ -123,13 +123,18 @@ export const permissionsPlugin = definePlugin({
     async function resolveTarget(
       platform: 'ios' | 'android' | 'auto' | undefined,
       bundleId: string | undefined
-    ): Promise<{ p: 'ios' | 'android'; id: string } | string> {
-      const p = platform === 'auto' || !platform ? await detectPlatform() : platform;
-      if (!p) return 'No simulator/emulator detected.';
+    ): Promise<{ p: 'ios' | 'android'; id: string; deviceId: string } | string> {
+      const device = await resolveDevice(
+        ctx,
+        platform === 'auto' || !platform ? 'auto' : platform,
+        ctx.cdp.getTarget(),
+      );
+      if (!device) return 'No simulator/emulator detected.';
+      const p = device.platform;
       const id = bundleId || (await detectBundleId(p));
       if (!id)
         return 'Bundle ID / package name required. Provide bundleId or ensure the app is running.';
-      return { p, id };
+      return { p, id, deviceId: device.id };
     }
 
     function validateIosService(service: string): string | null {
@@ -298,9 +303,18 @@ export const permissionsPlugin = definePlugin({
           .describe('Bundle ID (iOS) or package name (Android). Auto-detected if omitted.'),
       }),
       handler: async ({ service, platform, bundleId }) => {
-        const resolved = await resolveTarget(platform, bundleId);
+        let resolved: Awaited<ReturnType<typeof resolveTarget>>;
+        try {
+          resolved = await resolveTarget(platform, bundleId);
+        } catch (err) {
+          return `Failed to reset permissions: ${err instanceof Error ? err.message : String(err)}`;
+        }
         if (typeof resolved === 'string') return resolved;
         const { p, id } = resolved;
+        // Resolve the native target once, outside the reset fallback. If
+        // inventory discovery fails, never interpret that as a failed adb
+        // reset and issue a second destructive command.
+        const deviceId = p === 'android' ? resolved.deviceId : null;
 
         if (p === 'ios') {
           const iosTarget = service ?? 'all';
@@ -309,9 +323,7 @@ export const permissionsPlugin = definePlugin({
             if (serviceError) return serviceError;
           }
           try {
-            const udid = await getBootedIosUdid();
-            if (!udid) return 'No booted iOS simulator found.';
-            await ctx.exec(`xcrun simctl privacy "${udid}" reset "${iosTarget}" "${id}"`);
+            await ctx.exec(`xcrun simctl privacy "${resolved.deviceId}" reset "${iosTarget}" "${id}"`);
             return `Reset ${service ? `"${service}"` : 'all'} permissions for ${id} on iOS simulator.`;
           } catch (err) {
             return `Failed to reset permissions: ${err instanceof Error ? err.message : String(err)}`;
@@ -320,20 +332,14 @@ export const permissionsPlugin = definePlugin({
           try {
             if (service) {
               const perm = normalizeAndroidPermission(service);
-              const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
-              if (!device) return 'No authorized Android device found.';
-              await ctx.exec(`${adbPrefix(device.id)} shell pm revoke "${id}" "${perm}"`);
+              await ctx.exec(`${adbPrefix(deviceId!)} shell pm revoke "${id}" "${perm}"`);
               return `Reset "${perm}" for ${id} on Android device.`;
             } else {
               // pm reset-permissions not available on older Android; pm clear resets all app state including permissions
               try {
-                const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
-                if (!device) return 'No authorized Android device found.';
-                await ctx.exec(`${adbPrefix(device.id)} shell pm reset-permissions -p "${id}" 2>/dev/null`);
+                await ctx.exec(`${adbPrefix(deviceId!)} shell pm reset-permissions -p "${id}" 2>/dev/null`);
               } catch {
-                const device = await resolveDevice(ctx, 'android', ctx.cdp.getTarget());
-                if (!device) return 'No authorized Android device found.';
-                await ctx.exec(`${adbPrefix(device.id)} shell pm clear "${id}"`);
+                await ctx.exec(`${adbPrefix(deviceId!)} shell pm clear "${id}"`);
               }
               return `Reset all permissions for ${id} on Android device.`;
             }

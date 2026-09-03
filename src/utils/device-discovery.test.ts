@@ -82,6 +82,20 @@ describe('device discovery', () => {
     expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
   });
 
+  test('checks exact target IDs before a colliding iOS device name', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'Pixel_8', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    const device = await resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel_8',
+      reactNative: { logicalDeviceId: 'emulator-42' },
+    });
+    expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
   test('does not choose the first Android device when target identity is absent', async () => {
     const runner = runnerFor({
       ios: [iosInventory([])],

@@ -89,11 +89,20 @@ export const filesystemPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ bundleId, platform }) => {
-        const target = await resolveTarget(platform);
-        if (!target) return { error: 'No simulator/emulator detected' };
-        const p = target.platform;
+        let target: Awaited<ReturnType<typeof resolveTarget>> = null;
+        try {
+          target = await resolveTarget(platform);
+        } catch (error) {
+          if (platform !== 'android') throw error;
+          target = null;
+        }
+        if (!target && platform !== 'android') {
+          return { error: 'No simulator/emulator detected' };
+        }
+        const p = target?.platform ?? 'android';
 
         if (p === 'ios') {
+          if (!target) return { error: 'No simulator/emulator detected' };
           if (!bundleId) return { error: 'bundleId is required for iOS' };
           try {
             const root = await getIosContainer(bundleId, target.id);
@@ -114,9 +123,10 @@ export const filesystemPlugin = definePlugin({
         // Android — try adb first, fall back to evalInApp
         if (bundleId) {
           try {
-            const homeOut = await ctx.exec(
-              `${adbPrefix(target.id)} shell ${runAs(bundleId)}sh -c 'echo $HOME' 2>/dev/null`
-            );
+            const homeOut = target
+              ? await ctx.exec(`${adbPrefix(target.id)} shell ${runAs(bundleId)}sh -c 'echo $HOME' 2>/dev/null`)
+              : '';
+            if (!homeOut) throw new Error('adb device unavailable');
             const home = homeOut.trim() || `/data/data/${bundleId}`;
             return {
               root:      home,
