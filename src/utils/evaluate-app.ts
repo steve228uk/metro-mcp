@@ -1,6 +1,6 @@
 import type { CDPConnection, EvalOptions } from '../plugin.js';
 import { extractCDPExceptionMessage } from './cdp.js';
-import { awaitAppResult } from './await-app-result.js';
+import { awaitAppResult, type AppEvaluationCompletion } from './await-app-result.js';
 
 export interface AppEvaluationLifecycle {
   /** Ensure a request can be sent before it is dispatched. */
@@ -23,6 +23,26 @@ function isTransportError(error: unknown): boolean {
   );
 }
 
+async function sendRuntimeEvaluate(
+  cdp: Pick<CDPConnection, 'send'>,
+  params: Record<string, unknown>,
+  timeout?: number,
+): Promise<Record<string, unknown>> {
+  const result = (await cdp.send(
+    'Runtime.evaluate',
+    params,
+    timeout === undefined ? undefined : { timeoutMs: timeout },
+  )) as Record<string, unknown>;
+  if (result.exceptionDetails) {
+    throw new Error(
+      extractCDPExceptionMessage(
+        result.exceptionDetails as Record<string, unknown>,
+      ),
+    );
+  }
+  return result;
+}
+
 /**
  * Send one Runtime.evaluate request and return its by-value completion value.
  *
@@ -36,21 +56,63 @@ export async function evaluateAppScript(
   expression: string,
   options?: EvalOptions,
 ): Promise<unknown> {
-  const result = (await cdp.send('Runtime.evaluate', {
+  const result = await sendRuntimeEvaluate(cdp, {
     expression,
     returnByValue: true,
     awaitPromise: false,
-    timeout: options?.timeout,
-  })) as Record<string, unknown>;
-  if (result.exceptionDetails) {
-    throw new Error(
-      extractCDPExceptionMessage(
-        result.exceptionDetails as Record<string, unknown>,
-      ),
-    );
-  }
+    ...(options?.timeout === undefined ? {} : { timeout: options.timeout }),
+  }, options?.timeout);
   return (result.result as Record<string, unknown>).value;
 }
+
+/**
+ * Execute a script once and retain its remote completion object. Keeping the
+ * Runtime.evaluate request separate from mailbox setup is what preserves
+ * normal script completion and declaration semantics on persistent runtimes.
+ */
+export async function evaluateAppScriptCompletion(
+  cdp: Pick<CDPConnection, 'send'>,
+  expression: string,
+  options?: EvalOptions,
+): Promise<AppEvaluationCompletion> {
+  const result = await sendRuntimeEvaluate(cdp, {
+    expression,
+    returnByValue: false,
+    awaitPromise: false,
+    ...(options?.timeout === undefined ? {} : { timeout: options.timeout }),
+    ...(options?.objectGroup ? { objectGroup: options.objectGroup } : {}),
+  }, options?.timeout);
+  const remote = (result.result ?? {}) as Record<string, unknown>;
+  if (typeof remote.objectId === 'string') {
+    return {
+      objectId: remote.objectId,
+      ...(remote.value === undefined ? {} : { value: remote.value }),
+    };
+  }
+  return { value: remote.value };
+}
+
+const SETTLE_REMOTE_FUNCTION = `function(key) {
+  var state = globalThis[key];
+  if (!state) return false;
+  function fulfill(value) {
+    if (globalThis[key] !== state) return;
+    state.value = value;
+    state.status = 'fulfilled';
+  }
+  function reject(error) {
+    if (globalThis[key] !== state) return;
+    state.error = String(error && error.message || error);
+    state.status = 'rejected';
+  }
+  try {
+    // Assimilate arbitrary thenables exactly once. Calling this.then
+    // directly would accept a second callback or a nested thenable as the
+    // final value, unlike JavaScript Promise resolution.
+    Promise.resolve(this).then(fulfill, reject);
+  } catch (error) { reject(error); }
+  return true;
+}`;
 
 /**
  * Create the shared PluginContext evaluator policy. The raw primitive above
@@ -68,7 +130,79 @@ export function createAppEvaluator(
     if (options?.deadline !== undefined && Date.now() >= options.deadline) {
       throw new Error(`App evaluation timed out after ${options.timeout ?? 10_000}ms`);
     }
-    return evaluateAppScript(cdp, expression, options);
+    const timeout = options?.deadline === undefined
+      ? options?.timeout
+      : Math.min(options.timeout ?? 10_000, Math.max(1, options.deadline - Date.now()));
+    return evaluateAppScript(cdp, expression, { ...options, timeout });
+  };
+
+  const evaluateScript = async (
+    expression: string,
+    options?: { timeout?: number; deadline?: number; objectGroup?: string },
+  ): Promise<AppEvaluationCompletion> => {
+    await lifecycle.ensureConnected();
+    if (options?.deadline !== undefined && Date.now() >= options.deadline) {
+      throw new Error(`App evaluation timed out after ${options.timeout ?? 10_000}ms`);
+    }
+    const timeout = options?.deadline === undefined
+      ? options?.timeout
+      : Math.min(options.timeout ?? 10_000, Math.max(1, options.deadline - Date.now()));
+    return evaluateAppScriptCompletion(cdp, expression, { timeout, objectGroup: options?.objectGroup });
+  };
+
+  const settleRemote = async (
+    objectId: string,
+    mailboxKey: string,
+    options: { timeout?: number; deadline: number },
+  ): Promise<boolean> => {
+    const remaining = Math.max(1, options.deadline - Date.now());
+    let settled = false;
+    let released = false;
+    try {
+      const result = (await cdp.send(
+        'Runtime.callFunctionOn',
+        {
+          objectId,
+          functionDeclaration: SETTLE_REMOTE_FUNCTION,
+          arguments: [{ value: mailboxKey }],
+          returnByValue: true,
+        },
+        { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
+      )) as Record<string, unknown>;
+      if (result.exceptionDetails) {
+        throw new Error(
+          extractCDPExceptionMessage(
+            result.exceptionDetails as Record<string, unknown>,
+          ),
+        );
+      }
+      settled = ((result.result as Record<string, unknown> | undefined)?.value !== false);
+    } finally {
+      // The completion handle is only needed while its settlement callback is
+      // being attached. Releasing it avoids retaining every awaited Promise.
+      try {
+        await cdp.send(
+          'Runtime.releaseObject',
+          { objectId },
+          { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
+        );
+        released = true;
+      } catch {
+        // The object group cleanup in awaitAppResult remains the fallback.
+      }
+    }
+    return settled && released;
+  };
+
+  const releaseObjectGroup = async (
+    objectGroup: string,
+    options: { timeout?: number },
+  ): Promise<void> => {
+    await cdp.send(
+      'Runtime.releaseObjectGroup',
+      { objectGroup },
+      { timeoutMs: options.timeout ?? 500 },
+    );
   };
 
   async function recoverTransport(): Promise<void> {
@@ -100,7 +234,12 @@ export function createAppEvaluator(
         rawEvaluate,
         expression,
         options.timeout ?? 10_000,
-        { pollEvaluate: retryMailboxRead },
+        {
+          pollEvaluate: retryMailboxRead,
+          evaluateScript,
+          settleRemote,
+          releaseObjectGroup,
+        },
       );
     }
 
