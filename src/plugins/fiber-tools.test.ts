@@ -430,6 +430,9 @@ describe('fiber read tools', () => {
           ? { value: 'ready', onSubmitEditing: () => { submitted = true; } }
           : {},
       );
+      if (depth === 255) {
+        child.stateNode = { canonical: { publicInstance: { isFocused: () => true } } };
+      }
       append(current, child);
       current = child;
     }
