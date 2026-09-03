@@ -16,11 +16,63 @@ async function harness(runtime: Record<string, unknown>) {
   const tools = new Map<string, RegisteredTool>();
   const timeouts: Array<number | undefined> = [];
   const appGlobal = vm.createContext({ ...runtime, setTimeout, clearTimeout });
+  let nextObjectId = 0;
+  const remoteObjects = new Map<string, { value: unknown; group?: string }>();
   const evaluate = createAppEvaluator({
-    send: async (_method, params) => {
-      const result = new vm.Script(String(params?.expression)).runInContext(appGlobal);
-      // Hermes serializes promises instead of honoring CDP awaitPromise.
-      return { result: { value: result === undefined ? undefined : JSON.parse(JSON.stringify(result)) } };
+    send: async (method, params) => {
+      const actualParams = params ?? {};
+      if (method === 'Runtime.evaluate') {
+        const result = new vm.Script(String(actualParams.expression)).runInContext(appGlobal);
+        // Model Hermes' Runtime.evaluate behavior: awaitPromise is ignored,
+        // and a non-by-value completion is retained as a remote object. The
+        // production evaluator then attaches settlement to that object with
+        // Runtime.callFunctionOn instead of replaying the user's expression.
+        if (actualParams.returnByValue === false && result !== null &&
+            (typeof result === 'object' || typeof result === 'function')) {
+          const objectId = `remote-${++nextObjectId}`;
+          remoteObjects.set(objectId, {
+            value: result,
+            group: typeof actualParams.objectGroup === 'string'
+              ? actualParams.objectGroup
+              : undefined,
+          });
+          return {
+            result: {
+              type: 'object',
+              ...(typeof (result as { then?: unknown }).then === 'function'
+                ? { subtype: 'promise' }
+                : {}),
+              objectId,
+            },
+          };
+        }
+        return {
+          result: {
+            value: result === undefined ? undefined : JSON.parse(JSON.stringify(result)),
+          },
+        };
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const remote = remoteObjects.get(String(actualParams.objectId));
+        if (!remote) return { result: { value: false } };
+        const fn = new vm.Script(`(${String(actualParams.functionDeclaration)})`)
+          .runInContext(appGlobal) as (...args: unknown[]) => unknown;
+        const args = (actualParams.arguments as Array<{ value: unknown }> | undefined)
+          ?.map((argument) => argument.value) ?? [];
+        const result = fn.call(remote.value, ...args);
+        return { result: { value: result } };
+      }
+      if (method === 'Runtime.releaseObject') {
+        remoteObjects.delete(String(actualParams.objectId));
+        return {};
+      }
+      if (method === 'Runtime.releaseObjectGroup') {
+        for (const [objectId, remote] of remoteObjects) {
+          if (remote.group === actualParams.objectGroup) remoteObjects.delete(objectId);
+        }
+        return {};
+      }
+      throw new Error(`Unexpected CDP method ${method}`);
     },
   }, {
     ensureConnected: async () => {},
