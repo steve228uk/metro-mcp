@@ -9,13 +9,23 @@ type Tool = {
 };
 
 async function createAppOnlyHarness(
-  evaluation: 'success' | 'failure' | 'pre-dispatch' | 'unhandled' | 'fabric-focused' = 'success',
+  evaluation:
+    | 'success'
+    | 'failure'
+    | 'pre-dispatch'
+    | 'unhandled'
+    | 'fabric-focused'
+    | 'paper-focused'
+    | 'fabric-empty'
+    | 'paper-empty'
+    | 'fabric-uncontrolled'
+    | 'paper-uncontrolled' = 'success',
   nativeAvailable = false,
 ) {
   const tools = new Map<string, Tool>();
   let nativeCalls = 0;
   const execFileCalls: Array<{ command: string; args: string[] }> = [];
-  const reactCalls: string[] = [];
+  const reactCalls: Array<{ type: 'submit' | 'change'; value: unknown }> = [];
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
@@ -65,7 +75,7 @@ async function createAppOnlyHarness(
           }));
         }
         if (args[0] === 'ui' && args[1] === '--help') {
-          return Buffer.from('  describe-all\n  tap\n  text\n  swipe\n  button');
+          return Buffer.from('  describe-all\n  tap\n  text\n  key\n  swipe\n  button');
         }
         if (args[0] === 'ui' && args[2] === '--help') {
           return Buffer.from(args[1] === 'button' ? '{HOME}' : '--duration');
@@ -90,18 +100,22 @@ async function createAppOnlyHarness(
         throw new Error('Not connected to Metro. Use list_devices to check connection status.');
       }
       if (evaluation === 'unhandled') return false;
-      if (evaluation === 'fabric-focused') {
+      if (evaluation.endsWith('-focused') || evaluation.endsWith('-empty') || evaluation.endsWith('-uncontrolled')) {
+        const publicInstance = { isFocused: () => true };
+        const fabric = evaluation.startsWith('fabric-');
+        const controlled = !evaluation.endsWith('-uncontrolled');
+        const value = evaluation.endsWith('-empty') ? '' : 'hello';
         const host = {
-          stateNode: { canonical: { publicInstance: { isFocused: () => true } } },
+          stateNode: fabric ? { canonical: { publicInstance } } : publicInstance,
           child: null,
           sibling: null,
         };
         const textInput = {
           type: { displayName: 'TextInput' },
           memoizedProps: {
-            value: 'hello',
-            onSubmitEditing: () => reactCalls.push('submit'),
-            onChangeText: () => reactCalls.push('change'),
+            ...(controlled ? { value } : { defaultValue: value }),
+            onSubmitEditing: (event: unknown) => reactCalls.push({ type: 'submit', value: event }),
+            onChangeText: (text: unknown) => reactCalls.push({ type: 'change', value: text }),
           },
           stateNode: null,
           child: host,
@@ -163,15 +177,43 @@ describe('UI handler actions without native inventory', () => {
     expect(harness.getNativeCalls()).toBe(0);
   });
 
-  test('invokes focused Fabric TextInput key handlers without native inventory', async () => {
-    const harness = await createAppOnlyHarness('fabric-focused');
-    const press = harness.tools.get('press_button')!;
-    for (const button of ['ENTER', 'DELETE'] as const) {
-      expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
-        .toBe(`Pressed ${button}`);
+  test('invokes focused controlled Paper and Fabric key handlers with exact payloads', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      for (const [state, value] of [['focused', 'hello'], ['empty', '']] as const) {
+        const harness = await createAppOnlyHarness(`${renderer}-${state}`);
+        const press = harness.tools.get('press_button')!;
+        for (const button of ['ENTER', 'DELETE'] as const) {
+          expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
+            .toBe(`Pressed ${button}`);
+        }
+        expect(harness.reactCalls).toEqual([
+          { type: 'submit', value: { nativeEvent: { text: value } } },
+          { type: 'change', value: value.slice(0, -1) },
+        ]);
+        expect(harness.getNativeCalls()).toBe(0);
+      }
     }
-    expect(harness.reactCalls).toEqual(['submit', 'change']);
-    expect(harness.getNativeCalls()).toBe(0);
+  });
+
+  test('uses native focused keys for uncontrolled Paper and Fabric inputs', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true);
+      const press = harness.tools.get('press_button')!;
+      for (const button of ['ENTER', 'DELETE'] as const) {
+        const result = await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>);
+        expect(result).toContain('backend=idb');
+        expect(result).toContain('status=handled');
+      }
+      expect(harness.reactCalls).toEqual([]);
+      expect(harness.execFileCalls).toContainEqual({
+        command: 'idb',
+        args: ['ui', 'key', '40', '--udid', 'SIMULATOR123'],
+      });
+      expect(harness.execFileCalls).toContainEqual({
+        command: 'idb',
+        args: ['ui', 'key', '42', '--udid', 'SIMULATOR123'],
+      });
+    }
   });
 
   test('uses the verified Android serial when no focused app handler accepts a key', async () => {

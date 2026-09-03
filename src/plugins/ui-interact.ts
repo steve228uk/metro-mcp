@@ -361,6 +361,10 @@ export const uiInteractPlugin = definePlugin({
               if (handled || metroFiberName(fiber) !== 'TextInput') return;
               var props = fiber.memoizedProps || {};
               if (typeof props[${JSON.stringify(handler)}] !== 'function') return;
+              // Uncontrolled inputs keep their authoritative text natively;
+              // their props.value may be absent or stale, so a synthetic
+              // handler would submit or delete the wrong value.
+              if (typeof props.value !== 'string') return;
               var current = fiber;
               var focused = false;
               var inspected = 0;
@@ -383,9 +387,9 @@ export const uiInteractPlugin = definePlugin({
               }
               if (!focused) return;
               if (${JSON.stringify(button)} === 'ENTER') {
-                props.onSubmitEditing({ nativeEvent: { text: props.value || '' } });
+                props.onSubmitEditing({ nativeEvent: { text: props.value } });
               } else {
-                props.onChangeText(String(props.value || '').slice(0, -1));
+                props.onChangeText(props.value.slice(0, -1));
               }
               handled = true;
               return { prune: true };
