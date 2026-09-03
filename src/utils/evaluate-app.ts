@@ -1,5 +1,8 @@
 import type { CDPConnection, EvalOptions } from '../plugin.js';
-import { extractCDPExceptionMessage } from './cdp.js';
+import {
+  decodeCDPUnserializableValue,
+  extractCDPExceptionMessage,
+} from './cdp.js';
 import {
   awaitAppResult,
   awaitPromiseBeforeDeadline,
@@ -33,21 +36,20 @@ function timeoutError(timeout: number): Error {
   return new Error(`App evaluation timed out after ${timeout}ms`);
 }
 
-function decodeUnserializableValue(value: unknown): unknown {
-  if (value === 'NaN') return Number.NaN;
-  if (value === 'Infinity') return Number.POSITIVE_INFINITY;
-  if (value === '-Infinity') return Number.NEGATIVE_INFINITY;
-  if (value === '-0') return -0;
-  if (typeof value === 'string' && /^-?(?:0|[1-9]\d*)n$/.test(value)) {
-    return BigInt(value.slice(0, -1));
-  }
-  throw new Error('Unsupported CDP unserializable value');
-}
-
 function remoteObjectValue(remote: Record<string, unknown>): unknown {
   return Object.prototype.hasOwnProperty.call(remote, 'unserializableValue')
-    ? decodeUnserializableValue(remote.unserializableValue)
+    ? decodeCDPUnserializableValue(remote.unserializableValue)
     : remote.value;
+}
+
+function boundedRequestTimeout(options?: {
+  timeout?: number;
+  deadline?: number;
+}): number | undefined {
+  if (options?.deadline === undefined) return options?.timeout;
+  const remaining = options.deadline - Date.now();
+  if (remaining <= 0) throw timeoutError(options.timeout ?? 10_000);
+  return Math.min(options.timeout ?? 10_000, Math.max(1, remaining));
 }
 
 async function sendRuntimeEvaluate(
@@ -164,12 +166,7 @@ export function createAppEvaluator(
     options?: EvalOptions,
   ): Promise<unknown> => {
     await lifecycle.ensureConnected();
-    if (options?.deadline !== undefined && Date.now() >= options.deadline) {
-      throw timeoutError(options.timeout ?? 10_000);
-    }
-    const timeout = options?.deadline === undefined
-      ? options?.timeout
-      : Math.min(options.timeout ?? 10_000, Math.max(1, options.deadline - Date.now()));
+    const timeout = boundedRequestTimeout(options);
     return evaluateAppScript(cdp, expression, { ...options, timeout });
   };
 
@@ -190,12 +187,7 @@ export function createAppEvaluator(
     ) {
       throw new Error('App evaluation context changed before source dispatch');
     }
-    if (options?.deadline !== undefined && Date.now() >= options.deadline) {
-      throw timeoutError(options.timeout ?? 10_000);
-    }
-    const timeout = options?.deadline === undefined
-      ? options?.timeout
-      : Math.min(options.timeout ?? 10_000, Math.max(1, options.deadline - Date.now()));
+    const timeout = boundedRequestTimeout(options);
     return evaluateAppScriptCompletion(cdp, expression, { timeout, objectGroup: options?.objectGroup });
   };
 
@@ -204,14 +196,8 @@ export function createAppEvaluator(
     options: { timeout?: number; deadline: number },
   ): Promise<number | undefined> => {
     await lifecycle.ensureConnected();
-    if (Date.now() >= options.deadline) {
-      throw timeoutError(options.timeout ?? 10_000);
-    }
     const generation = lifecycle.getGeneration?.();
-    const timeout = Math.min(
-      options.timeout ?? 10_000,
-      Math.max(1, options.deadline - Date.now()),
-    );
+    const timeout = boundedRequestTimeout(options);
     await evaluateAppScript(cdp, expression, { timeout });
     if (
       generation !== undefined &&

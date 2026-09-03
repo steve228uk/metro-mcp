@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { PluginContext } from '../plugin.js';
+import { decodeCDPUnserializableValue } from './cdp.js';
 
 type Evaluate = PluginContext['evalInApp'];
 
@@ -112,17 +113,6 @@ export interface AwaitAppResultOptions {
   getRuntimeGeneration?: () => number;
   /** Create the mailbox while bracketing the dispatch with generation checks. */
   setupMailbox?: SetupMailbox;
-}
-
-function decodeUnserializableValue(value: unknown): unknown {
-  if (value === 'NaN') return Number.NaN;
-  if (value === 'Infinity') return Number.POSITIVE_INFINITY;
-  if (value === '-Infinity') return Number.NEGATIVE_INFINITY;
-  if (value === '-0') return -0;
-  if (typeof value === 'string' && /^-?(?:0|[1-9]\d*)n$/.test(value)) {
-    return BigInt(value.slice(0, -1));
-  }
-  throw new Error('Unsupported CDP unserializable value');
 }
 
 function serializeCompletionValue(value: unknown): {
@@ -295,7 +285,7 @@ export async function awaitAppResult(
       if (result?.status === 'fulfilled') {
         return result.unserializableValue === undefined
           ? result.value
-          : decodeUnserializableValue(result.unserializableValue);
+          : decodeCDPUnserializableValue(result.unserializableValue);
       }
       if (result?.status === 'rejected') throw new Error(result.error);
       if (!result || result.status !== 'pending') {
