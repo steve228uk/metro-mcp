@@ -75,6 +75,11 @@ async function createHarness(
       handler: config.handler as unknown as RegisteredTool['handler'],
     });
   };
+  // Also works when the screenshot plugin's execFile context API is present.
+  const commandStubs = {
+    exec: async () => '',
+    execFile: async () => Buffer.alloc(0),
+  };
   const ctx: PluginContext = {
     cdp: {
       on: () => {},
@@ -91,7 +96,7 @@ async function createHarness(
     config: {},
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
     metro: { host: 'localhost', port: 8081, fetch: async () => new Response() },
-    exec: async () => '',
+    ...commandStubs,
     format: {
       summarize: () => '',
       compact: (value: unknown) => JSON.stringify(value),
@@ -103,7 +108,11 @@ async function createHarness(
         'globalThis',
         `return ${expression};`,
       ) as (globalObject: Record<string, unknown>) => unknown;
-      return evaluate(runtime);
+      // Mirror returnByValue without assuming CDP awaits an app's JS Promise.
+      const result = evaluate(runtime);
+      return result === undefined
+        ? undefined
+        : JSON.parse(JSON.stringify(result));
     },
     getActiveDeviceKey: () => 'device',
     getActiveDeviceName: () => 'Device',
