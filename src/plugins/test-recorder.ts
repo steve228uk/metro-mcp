@@ -29,6 +29,20 @@ const CURRENT_ROUTE_JS = `
 // future props, schedules refreshes for already-mounted props, and is followed
 // by a bounded readiness scan. Capture is enabled only after that scan succeeds,
 // so the first interaction after start_test_recording returns cannot be missed.
+const RECORDING_HANDLERS = [
+  'onPress', 'onLongPress', 'onChangeText', 'onSubmitEditing',
+  'onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd',
+];
+const SCROLLABLE_PROPS_JS = `
+  function isScrollable(props) {
+    return 'scrollEventThrottle' in props || 'extraScrollHeight' in props ||
+      'showsVerticalScrollIndicator' in props || 'showsHorizontalScrollIndicator' in props ||
+      'keyboardShouldPersistTaps' in props || 'keyboardDismissMode' in props ||
+      'scrollEnabled' in props || typeof props.onScrollBeginDrag === 'function' ||
+      typeof props.onScrollEndDrag === 'function';
+  }
+`;
+
 const START_RECORDING_JS = `
 (function() {
   var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
@@ -54,10 +68,7 @@ const START_RECORDING_JS = `
 
   ${GET_ROUTE_FUNC_JS}
 
-  var HANDLERS = [
-    'onPress', 'onLongPress', 'onChangeText', 'onSubmitEditing',
-    'onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'
-  ];
+  var HANDLERS = ${JSON.stringify(RECORDING_HANDLERS)};
 
   function isWrapped(fn) {
     return typeof fn === 'function' && fn.__mcpRecSession === state.sessionId;
@@ -86,13 +97,7 @@ const START_RECORDING_JS = `
     }
   }
 
-  function isScrollable(obj) {
-    return 'scrollEventThrottle' in obj || 'extraScrollHeight' in obj ||
-      'showsVerticalScrollIndicator' in obj || 'showsHorizontalScrollIndicator' in obj ||
-      'keyboardShouldPersistTaps' in obj || 'keyboardDismissMode' in obj ||
-      'scrollEnabled' in obj || typeof obj.onScrollBeginDrag === 'function' ||
-      typeof obj.onScrollEndDrag === 'function';
-  }
+  ${SCROLLABLE_PROPS_JS}
 
   function wrapProps(obj) {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
@@ -175,52 +180,6 @@ const START_RECORDING_JS = `
     return origFreeze.call(this, obj);
   };
 
-  // Already-mounted memoizedProps are usually frozen. Ask React to render
-  // those fibers again so Object.freeze sees fresh mutable props. The shared
-  // bounded walker keeps this initialization finite even for pathological
-  // component trees.
-  ${FIBER_WALKER_JS}
-  metroWalkFibers({ maxDepth: 600, maxNodes: 5000 }, function(fiber) {
-    var props = fiber && fiber.memoizedProps;
-    if (!props || typeof props !== 'object') return;
-    var needsRefresh = false;
-    for (var i = 0; i < HANDLERS.length; i++) {
-      if (typeof props[HANDLERS[i]] === 'function' && !isWrapped(props[HANDLERS[i]])) {
-        needsRefresh = true;
-        break;
-      }
-    }
-    var scrollable = 'scrollEventThrottle' in props || 'extraScrollHeight' in props ||
-      'showsVerticalScrollIndicator' in props || 'showsHorizontalScrollIndicator' in props ||
-      'keyboardShouldPersistTaps' in props || 'keyboardDismissMode' in props ||
-      'scrollEnabled' in props || typeof props.onScrollBeginDrag === 'function' ||
-      typeof props.onScrollEndDrag === 'function';
-    if (scrollable) {
-      var scrollNames = ['onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'];
-      for (var scrollIndex = 0; scrollIndex < scrollNames.length; scrollIndex++) {
-        if (!isWrapped(props[scrollNames[scrollIndex]])) { needsRefresh = true; break; }
-      }
-    }
-    if (!needsRefresh) return;
-    var context = arguments[1] || {};
-    var renderer = context.renderer || null;
-    var refreshFiber = fiber;
-    while (refreshFiber && (!refreshFiber.stateNode || typeof refreshFiber.stateNode.forceUpdate !== 'function'))
-      refreshFiber = refreshFiber.return;
-    if (refreshFiber && refreshFiber.stateNode && typeof refreshFiber.stateNode.forceUpdate === 'function') {
-      try { refreshFiber.stateNode.forceUpdate(); return; } catch (_) {}
-    }
-    if (renderer && typeof renderer.overrideProps === 'function') {
-      try {
-        renderer.overrideProps(fiber, ['__mcpRecRefresh'], state.sessionId);
-        // React DevTools schedules the update through pendingProps. Some
-        // renderers do not call Object.freeze again for this path, so patch
-        // the mutable pending copy as part of the same refresh operation.
-        if (fiber.pendingProps && typeof fiber.pendingProps === 'object') wrapProps(fiber.pendingProps);
-      } catch (_) {}
-    }
-  });
-
   // ── Track navigation events on every React commit ───────────────────────────
   var origCommit = hook.onCommitFiberRoot;
   var commitWrapper = function(id, root) {
@@ -243,10 +202,16 @@ const START_RECORDING_JS = `
     state.ready = false;
     if (hook.onCommitFiberRoot === commitWrapper) {
       var predecessor = origCommit;
-      // If a profiler that preceded us has already stopped, remove its
-      // inactive wrapper as well once our own wrapper is removed.
-      while (predecessor && predecessor.__mcpProfilerState && !predecessor.__mcpProfilerState.active)
-        predecessor = predecessor.__mcpProfilerPrevious;
+      var seen = new Set();
+      while (predecessor) {
+        if (seen.has(predecessor) || seen.size >= 1000) { predecessor = undefined; break; }
+        seen.add(predecessor);
+        if (predecessor.__mcpRecState && !predecessor.__mcpRecState.active)
+          predecessor = predecessor.__mcpRecPrevious;
+        else if (predecessor.__mcpProfilerState && !predecessor.__mcpProfilerState.active)
+          predecessor = predecessor.__mcpProfilerPrevious;
+        else break;
+      }
       hook.onCommitFiberRoot = predecessor;
     }
     if (Object.freeze === freezeWrapper) Object.freeze = origFreeze;
@@ -258,6 +223,54 @@ const START_RECORDING_JS = `
   };
   var freezeWrapper = Object.freeze;
   globalThis.__METRO_MCP_REC_CLEANUP__.origFreeze = origFreeze;
+
+  // Already-mounted memoizedProps are usually frozen. Ask React to render
+  // those fibers again so Object.freeze sees fresh mutable props. The shared
+  // bounded walker keeps this initialization finite even for pathological
+  // component trees.
+  ${FIBER_WALKER_JS}
+  // An explicit empty navigation state disables pruning: every mounted
+  // scene must be instrumented before it can later become focused.
+  metroWalkFibers({ maxDepth: 600, maxNodes: 5000 }, function(fiber) {
+    var props = fiber && fiber.memoizedProps;
+    if (!props || typeof props !== 'object') return;
+    var needsRefresh = false;
+    for (var i = 0; i < HANDLERS.length; i++) {
+      if (typeof props[HANDLERS[i]] === 'function' && !isWrapped(props[HANDLERS[i]])) {
+        needsRefresh = true;
+        break;
+      }
+    }
+    if (isScrollable(props)) {
+      var scrollNames = ['onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'];
+      for (var scrollIndex = 0; scrollIndex < scrollNames.length; scrollIndex++) {
+        if (!isWrapped(props[scrollNames[scrollIndex]])) { needsRefresh = true; break; }
+      }
+    }
+    if (!needsRefresh) return;
+    var context = arguments[1] || {};
+    var renderer = context.renderer || null;
+    var refreshFiber = fiber;
+    var visitedAncestors = new Set();
+    while (refreshFiber && (!refreshFiber.stateNode || typeof refreshFiber.stateNode.forceUpdate !== 'function')) {
+      if (visitedAncestors.has(refreshFiber) || visitedAncestors.size >= 600) { refreshFiber = null; break; }
+      visitedAncestors.add(refreshFiber);
+      refreshFiber = refreshFiber.return;
+    }
+    if (renderer && typeof renderer.overrideProps === 'function') {
+      try {
+        renderer.overrideProps(fiber, ['__mcpRecRefresh'], state.sessionId);
+        // React DevTools schedules the update through pendingProps. Some
+        // renderers do not call Object.freeze again for this path, so patch
+        // the mutable pending copy as part of the same refresh operation.
+        if (fiber.pendingProps && typeof fiber.pendingProps === 'object') wrapProps(fiber.pendingProps);
+      } catch (_) {}
+    }
+    if (refreshFiber && refreshFiber.stateNode && typeof refreshFiber.stateNode.forceUpdate === 'function') {
+      try { refreshFiber.stateNode.forceUpdate(); } catch (_) {}
+    }
+  }, { routes: [] });
+
   return true;
 })()
 `;
@@ -265,19 +278,10 @@ const START_RECORDING_JS = `
 const RECORDING_READINESS_JS = buildFiberReadExpression(`
   var state = globalThis.__METRO_MCP_REC_STATE__;
   if (!state) return { ready: false, error: 'no-session' };
-  var handlers = [
-    'onPress', 'onLongPress', 'onChangeText', 'onSubmitEditing',
-    'onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'
-  ];
+  var handlers = ${JSON.stringify(RECORDING_HANDLERS)};
   var handlerCount = 0;
   var unwrapped = [];
-  function isScrollable(props) {
-    return 'scrollEventThrottle' in props || 'extraScrollHeight' in props ||
-      'showsVerticalScrollIndicator' in props || 'showsHorizontalScrollIndicator' in props ||
-      'keyboardShouldPersistTaps' in props || 'keyboardDismissMode' in props ||
-      'scrollEnabled' in props || typeof props.onScrollBeginDrag === 'function' ||
-      typeof props.onScrollEndDrag === 'function';
-  }
+  ${SCROLLABLE_PROPS_JS}
   var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber) {
     var props = fiber && fiber.memoizedProps;
     if (!props || typeof props !== 'object') return;
@@ -296,7 +300,7 @@ const RECORDING_READINESS_JS = buildFiberReadExpression(`
           unwrapped.push(scrollName);
       }
     }
-  });
+  }, { routes: [] });
   return {
     ready: traversal.complete && unwrapped.length === 0,
     handlerCount: handlerCount,
@@ -502,16 +506,7 @@ export const testRecorderPlugin = definePlugin({
       annotations: { readOnlyHint: false, idempotentHint: false },
       parameters: z.object({}),
       handler: async () => {
-        // Cleanup injection
-        await ctx.evalInApp(
-          `(function(){
-            if (globalThis.__METRO_MCP_REC_CLEANUP__) {
-              globalThis.__METRO_MCP_REC_CLEANUP__();
-              delete globalThis.__METRO_MCP_REC_CLEANUP__;
-            }
-          })()`,
-          { timeout: 3000 }
-        ).catch(() => {});
+        await ctx.evalInApp(CLEANUP_RECORDING_JS, { timeout: 3000 }).catch(() => {});
 
         // Retrieve events
         const raw = await ctx.evalInApp(

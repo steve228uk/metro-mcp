@@ -90,6 +90,20 @@ function appWithoutFiberRefresh() {
     var leafWithoutRefresh = originalRoot;
     while (leafWithoutRefresh.child) leafWithoutRefresh = leafWithoutRefresh.child;
     leafWithoutRefresh.stateNode = { forceUpdate: function() {} };
+    hook.renderers.get(12).overrideProps = null;
+  `, app);
+  return app;
+}
+
+function appWithNoopAncestorAndTargetRefresh() {
+  const app = appWithDeepButton();
+  vm.runInContext(`
+    var target = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+    while (target.child) target = target.child;
+    target.stateNode = null;
+    var ancestor = target.return;
+    while (ancestor && !ancestor.return) ancestor = ancestor.return;
+    ancestor.stateNode = { forceUpdate: function() {} };
   `, app);
   return app;
 }
@@ -147,6 +161,57 @@ async function createHarness(app: Record<string, unknown>, plugins: PluginDefini
 }
 
 describe('test recorder readiness', () => {
+  test('wraps frozen handlers in mounted inactive scenes before they become focused', async () => {
+    const app = appWithDeepButton();
+    vm.runInContext(`
+      var navigationState = { index: 0, routes: [{ key: 'a', name: 'A' }, { key: 'b', name: 'B' }] };
+      globalThis.__METRO_MCP_NAV_REF__ = { getRootState: function() { return navigationState; } };
+      var inactiveLeaf = { type: 'Button', memoizedProps: Object.freeze({ testID: 'inactive-button', onPress: function() { handlerCalls++; } }) };
+      var sceneB = { type: { name: 'SceneView' }, memoizedProps: { route: navigationState.routes[1] }, child: inactiveLeaf };
+      var sceneA = { type: { name: 'SceneView' }, memoizedProps: { route: navigationState.routes[0] }, child: root, sibling: sceneB };
+      var navRoot = { type: 'Navigator', memoizedProps: { state: navigationState }, child: sceneA };
+      hook.getFiberRoots = function(id) { return id === 12 ? new Set([{ current: navRoot }]) : new Set(); };
+    `, app);
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext('navigationState.index = 1; inactiveLeaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('handlerCalls', app)).toBe(1);
+  });
+
+  test('removes inactive recorder and profiler predecessors after an interleaved restart', async () => {
+    const app = appWithDeepButton();
+    const originalHook = vm.runInContext('hook.onCommitFiberRoot', app);
+    const call = await createHarness(app, [testRecorderPlugin, profilerPlugin]);
+    await call('start_test_recording');
+    await call('start_profiling');
+    await call('start_test_recording');
+    await call('stop_profiling');
+    await call('stop_test_recording');
+    expect(vm.runInContext('hook.onCommitFiberRoot', app)).toBe(originalHook);
+  });
+
+  test('bounds cyclic ancestor refresh searches and still instruments through the renderer', async () => {
+    const app = appWithDeepButton();
+    vm.runInContext('leaf.stateNode = null; leaf.return = leaf;', app);
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext('leaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+  });
+
+  test('restores instrumentation when the initial mounted-props scan throws', async () => {
+    const app = appWithDeepButton();
+    const originalFreeze = vm.runInContext('Object.freeze', app);
+    const originalCommit = vm.runInContext('hook.onCommitFiberRoot', app);
+    vm.runInContext(`Object.defineProperty(leaf, 'memoizedProps', { get: function() { throw new Error('props unavailable'); } })`, app);
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(String(await call('start_test_recording'))).toContain('Could not inject recording hooks');
+    expect(vm.runInContext('Object.freeze', app)).toBe(originalFreeze);
+    expect(vm.runInContext('hook.onCommitFiberRoot', app)).toBe(originalCommit);
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
+  });
+
   test('refreshes frozen props through depth 255 before enabling capture', async () => {
     const app = appWithDeepButton();
     const call = await createHarness(app, [testRecorderPlugin]);
@@ -159,6 +224,14 @@ describe('test recorder readiness', () => {
     (leaf as { memoizedProps: { onPress: () => void } }).memoizedProps.onPress();
     expect(await call('stop_test_recording')).toContain('1 tap');
     expect(vm.runInContext('handlerCalls', app)).toBe(1);
+  });
+
+  test('uses target overrideProps when an ancestor forceUpdate is a no-op', async () => {
+    const app = appWithNoopAncestorAndTargetRefresh();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext('leaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
   });
 
   test('keeps recorder and profiler commit hooks chained in either stop order', async () => {

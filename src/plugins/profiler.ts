@@ -374,8 +374,16 @@ const DEVTOOLS_STOP_EXPR = `(function() {
   // the newer hook intact in the other case.
   if (hook && hook.onCommitFiberRoot === profiler.wrapper) {
     var predecessor = profiler.orig;
-    while (predecessor && predecessor.__mcpRecState && !predecessor.__mcpRecState.active)
-      predecessor = predecessor.__mcpRecPrevious;
+    var seen = new Set();
+    while (predecessor) {
+      if (seen.has(predecessor) || seen.size >= 1000) { predecessor = undefined; break; }
+      seen.add(predecessor);
+      if (predecessor.__mcpRecState && !predecessor.__mcpRecState.active)
+        predecessor = predecessor.__mcpRecPrevious;
+      else if (predecessor.__mcpProfilerState && !predecessor.__mcpProfilerState.active)
+        predecessor = predecessor.__mcpProfilerPrevious;
+      else break;
+    }
     hook.onCommitFiberRoot = predecessor;
   }
   var data = profiler.commits.slice();
