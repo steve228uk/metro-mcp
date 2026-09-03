@@ -229,14 +229,12 @@ describe('UI handler actions without native inventory', () => {
         expect(result).toContain('status=handled');
       }
       expect(harness.reactCalls).toEqual([]);
-      expect(harness.execFileCalls).toContainEqual({
-        command: 'adb',
-        args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '66'],
-      });
-      expect(harness.execFileCalls).toContainEqual({
-        command: 'adb',
-        args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '67'],
-      });
+      expect(harness.execFileCalls.filter(({ command, args }) =>
+        command === 'adb' && args[4] === 'keyevent',
+      )).toEqual([
+        { command: 'adb', args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '66'] },
+        { command: 'adb', args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '67'] },
+      ]);
     }
   });
 
