@@ -7,14 +7,7 @@ import {
   MAX_FIBER_DEPTH,
   MAX_FIBER_NODES,
 } from '../utils/fiber.js';
-
-const CURRENT_ROUTE_JS = `(function() {
-  try {
-    var n = globalThis.__METRO_MCP_NAV_REF__;
-    if (n && n.getCurrentRoute) { var r = n.getCurrentRoute(); return r ? r.name : null; }
-  } catch(e) {}
-  return null;
-})()`;
+import { readFocusedRoute } from '../utils/navigation.js';
 
 export const automationPlugin = definePlugin({
   name: 'automation',
@@ -137,15 +130,21 @@ export const automationPlugin = definePlugin({
         const pollInterval = 300;
         while (Date.now() - start < timeout) {
           try {
-            const current = await ctx.evalInApp(CURRENT_ROUTE_JS);
-            if (current === routeName) {
+            const current = await readFocusedRoute(
+              ctx.evalInApp,
+              Math.max(1, timeout - (Date.now() - start)),
+            );
+            if (current?.name === routeName) {
               return { route: routeName, elapsedMs: Date.now() - start };
             }
           } catch {
             // keep polling
           }
           await sendProgress?.(Date.now() - start, timeout, `Waiting for route "${routeName}"…`);
-          await new Promise<void>((r) => setTimeout(r, pollInterval));
+          const remaining = timeout - (Date.now() - start);
+          if (remaining > 0) {
+            await new Promise<void>((r) => setTimeout(r, Math.min(pollInterval, remaining)));
+          }
         }
         throw new Error(
           `Timed out after ${timeout}ms waiting for route "${routeName}". ` +

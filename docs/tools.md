@@ -142,6 +142,9 @@ All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB
 
 - **`get_navigation_state`** — Full React Navigation / Expo Router state.
 - **`get_current_route`** — Currently focused route name and params.
+- **`wait_for_navigation`** — Wait for a focused route by name (up to the supplied timeout). Uses
+  the same SDK, navigation ref, Expo state, and bounded Fiber discovery as `get_current_route`,
+  including nested navigators. It also succeeds when the requested route is already focused.
 - **`get_route_history`** — Navigation back stack.
 - **`list_routes`** — All registered route names.
 
