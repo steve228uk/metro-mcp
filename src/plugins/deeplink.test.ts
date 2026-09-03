@@ -155,6 +155,24 @@ describe('list_url_schemes', () => {
       args: ['-s', 'emulator-2', 'shell', 'pm', 'dump', 'com.example.android'],
     });
   });
+
+  test('uses an explicit Android platform when the connected target is iOS', async () => {
+    const harness = createHarness({
+      androidDump: 'IntentFilter:\n  scheme:\n    Scheme: "android-example"\n',
+      androidInventory: 'List of devices attached\nemulator-2\tdevice model:Pixel_8\n',
+    });
+    const tool = await harness.setup();
+
+    expect(await call(tool, {
+      platform: 'android',
+      bundleId: 'com.example.android',
+    })).toContain('Scheme: "android-example"');
+    expect(harness.calls).toContainEqual({
+      command: 'adb',
+      args: ['-s', 'emulator-2', 'shell', 'pm', 'dump', 'com.example.android'],
+    });
+    expect(harness.calls.some(({ command }) => command === 'xcrun')).toBe(false);
+  });
 });
 
 test('extractAndroidSchemeDump preserves matching lines and their context', () => {

@@ -118,11 +118,12 @@ export const deeplinkPlugin = definePlugin({
       description: 'List URL schemes registered by an installed iOS app or Android package.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
+        platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
         bundleId: z.string().optional().describe('Bundle ID to check (auto-detected if not provided)'),
       }),
-      handler: async ({ bundleId }) => {
+      handler: async ({ platform, bundleId }) => {
         const targetInfo = ctx.cdp.getTarget();
-        const target = await resolveTarget('auto');
+        const target = await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
 
         const requestedBundleId = bundleId?.trim() || targetInfo?.appId?.trim();
