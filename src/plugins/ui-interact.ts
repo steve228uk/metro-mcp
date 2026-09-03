@@ -492,7 +492,11 @@ export const uiInteractPlugin = definePlugin({
                   } catch (e) {}
                   current = current.child;
                 }
-                if (name === 'TextInput' && focused && typeof props[handlerName] === 'function') target = fiber;
+                // Only synthesize key events for controlled inputs. Uncontrolled
+                // inputs have no current value to preserve; let the native
+                // backend deliver the key event instead.
+                if (name === 'TextInput' && focused && typeof props.value === 'string' &&
+                  typeof props[handlerName] === 'function') target = fiber;
                 if (!target) {
                   if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
                   if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
@@ -501,9 +505,9 @@ export const uiInteractPlugin = definePlugin({
               if (!target) return false;
               var targetProps = target.memoizedProps || {};
               if (handlerName === 'onSubmitEditing') {
-                targetProps.onSubmitEditing({ nativeEvent: { text: targetProps.value || '' } });
+                targetProps.onSubmitEditing({ nativeEvent: { text: targetProps.value } });
               } else {
-                var val = (targetProps.value || '').slice(0, -1);
+                var val = targetProps.value.slice(0, -1);
                 targetProps.onChangeText(val);
               }
               return true;

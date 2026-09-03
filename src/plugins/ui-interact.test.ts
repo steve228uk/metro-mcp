@@ -9,14 +9,24 @@ type Tool = {
 };
 
 async function createAppOnlyHarness(
-  evaluation: 'success' | 'failure' | 'pre-dispatch' | 'unhandled' | 'fabric-focused' = 'success',
+  evaluation:
+    | 'success'
+    | 'failure'
+    | 'pre-dispatch'
+    | 'unhandled'
+    | 'fabric-focused'
+    | 'paper-focused'
+    | 'fabric-empty'
+    | 'paper-empty'
+    | 'fabric-uncontrolled'
+    | 'paper-uncontrolled' = 'success',
   nativeAvailable = false,
 ) {
   const tools = new Map<string, Tool>();
   let nativeCalls = 0;
   const evaluations: string[] = [];
   const execCommands: string[] = [];
-  const reactCalls: string[] = [];
+  const reactCalls: Array<{ type: 'submit' | 'change'; value: unknown }> = [];
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
@@ -66,18 +76,22 @@ async function createAppOnlyHarness(
         throw new Error('Not connected to Metro. Use list_devices to check connection status.');
       }
       if (evaluation === 'unhandled') return false;
-      if (evaluation === 'fabric-focused') {
+      if (evaluation.endsWith('-focused') || evaluation.endsWith('-empty') || evaluation.endsWith('-uncontrolled')) {
+        const publicInstance = { isFocused: () => true };
+        const fabric = evaluation.startsWith('fabric-');
+        const controlled = !evaluation.endsWith('-uncontrolled');
+        const value = evaluation.endsWith('-empty') ? '' : 'hello';
         const host = {
-          stateNode: { canonical: { publicInstance: { isFocused: () => true } } },
+          stateNode: fabric ? { canonical: { publicInstance } } : publicInstance,
           child: null,
           sibling: null,
         };
         const textInput = {
           type: { displayName: 'TextInput' },
           memoizedProps: {
-            value: 'hello',
-            onSubmitEditing: () => reactCalls.push('submit'),
-            onChangeText: () => reactCalls.push('change'),
+            ...(controlled ? { value } : { defaultValue: value }),
+            onSubmitEditing: (event: unknown) => reactCalls.push({ type: 'submit', value: event }),
+            onChangeText: (text: unknown) => reactCalls.push({ type: 'change', value: text }),
           },
           stateNode: null,
           child: host,
@@ -160,8 +174,38 @@ describe('UI handler actions without native inventory', () => {
       expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
         .toBe(`Pressed ${button}`);
     }
-    expect(harness.reactCalls).toEqual(['submit', 'change']);
+    expect(harness.reactCalls).toEqual([
+      { type: 'submit', value: { nativeEvent: { text: 'hello' } } },
+      { type: 'change', value: 'hell' },
+    ]);
     expect(harness.getNativeCalls()).toBe(0);
+  });
+
+  test('invokes controlled Paper and Fabric handlers with exact empty payloads', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await createAppOnlyHarness(`${renderer}-empty`);
+      const press = harness.tools.get('press_button')!;
+      for (const button of ['ENTER', 'DELETE'] as const) {
+        expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
+          .toBe(`Pressed ${button}`);
+      }
+      expect(harness.reactCalls).toEqual([
+        { type: 'submit', value: { nativeEvent: { text: '' } } },
+        { type: 'change', value: '' },
+      ]);
+      expect(harness.getNativeCalls()).toBe(0);
+    }
+  });
+
+  test('leaves uncontrolled Paper and Fabric inputs for native handling', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true);
+      const press = harness.tools.get('press_button')!;
+      const result = await press.handler(press.parameters.parse({ button: 'ENTER', platform: 'ios' }) as Record<string, unknown>);
+      expect(result).toBe('Pressed ENTER');
+      expect(harness.reactCalls).toEqual([]);
+      expect(harness.getNativeCalls()).toBeGreaterThan(0);
+    }
   });
 
   test('does not replay a possibly dispatched action after a CDP rejection', async () => {
