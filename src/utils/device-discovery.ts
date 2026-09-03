@@ -237,7 +237,8 @@ export async function resolveDevice(
       // An opaque Metro logical ID is still evidence that a target is
       // connected. With only one authorized Android device remaining, there
       // is no competing local candidate to choose accidentally.
-      if (targetId(target) && authorized.length === 1) {
+      if (connectedId && authorized.length === 1 &&
+        (!connectedName || nameMatches.length === 1)) {
         const device = authorized[0];
         return { platform: 'android', id: device.id, name: device.model };
       }
@@ -252,7 +253,8 @@ export async function resolveDevice(
       // A connected opaque inspector ID plus one booted simulator is the
       // symmetric iOS case: the missing Android executable cannot hide a
       // competing local Android device.
-      if (targetId(target) && iosResult.value.length === 1) {
+      if (connectedId && iosResult.value.length === 1 &&
+        (!connectedName || nameMatches.length === 1)) {
         return toResolvedIos(iosResult.value[0]);
       }
     }
@@ -316,11 +318,25 @@ export async function resolveDevice(
       `${authorizedAndroid.map((device) => `${device.model ?? device.id} (${device.id})`).join(', ')}.`,
     );
   }
+  // A sole inventory is safe to use when the connected target only exposes an
+  // opaque logical ID. A device name is useful contradiction evidence, while
+  // an unmatched logical ID may simply be an inspector-generated identifier;
+  // exact matches returned above already win.
   if (bootedIos.length > 0) {
+    if (bootedIos.length === 1 && connectedName) {
+      throw new Error(
+        'Connected Metro target does not match the sole available iOS simulator.',
+      );
+    }
     return resolveIosDevice(bootedIos, target);
   }
   if (authorizedAndroid.length > 0) {
     if (authorizedAndroid.length === 1) {
+      if (connectedName) {
+        throw new Error(
+          'Connected Metro target does not match the sole available Android device.',
+        );
+      }
       return { platform: 'android', id: authorizedAndroid[0].id, name: authorizedAndroid[0].model };
     }
     if (authorizedAndroid.length > 1) {
