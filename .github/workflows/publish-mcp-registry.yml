@@ -29,6 +29,7 @@ jobs:
           mv server.tmp.json server.json
 
       - name: Publish to MCP Registry
+        timeout-minutes: 15
         run: |
           ./mcp-publisher login github-oidc
-          ./mcp-publisher publish
+          bash scripts/publish-mcp-registry.sh
