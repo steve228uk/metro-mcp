@@ -482,6 +482,26 @@ describe('native input providers', () => {
     expect(runner.calls).toContainEqual({ command: 'idb', args: ['ui', 'tap', '50', '40', '--udid', 'device-a'] });
   });
 
+  test('reports IDB label discovery failures as not-sent before tap dispatch', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args, ...rest) => {
+      if (command === 'idb' && args[0] === 'ui' && args[1] === 'describe-all' && !args.includes('--help')) {
+        throw new Error('describe-all failed');
+      }
+      return baseExecFile(command, args, ...rest);
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'idb', idbCommand: 'idb' },
+      runner,
+    });
+
+    await expect(controller.tapLabel({ platform: 'ios', id: 'device-a' }, 'Continue')).resolves.toMatchObject({
+      backend: 'idb', status: 'failed', dispatched: false, dispatch: 'not-sent',
+    });
+    expect(runner.calls.some(({ args }) => args[0] === 'ui' && args[1] === 'tap' && !args.includes('--help'))).toBe(false);
+  });
+
   test('does not report a coordinate action as handled when the receipt did not dispatch input', async () => {
     const runner = fakeRunner();
     const client = {

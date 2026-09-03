@@ -394,7 +394,10 @@ export class NativeInputController {
       if (!match.point) return result('idb', 'failed', false, match.ambiguous ? `Element "${label}" is ambiguous` : `Element "${label}" was not found by IDB`);
       return this.idb(target, 'tap', match.point, provider);
     } catch (error) {
-      return result('idb', 'failed', false, error instanceof Error ? error.message : String(error), 'unknown');
+      // The accessibility dump is performed before the tap command. A failed
+      // describe-all therefore cannot have dispatched input and is safe to
+      // report as not-sent for callers deciding whether to retry or fall back.
+      return result('idb', 'failed', false, error instanceof Error ? error.message : String(error), 'not-sent');
     }
   }
 
