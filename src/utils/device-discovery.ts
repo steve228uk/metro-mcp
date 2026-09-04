@@ -364,8 +364,18 @@ export async function resolveDevice(
 }
 
 function isUnavailableToolError(reason: unknown): boolean {
-  return typeof reason === 'object' && reason !== null &&
-    'code' in reason && reason.code === 'ENOENT';
+  if (typeof reason !== 'object' || reason === null) return false;
+  if ('code' in reason && reason.code === 'ENOENT') return true;
+
+  // xcrun can start successfully and still fail because the requested
+  // developer utility is absent. Treat only that precise simctl diagnostic as
+  // unavailable; malformed inventories and other non-zero exits remain
+  // strict so they cannot silently select a different runtime.
+  const error = reason as { message?: unknown; stderr?: unknown };
+  const text = [error.message, error.stderr]
+    .filter((value): value is string => typeof value === 'string')
+    .join('\n');
+  return /xcrun:\s*error:\s*unable to find utility ["']simctl["']/i.test(text);
 }
 
 function findAndroidTarget(
