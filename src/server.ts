@@ -800,6 +800,7 @@ export async function createMetroRuntime(
       },
       format: formatUtils,
       getActiveDeviceKey: () => activeDeviceKey,
+      getRuntimeGeneration: () => runtimeGeneration,
       getActiveDeviceName: () => activeDeviceName,
       notifyResourceUpdated,
     };

@@ -37,6 +37,7 @@ async function createAppOnlyHarness(
   sharedInventoryDeviceId = false,
   unavailablePlatform?: 'ios' | 'android',
   androidStatus: 'device' | 'offline' | 'unauthorized' = 'device',
+  targetChangeAfterInventory?: { id?: string; logicalId?: string; generation?: boolean },
 ) {
   const tools = new Map<string, Tool>();
   let nativeCalls = 0;
@@ -44,15 +45,18 @@ async function createAppOnlyHarness(
   const execCommands: string[] = [];
   const reactCalls: Array<{ type: 'submit' | 'change'; value: unknown }> = [];
   let blurCalls = 0;
+  let runtimeGeneration = 0;
+  let currentTarget = {
+    id: 'metro-target-a',
+    deviceName: 'Connected app',
+    ...(connectedLogicalDeviceId
+      ? { reactNative: { logicalDeviceId: connectedLogicalDeviceId } }
+      : {}),
+  } as Record<string, unknown>;
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
-      getTarget: () => ({
-        deviceName: 'Connected app',
-        ...(connectedLogicalDeviceId
-          ? { reactNative: { logicalDeviceId: connectedLogicalDeviceId } }
-          : {}),
-      } as never),
+      getTarget: () => currentTarget as never,
       send: async () => ({}),
     },
     events: { on: () => {}, off: () => {}, isConnected: () => true },
@@ -97,6 +101,16 @@ async function createAppOnlyHarness(
         const androidId = sharedInventoryDeviceId && connectedLogicalDeviceId
           ? connectedLogicalDeviceId
           : 'emulator-42';
+        if (targetChangeAfterInventory) {
+          currentTarget = {
+            ...currentTarget,
+            ...(targetChangeAfterInventory.id ? { id: targetChangeAfterInventory.id } : {}),
+            ...(targetChangeAfterInventory.logicalId
+              ? { reactNative: { logicalDeviceId: targetChangeAfterInventory.logicalId } }
+              : {}),
+          };
+          if (targetChangeAfterInventory.generation) runtimeGeneration++;
+        }
         return Buffer.from(`List of devices attached\n${androidId}\t${androidStatus} model:Connected_app\n`);
       }
       throw new Error('native inventory unavailable');
@@ -168,6 +182,7 @@ async function createAppOnlyHarness(
       return true;
     },
     getActiveDeviceKey: () => null, getActiveDeviceName: () => null,
+    getRuntimeGeneration: () => runtimeGeneration,
     notifyResourceUpdated: () => {},
   };
   await uiInteractPlugin.setup(ctx);
@@ -549,6 +564,38 @@ describe('UI handler actions without native inventory', () => {
     expect(await tool.handler(tool.parameters.parse({ label: 'Save', platform: 'ios' }) as Record<string, unknown>))
       .toBe('Tapped "Save"');
     expect(harness.evaluations).toHaveLength(1);
+  });
+
+  test('revalidates the Metro target after native inventory before React dispatch', async () => {
+    const harness = await createAppOnlyHarness(
+      'success', true, 'SIMULATOR123', false, undefined, 'device',
+      { id: 'metro-target-b' },
+    );
+    const tool = harness.tools.get('tap_element')!;
+    const result = await tool.handler(tool.parameters.parse({
+      label: 'Save', platform: 'ios',
+    }) as Record<string, unknown>);
+
+    expect(result).toBe('No simulator/emulator detected.');
+    expect(harness.evaluations).toHaveLength(0);
+    expect(harness.execCommands).toHaveLength(0);
+  });
+
+  test('revalidates the runtime generation after native inventory before React dispatch', async () => {
+    const harness = await createAppOnlyHarness(
+      'success', true, 'SIMULATOR123', false, undefined, 'device',
+      { generation: true },
+    );
+    const tool = harness.tools.get('tap_element')!;
+    const result = await tool.handler(tool.parameters.parse({
+      label: 'Save', platform: 'ios',
+    }) as Record<string, unknown>);
+
+    // The native target remains the same, so its fallback is still safe even
+    // though the app runtime generation changed during inventory.
+    expect(result).toBe('Tapped "Save"');
+    expect(harness.evaluations).toHaveLength(0);
+    expect(harness.execCommands).toHaveLength(1);
   });
 
   test('requires the opposite inventory before explicit React-first handling', async () => {
