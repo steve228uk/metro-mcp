@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import vm from 'node:vm';
 import type { z } from 'zod';
-import type { ComponentNode, PluginContext, PluginDefinition } from '../plugin.js';
+import type { ComponentNode, EvalOptions, PluginContext, PluginDefinition } from '../plugin.js';
 import { profilerPlugin } from './profiler.js';
 import { testRecorderPlugin } from './test-recorder.js';
 
@@ -119,7 +119,9 @@ function appWithoutFiberRoots() {
 async function createHarness(
   app: Record<string, unknown>,
   plugins: PluginDefinition[],
-  targetAppIdOrBeforeEval?: string | ((expression: string) => void),
+  targetAppIdOrBeforeEval?:
+    | string
+    | ((expression: string, options?: EvalOptions) => void),
 ): Promise<Runner> {
   const tools = new Map<string, Tool>();
   const resources = new Map<string, () => Promise<string>>();
@@ -146,8 +148,8 @@ async function createHarness(
       summarize: () => '', compact: (value: unknown) => JSON.stringify(value),
       truncate: (value: string) => value, structureOnly: (value: ComponentNode) => value,
     },
-    evalInApp: async (expression) => {
-      beforeEval?.(expression);
+    evalInApp: async (expression, options) => {
+      beforeEval?.(expression, options);
       const value = new vm.Script(expression).runInContext(app as vm.Context);
       return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
     },
@@ -232,6 +234,26 @@ describe('test recorder readiness', () => {
     (leaf as { memoizedProps: { onPress: () => void } }).memoizedProps.onPress();
     expect(await call('stop_test_recording')).toContain('1 tap');
     expect(vm.runInContext('handlerCalls', app)).toBe(1);
+  });
+
+  test('bounds every startup evaluation by one deadline', async () => {
+    const app = appWithDeepButton();
+    const evaluations: Array<{ expression: string; options?: EvalOptions; remaining: number }> = [];
+    const call = await createHarness(app, [testRecorderPlugin], (expression, options) => {
+      if (options?.deadline !== undefined) {
+        evaluations.push({ expression, options, remaining: options.deadline - Date.now() });
+      }
+    });
+
+    expect(await call('start_test_recording')).toContain('Recording started');
+    expect(evaluations.length).toBeGreaterThanOrEqual(4);
+    const deadlines = new Set(evaluations.map(({ options }) => options?.deadline));
+    expect(deadlines.size).toBe(1);
+    for (const { options, remaining } of evaluations) {
+      expect(options?.timeout).toBeGreaterThan(0);
+      expect(options?.timeout).toBeLessThanOrEqual(6000);
+      expect(options?.timeout).toBeLessThanOrEqual(remaining);
+    }
   });
 
   test('uses target overrideProps when an ancestor forceUpdate is a no-op', async () => {
@@ -330,7 +352,7 @@ describe('test recorder readiness', () => {
     });
     const realNow = Date.now;
     let clockReads = 0;
-    Date.now = () => realNow() + (clockReads++ < 2 ? 0 : 7000);
+    Date.now = () => realNow() + (clockReads++ < 5 ? 0 : 7000);
     let result: unknown;
     try {
       result = await call('start_test_recording');
@@ -495,13 +517,16 @@ describe('test recorder readiness', () => {
     expect(JSON.parse(await call.resource('metro://recording/status'))).toMatchObject({ isRecording: false });
   });
 
-  test('fails and cleans up when a commit does not produce wrapped props', async () => {
+  test('does not extend the startup deadline when a commit does not produce wrapped props', async () => {
     const app = appWithoutFiberRefresh();
     const originalCommit = vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app);
-    const call = await createHarness(app, [testRecorderPlugin]);
+    const evaluations: Array<{ expression: string; options?: EvalOptions }> = [];
+    const call = await createHarness(app, [testRecorderPlugin], (expression, options) => {
+      evaluations.push({ expression, options });
+    });
     const realNow = Date.now;
     let clockReads = 0;
-    Date.now = () => realNow() + (clockReads++ === 0 ? 0 : 7000);
+    Date.now = () => realNow() + (clockReads++ < 5 ? 0 : 7000);
     let result: unknown;
     try {
       result = await call('start_test_recording');
@@ -509,6 +534,8 @@ describe('test recorder readiness', () => {
       Date.now = realNow;
     }
     expect(String(result)).toContain('coverage did not become ready');
+    expect(evaluations.filter(({ expression }) => expression.includes('handlerCount'))).toHaveLength(1);
+    expect(evaluations.every(({ options }) => (options?.timeout ?? 0) > 0)).toBe(true);
     expect(vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app)).toBe(originalCommit);
     expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
     expect(vm.runInContext('globalThis.__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
@@ -519,7 +546,7 @@ describe('test recorder readiness', () => {
     const call = await createHarness(app, [testRecorderPlugin]);
     const realNow = Date.now;
     let clockReads = 0;
-    Date.now = () => realNow() + (clockReads++ === 0 ? 0 : 7000);
+    Date.now = () => realNow() + (clockReads++ < 5 ? 0 : 7000);
     let result: unknown;
     try {
       result = await call('start_test_recording');
