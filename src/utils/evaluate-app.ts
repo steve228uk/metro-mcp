@@ -32,6 +32,14 @@ function isTransportError(error: unknown): boolean {
   );
 }
 
+// Metro Bridge uses this exact error when it rejects a request before writing
+// anything to the target. It is safe to retry that request once after
+// connection recovery; errors such as WebSocket closed can follow a request
+// that already ran and must remain one-shot.
+function isDefinitivePreDispatchFailure(error: unknown): boolean {
+  return error instanceof Error && error.message === 'Not connected to CDP target';
+}
+
 function timeoutError(timeout: number): Error {
   return new Error(`App evaluation timed out after ${timeout}ms`);
 }
@@ -166,19 +174,35 @@ const SETTLE_REMOTE_FUNCTION = `function(key) {
 
 /**
  * Create the shared PluginContext evaluator policy. The raw primitive above
- * remains one-shot; only mailbox reads are eligible for reconnect/retry.
+ * remains one-shot after dispatch; a definitive pre-dispatch disconnect may
+ * be recovered once, while mailbox reads also have their safe retry policy.
  */
 export function createAppEvaluator(
   cdp: Pick<CDPConnection, 'send'>,
   lifecycle: AppEvaluationLifecycle,
 ): (expression: string, options?: EvalOptions) => Promise<unknown> {
-  const rawEvaluate = async (
+  const rawEvaluateOnce = async (
     expression: string,
     options?: EvalOptions,
   ): Promise<unknown> => {
     await lifecycle.ensureConnected(options?.deadline);
     const timeout = boundedRequestTimeout(options);
     return evaluateAppScript(cdp, expression, { ...options, timeout });
+  };
+
+  const rawEvaluate = async (
+    expression: string,
+    options?: EvalOptions,
+  ): Promise<unknown> => {
+    try {
+      return await rawEvaluateOnce(expression, options);
+    } catch (error) {
+      if (!isDefinitivePreDispatchFailure(error)) throw error;
+      // The Bridge rejected before writing Runtime.evaluate, so reconnecting
+      // and issuing this one request cannot replay caller code.
+      await recoverTransport(options?.deadline, options?.timeout);
+      return rawEvaluateOnce(expression, options);
+    }
   };
 
   const evaluateScript = async (
@@ -188,36 +212,75 @@ export function createAppEvaluator(
       deadline?: number;
       objectGroup?: string;
       generation?: number;
+      retryMailboxSetup?: (
+        options: { timeout?: number; deadline: number },
+      ) => Promise<number | undefined>;
     },
   ): Promise<AppEvaluationCompletion> => {
-    await lifecycle.ensureConnected(options?.deadline);
-    if (
-      options?.generation !== undefined &&
-      lifecycle.getGeneration &&
-      options.generation !== lifecycle.getGeneration()
-    ) {
-      throw new Error('App evaluation context changed before source dispatch');
+    let sourceGeneration = options?.generation;
+    const evaluateOnce = async (): Promise<AppEvaluationCompletion> => {
+      await lifecycle.ensureConnected(options?.deadline);
+      if (
+        sourceGeneration !== undefined &&
+        lifecycle.getGeneration &&
+        sourceGeneration !== lifecycle.getGeneration()
+      ) {
+        throw new Error('App evaluation context changed before source dispatch');
+      }
+      const timeout = boundedRequestTimeout(options);
+      return evaluateAppScriptCompletion(cdp, expression, { timeout, objectGroup: options?.objectGroup });
+    };
+    try {
+      return await evaluateOnce();
+    } catch (error) {
+      if (!isDefinitivePreDispatchFailure(error)) throw error;
+      await recoverTransport(options?.deadline, options?.timeout);
+      if (options?.retryMailboxSetup) {
+        if (options.deadline === undefined) {
+          throw new Error('App evaluation retry requires a deadline');
+        }
+        sourceGeneration = await options.retryMailboxSetup({
+          timeout: options.timeout,
+          deadline: options.deadline,
+        });
+      }
+      return evaluateOnce();
     }
-    const timeout = boundedRequestTimeout(options);
-    return evaluateAppScriptCompletion(cdp, expression, { timeout, objectGroup: options?.objectGroup });
   };
 
   const setupMailbox = async (
     expression: string,
     options: { timeout?: number; deadline: number },
   ): Promise<number | undefined> => {
-    await lifecycle.ensureConnected(options.deadline);
-    const generation = lifecycle.getGeneration?.();
-    const timeout = boundedRequestTimeout(options);
-    await evaluateAppScript(cdp, expression, { timeout });
-    if (
-      generation !== undefined &&
-      lifecycle.getGeneration &&
-      generation !== lifecycle.getGeneration()
-    ) {
-      throw new Error('App evaluation context changed during mailbox setup');
+    const setupOnce = async (): Promise<number | undefined> => {
+      await lifecycle.ensureConnected(options.deadline);
+      const generation = lifecycle.getGeneration?.();
+      const timeout = boundedRequestTimeout(options);
+      await evaluateAppScript(cdp, expression, { timeout });
+      if (
+        generation !== undefined &&
+        lifecycle.getGeneration &&
+        generation !== lifecycle.getGeneration()
+      ) {
+        throw new Error('App evaluation context changed during mailbox setup');
+      }
+      return generation;
+    };
+
+    try {
+      return await setupOnce();
+    } catch (error) {
+      if (!isTransportError(error)) throw error;
+      // Mailbox setup happens before the caller source is dispatched. A lost
+      // setup response can therefore be retried safely after one bounded
+      // reconnect, even when the first setup may already have installed the
+      // mailbox in the old runtime.
+      await recoverTransport(options.deadline, options.timeout);
+      if (Date.now() >= options.deadline) {
+        throw timeoutError(options.timeout ?? 10_000);
+      }
+      return setupOnce();
     }
-    return generation;
   };
 
   const settleRemote = async (

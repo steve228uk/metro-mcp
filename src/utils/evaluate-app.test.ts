@@ -226,6 +226,120 @@ describe('shared app evaluation policy', () => {
       String(call.params.expression).includes('executionCount'))).toHaveLength(1);
   });
 
+  test('retries an exact pre-dispatch disconnect without replaying a raw script', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    let first = true;
+    let sourceAttempts = 0;
+    transport.send = async (method, params) => {
+      if (first && method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('executionCount')) {
+        first = false;
+        sourceAttempts += 1;
+        throw new Error('Not connected to CDP target');
+      }
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('executionCount')) sourceAttempts += 1;
+      return originalSend(method, params);
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; executionCount;',
+      { awaitPromise: false },
+    )).resolves.toBe(1);
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(sourceAttempts).toBe(2);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('executionCount'))).toHaveLength(1);
+    expect(state.state().reconnectCount).toBe(1);
+  });
+
+  test('does not retry a duration-bearing evaluation timeout after dispatch', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    transport.send = async (method, params) => {
+      const result = await originalSend(method, params);
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('executionCount')) {
+        throw new Error('App evaluation timed out after 30ms');
+      }
+      return result;
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; executionCount;',
+      { awaitPromise: false },
+    )).rejects.toThrow('App evaluation timed out after 30ms');
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(state.state().reconnectCount).toBe(0);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('executionCount'))).toHaveLength(1);
+  });
+
+  test('retries an exact pre-dispatch disconnect before awaited source execution', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    let sourceAttempts = 0;
+    let setupAttempts = 0;
+    let generation = 0;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+        setupAttempts += 1;
+      }
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('executionCount')) {
+        sourceAttempts += 1;
+        if (sourceAttempts === 1) throw new Error('Not connected to CDP target');
+      }
+      return originalSend(method, params);
+    };
+    const base = lifecycle({ reconnect: async () => { generation += 1; } });
+    const state = { ...base, getGeneration: () => generation };
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; Promise.resolve(executionCount);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(1);
+    expect(sourceAttempts).toBe(2);
+    expect(setupAttempts).toBe(2);
+    expect(generation).toBe(1);
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('executionCount'))).toHaveLength(1);
+  });
+
+  test('retries mailbox setup after transport loss before source dispatch', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    let setupAttempts = 0;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+        setupAttempts += 1;
+        if (setupAttempts === 1) throw new Error('WebSocket closed');
+      }
+      return originalSend(method, params);
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; Promise.resolve(executionCount);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(1);
+    expect(setupAttempts).toBe(2);
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(state.state().reconnectCount).toBe(1);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('executionCount'))).toHaveLength(1);
+  });
+
   test('settles hostile Promise rejection reasons instead of timing out', async () => {
     const { transport } = vmTransport();
     const evalInApp = createAppEvaluator(transport, lifecycle());

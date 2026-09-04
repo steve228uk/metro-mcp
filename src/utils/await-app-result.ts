@@ -5,6 +5,15 @@ import { decodeCDPUnserializableValue } from './cdp.js';
 
 type Evaluate = PluginContext['evalInApp'];
 
+type SetupMailbox = (
+  expression: string,
+  options: { timeout?: number; deadline: number },
+) => Promise<number | undefined>;
+
+type RetryMailboxSetup = (
+  options: { timeout?: number; deadline: number },
+) => Promise<number | undefined>;
+
 export type AppEvaluationCompletion =
   | {
       /** Remote object handle for object and Promise completions. */
@@ -24,13 +33,10 @@ type EvaluateScript = (
     deadline?: number;
     objectGroup?: string;
     generation?: number;
+    /** Recreate the mailbox after a safe pre-dispatch source retry. */
+    retryMailboxSetup?: RetryMailboxSetup;
   },
 ) => Promise<AppEvaluationCompletion>;
-
-type SetupMailbox = (
-  expression: string,
-  options: { timeout?: number; deadline: number },
-) => Promise<number | undefined>;
 
 type SettleRemote = (
   objectId: string,
@@ -234,6 +240,9 @@ export async function awaitAppResult(
         deadline,
         objectGroup,
         generation: mailboxGeneration,
+        retryMailboxSetup: options.setupMailbox
+          ? (retryOptions) => options.setupMailbox!(mailboxSetup, retryOptions)
+          : undefined,
       });
       sourceEvaluation.then(
         () => { sourceEvaluationSettled = true; },
