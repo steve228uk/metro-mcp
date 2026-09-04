@@ -66,6 +66,94 @@ describe('native input providers', () => {
     expect(versionCalls[0]?.timeout).toBeLessThanOrEqual(20);
   });
 
+  test('bounds a stalled IDB version probe', async () => {
+    const runner = fakeRunner();
+    const versionCalls: Array<{ timeout?: number }> = [];
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args, options) => {
+      if (command === 'idb' && args.at(-1) === '--version') {
+        versionCalls.push({ timeout: options?.timeout });
+        return new Promise<never>(() => {});
+      }
+      return baseExecFile(command, args, options);
+    };
+
+    const started = Date.now();
+    const providers = await discoverNativeProviders(
+      { config: { nativeBackend: 'idb', idbCommand: 'idb' }, runner },
+      Date.now() + 20,
+    );
+
+    expect(providers[0]).toMatchObject({ available: false });
+    expect(versionCalls).toHaveLength(1);
+    expect(versionCalls[0]?.timeout).toBeGreaterThan(0);
+    expect(versionCalls[0]?.timeout).toBeLessThanOrEqual(20);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test('bounds a stalled IDB help probe after a successful version check', async () => {
+    const runner = fakeRunner();
+    const helpCalls: Array<{ args: string[]; timeout?: number }> = [];
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args, options) => {
+      if (command === 'idb' && args.at(-1) === '--help') {
+        helpCalls.push({ args, timeout: options?.timeout });
+        return new Promise<never>(() => {});
+      }
+      return baseExecFile(command, args, options);
+    };
+
+    const started = Date.now();
+    const providers = await discoverNativeProviders(
+      { config: { nativeBackend: 'idb', idbCommand: 'idb' }, runner },
+      Date.now() + 20,
+    );
+
+    expect(providers[0]).toMatchObject({ available: false });
+    expect(helpCalls).toHaveLength(1);
+    expect(helpCalls[0]?.args).toEqual(['--help']);
+    expect(helpCalls[0]?.timeout).toBeGreaterThan(0);
+    expect(helpCalls[0]?.timeout).toBeLessThanOrEqual(20);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test('dispatches through SimView without probing a stalled IDB installation', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args, options) => {
+      if (command === 'which' && args[0] === 'simview') return Buffer.from('/usr/local/bin/simview');
+      if (command === 'idb' && args.at(-1) === '--version') return new Promise<never>(() => {});
+      return baseExecFile(command, args, options);
+    };
+    const calls: string[] = [];
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'tap'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push(name);
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:simview-first', capabilities: { input: { touch: true } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        return { structuredContent: { accepted: true, inputDispatched: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: 'simview', idbCommand: 'idb' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+      simviewRequestTimeoutMs: 50,
+    });
+
+    const started = Date.now();
+    await expect(controller.tap({ platform: 'ios', id: 'simview-first' }, 1, 2)).resolves.toMatchObject({
+      backend: 'simview', status: 'handled', dispatched: true, dispatch: 'submitted',
+    });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(calls).toContain('tap');
+    expect(runner.calls.some(({ command, args }) => command === 'idb' && args.at(-1) === '--version')).toBe(false);
+    await controller.close();
+  });
+
   test('bounds slow SimView plugin discovery and still dispatches through IDB', async () => {
     const runner = fakeRunner();
     let directoryReads = 0;
@@ -864,6 +952,86 @@ describe('native input providers', () => {
     expect(runner.calls.some(({ args }) => args[0] === 'ui' && args[1] === 'tap' && !args.includes('--help'))).toBe(false);
   });
 
+  test('bounds a stalled IDB accessibility read before label dispatch', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    const timeouts: number[] = [];
+    runner.execFile = async (command, args, options) => {
+      if (command === 'idb' && args[0] === 'ui' && args[1] === 'describe-all' && !args.includes('--help')) {
+        timeouts.push(options?.timeout ?? 0);
+        return new Promise<never>(() => {});
+      }
+      return baseExecFile(command, args, options);
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'idb', idbCommand: 'idb' },
+      runner,
+      simviewRequestTimeoutMs: 20,
+    });
+
+    const started = Date.now();
+    await expect(controller.tapLabel({ platform: 'ios', id: 'stalled-read' }, 'Continue'))
+      .resolves.toMatchObject({ backend: 'idb', status: 'failed', dispatch: 'not-sent' });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0]).toBeGreaterThan(0);
+    expect(timeouts[0]).toBeLessThanOrEqual(20);
+    expect(runner.calls.some(({ args }) => args[0] === 'ui' && args[1] === 'tap' && !args.includes('--help'))).toBe(false);
+  });
+
+  test('bounds a stalled IDB geometry read before directional swipe dispatch', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    const timeouts: number[] = [];
+    runner.execFile = async (command, args, options) => {
+      if (command === 'idb' && args[0] === 'describe' && !args.includes('--help')) {
+        timeouts.push(options?.timeout ?? 0);
+        return new Promise<never>(() => {});
+      }
+      return baseExecFile(command, args, options);
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'idb', idbCommand: 'idb' },
+      runner,
+      simviewRequestTimeoutMs: 20,
+    });
+
+    const started = Date.now();
+    await expect(controller.swipeDirection({ platform: 'ios', id: 'stalled-geometry' }, 'up', 300))
+      .resolves.toMatchObject({ backend: 'none', status: 'unavailable', dispatch: 'not-sent' });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0]).toBeGreaterThan(0);
+    expect(timeouts[0]).toBeLessThanOrEqual(20);
+    expect(runner.calls.some(({ args }) => args[0] === 'ui' && args[1] === 'swipe' && !args.includes('--help'))).toBe(false);
+  });
+
+  test('bounds a stalled IDB action as an uncertain dispatch', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    const timeouts: number[] = [];
+    runner.execFile = async (command, args, options) => {
+      if (command === 'idb' && args[0] === 'ui' && args[1] === 'tap' && !args.includes('--help')) {
+        timeouts.push(options?.timeout ?? 0);
+        return new Promise<never>(() => {});
+      }
+      return baseExecFile(command, args, options);
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'idb', idbCommand: 'idb' },
+      runner,
+      simviewRequestTimeoutMs: 20,
+    });
+
+    const started = Date.now();
+    await expect(controller.tap({ platform: 'ios', id: 'stalled-action' }, 1, 2))
+      .resolves.toMatchObject({ backend: 'idb', status: 'failed', dispatched: false, dispatch: 'unknown' });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0]).toBeGreaterThan(0);
+    expect(timeouts[0]).toBeLessThanOrEqual(20);
+  });
+
   test('does not report a coordinate action as handled when the receipt did not dispatch input', async () => {
     const runner = fakeRunner();
     const client = {
@@ -1241,6 +1409,61 @@ describe('native input providers', () => {
     });
     const response = await controller.tap({ platform: 'ios', id: 'fake-udid' }, 1, 2);
     expect(response).toMatchObject({ backend: 'simview', status: 'failed', dispatched: false, dispatch: 'unknown' });
+    expect(runner.calls.some(({ command, args }) => command === 'idb' && args[0] === 'ui' && args.includes('--udid'))).toBe(false);
+  });
+
+  test('bounds a stalled SimView action and never falls through after dispatch may have started', async () => {
+    const runner = fakeRunner();
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'tap'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:stalled-simview', capabilities: { input: { touch: true } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        if (name === 'tap') return new Promise<never>(() => {});
+        return { structuredContent: { connected: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewRequestTimeoutMs: 20,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    const started = Date.now();
+    await expect(controller.tap({ platform: 'ios', id: 'stalled-simview' }, 1, 2))
+      .resolves.toMatchObject({ backend: 'simview', status: 'failed', dispatched: false, dispatch: 'unknown' });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(runner.calls.some(({ command, args }) => command === 'idb' && args[0] === 'ui' && args.includes('--udid'))).toBe(false);
+  });
+
+  test('bounds a stalled semantic SimView action and never falls through', async () => {
+    const runner = fakeRunner();
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'find_elements', 'tap_element'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:stalled-semantic', capabilities: { input: { touch: true } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        if (name === 'find_elements') return { structuredContent: { matches: [{ ref: 'element:1' }] } };
+        if (name === 'tap_element') return new Promise<never>(() => {});
+        return { structuredContent: { connected: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewRequestTimeoutMs: 20,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    const started = Date.now();
+    await expect(controller.tapLabel({ platform: 'ios', id: 'stalled-semantic' }, 'Continue'))
+      .resolves.toMatchObject({ backend: 'simview', status: 'failed', dispatched: false, dispatch: 'unknown' });
+    expect(Date.now() - started).toBeLessThan(500);
     expect(runner.calls.some(({ command, args }) => command === 'idb' && args[0] === 'ui' && args.includes('--udid'))).toBe(false);
   });
 

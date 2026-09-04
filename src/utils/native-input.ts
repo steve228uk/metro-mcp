@@ -235,6 +235,7 @@ async function validateSimViewPlugin(root: string, deadline?: number, fileSystem
 export async function discoverNativeProviders(
   options: NativeInputOptions,
   deadline?: number,
+  providerKinds?: Array<Provider['kind']>,
 ): Promise<Provider[]> {
   const config = configValue(options.config);
   const result: Provider[] = [];
@@ -243,12 +244,15 @@ export async function discoverNativeProviders(
     { kind: 'idb', command: config.idbCommand, explicit: options.config?.idbCommand !== undefined },
   ] as Array<{ kind: 'simview' | 'idb'; command: string; explicit: boolean }>).filter(
     (candidate) => config.nativeBackend === 'auto' || candidate.kind === config.nativeBackend,
-  );
+  ).filter((candidate) => !providerKinds || providerKinds.includes(candidate.kind));
 
   for (const candidate of candidates) {
     let parts = commandParts(candidate.command);
     const fileSystem = candidate.kind === 'simview' ? options.simviewFileSystem ?? defaultSimViewFileSystem : defaultSimViewFileSystem;
-    const discoveryDeadline = candidate.kind === 'simview' ? deadline : undefined;
+    // Provider discovery is part of the same pre-dispatch budget as the
+    // eventual native action. A broken IDB installation must not leave its
+    // version or help process running indefinitely while SimView is ready.
+    const discoveryDeadline = deadline;
     if (candidate.explicit) {
       const tokens = commandTokens(candidate.command);
       for (let index = tokens.length; index > 0; index--) {
@@ -268,7 +272,7 @@ export async function discoverNativeProviders(
         ];
     let selected: string | undefined;
     const selectPath = async (path: string): Promise<boolean> => {
-      if (candidate.explicit || (path.includes('/') ? await executable(path) : await commandExists(options.runner, path, candidate.kind === 'simview' ? deadline : undefined))) {
+      if (candidate.explicit || (path.includes('/') ? await executable(path, discoveryDeadline, fileSystem) : await commandExists(options.runner, path, discoveryDeadline))) {
         selected = path;
         return true;
       }
@@ -313,7 +317,7 @@ async function probeProvider(
 ): Promise<{ capabilities?: Set<string>; buttons?: Set<string> }> {
   let versionError: unknown;
   try {
-    await boundedExecFile(runner, command, [...args, '--version'], { maxBuffer: 64 * 1024 }, kind === 'simview' ? deadline : undefined);
+    await boundedExecFile(runner, command, [...args, '--version'], { maxBuffer: 64 * 1024 }, deadline);
   } catch (error) {
     versionError = error;
   }
@@ -328,7 +332,7 @@ async function probeProvider(
   // partial set of input operations without making the whole provider unusable.
   let help: string;
   try {
-    help = (await runner.execFile(command, [...args, '--help'], { maxBuffer: 128 * 1024 })).toString('utf8');
+    help = (await boundedExecFile(runner, command, [...args, '--help'], { maxBuffer: 128 * 1024 }, deadline)).toString('utf8');
   } catch (error) {
     throw new Error(`IDB help probe failed${versionError ? ` after version probe: ${error instanceof Error ? error.message : String(error)}` : `: ${error instanceof Error ? error.message : String(error)}`}`);
   }
@@ -336,7 +340,7 @@ async function probeProvider(
 
   let uiHelp: string;
   try {
-    uiHelp = (await runner.execFile(command, [...args, 'ui', '--help'], { maxBuffer: 128 * 1024 })).toString('utf8');
+    uiHelp = (await boundedExecFile(runner, command, [...args, 'ui', '--help'], { maxBuffer: 128 * 1024 }, deadline)).toString('utf8');
   } catch (error) {
     throw new Error(`IDB ui help probe failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -355,15 +359,15 @@ async function probeProvider(
   // Probe these read-only help pages independently so a provider can retain
   // the capabilities it does support when one command is incomplete.
   if (capabilities.has('tap')) {
-    const tapHelp = await readOperationHelp(runner, command, args, 'tap');
+    const tapHelp = await readOperationHelp(runner, command, args, 'tap', deadline);
     if (tapHelp && /(?:^|\s)--duration(?:\s|$)/m.test(tapHelp)) capabilities.add('long_press');
   }
   if (capabilities.has('swipe')) {
-    const swipeHelp = await readOperationHelp(runner, command, args, 'swipe');
+    const swipeHelp = await readOperationHelp(runner, command, args, 'swipe', deadline);
     if (swipeHelp && /(?:^|\s)--duration(?:\s|$)/m.test(swipeHelp)) capabilities.add('swipe-duration');
   }
   if (capabilities.has('button')) {
-    const buttonHelp = await readOperationHelp(runner, command, args, 'button');
+    const buttonHelp = await readOperationHelp(runner, command, args, 'button', deadline);
     for (const button of ['APPLE_PAY', 'HOME', 'LOCK', 'SIDE_BUTTON', 'SIRI']) {
       if (buttonHelp && new RegExp(`(?:\\{|,|\\s)${button}(?=,|\\}|\\s|$)`, 'm').test(buttonHelp)) buttons.add(button.toLowerCase());
     }
@@ -380,9 +384,10 @@ async function readOperationHelp(
   command: string,
   args: string[],
   operation: string,
+  deadline?: number,
 ): Promise<string | null> {
   try {
-    return (await runner.execFile(command, [...args, 'ui', operation, '--help'], { maxBuffer: 128 * 1024 })).toString('utf8');
+    return (await boundedExecFile(runner, command, [...args, 'ui', operation, '--help'], { maxBuffer: 128 * 1024 }, deadline)).toString('utf8');
   } catch {
     return null;
   }
@@ -452,13 +457,31 @@ export class NativeInputController {
     this.registerCleanup();
   }
 
-  async providersFor(target: NativeInputTarget, deadline = this.simviewDeadline()): Promise<Provider[]> {
+  private async discoverProviders(target: NativeInputTarget, deadline: number): Promise<Provider[]> {
+    if (this.config.nativeBackend !== 'auto' || target.platform !== 'ios') {
+      return discoverNativeProviders(this.options, deadline);
+    }
+
+    // SimView is the preferred iOS backend. Do not make a ready SimView wait
+    // for a broken IDB installation; IDB is discovered lazily when SimView
+    // cannot handle the action. If SimView itself is unavailable, give IDB a
+    // fresh bounded discovery window so the existing fallback remains useful.
+    const simview = await discoverNativeProviders(this.options, deadline, ['simview']);
+    if (simview.some((provider) => provider.available)) return simview;
+    return [...simview, ...await discoverNativeProviders(this.options, this.simviewDeadline(), ['idb'])];
+  }
+
+  async providersFor(target: NativeInputTarget, deadline = this.simviewDeadline(), includeFallback = false): Promise<Provider[]> {
     // Keep successful discovery cheap, but do not make an unavailable
     // provider permanent for the lifetime of the controller. A provider can
     // be installed, added to PATH, or recover from a transient probe failure
     // while the daemon is still running.
     if (!this.providers || this.providers.some((provider) => !provider.available)) {
-      this.providers = await discoverNativeProviders(this.options, deadline);
+      this.providers = await this.discoverProviders(target, deadline);
+    }
+    if (includeFallback && this.config.nativeBackend === 'auto' && target.platform === 'ios'
+      && !this.providers.some((provider) => provider.kind === 'idb')) {
+      this.providers = [...this.providers, ...await discoverNativeProviders(this.options, this.simviewDeadline(), ['idb'])];
     }
     return this.providers.filter((provider) =>
       this.config.nativeBackend === 'auto' || provider.kind === this.config.nativeBackend,
@@ -484,11 +507,18 @@ export class NativeInputController {
       const semantic = await this.simviewLabel(target, label, simview, deadline);
       if (semantic.status !== 'unavailable' && semantic.status !== 'unsupported') return semantic;
     }
-    const provider = providers.find((candidate) => candidate.kind === 'idb' && candidate.available);
+    const provider = (await this.providersFor(target, deadline, true)).find((candidate) => candidate.kind === 'idb' && candidate.available);
     if (!provider) return result('none', 'unavailable', false, 'IDB is not installed for accessibility label lookup');
     if (!provider.capabilities?.has('describe-all')) return result('idb', 'unsupported', false, 'IDB does not advertise accessibility descriptions');
     try {
-      const dump = await this.options.runner.execFile(provider.command, [...provider.args, 'ui', 'describe-all', '--udid', target.id, '--json'], { maxBuffer: 2 * 1024 * 1024 });
+      const idbDeadline = this.simviewDeadline();
+      const dump = await boundedExecFile(
+        this.options.runner,
+        provider.command,
+        [...provider.args, 'ui', 'describe-all', '--udid', target.id, '--json'],
+        { maxBuffer: 2 * 1024 * 1024 },
+        idbDeadline,
+      );
       const match = findAccessibilityPoint(dump.toString('utf8'), label);
       if (!match.point) return result('idb', 'failed', false, match.ambiguous ? `Element "${label}" is ambiguous` : `Element "${label}" was not found by IDB`);
       return this.idb(target, 'tap', match.point, provider);
@@ -517,12 +547,19 @@ export class NativeInputController {
     // IDB's accessibility dump and UI input commands are iOS-only. SimView
     // remains available on Android because it can query that device directly.
     if (target.platform !== 'ios') return fallback ?? result('none', 'unsupported', false, 'Label lookup is only available through SimView on Android');
-    const provider = providers.find((candidate) => candidate.kind === 'idb' && candidate.available);
+    const provider = (await this.providersFor(target, deadline, true)).find((candidate) => candidate.kind === 'idb' && candidate.available);
     if (!provider) return fallback ?? result('none', 'unavailable', false, 'IDB is not installed for accessibility label lookup');
     if (!provider.capabilities?.has('describe-all')) return result('idb', 'unsupported', false, 'IDB does not advertise accessibility descriptions');
     if (!provider.capabilities.has('long_press')) return result('idb', 'unsupported', false, 'IDB does not advertise long press input');
     try {
-      const dump = await this.options.runner.execFile(provider.command, [...provider.args, 'ui', 'describe-all', '--udid', target.id, '--json'], { maxBuffer: 2 * 1024 * 1024 });
+      const idbDeadline = this.simviewDeadline();
+      const dump = await boundedExecFile(
+        this.options.runner,
+        provider.command,
+        [...provider.args, 'ui', 'describe-all', '--udid', target.id, '--json'],
+        { maxBuffer: 2 * 1024 * 1024 },
+        idbDeadline,
+      );
       const match = findAccessibilityPoint(dump.toString('utf8'), label);
       if (!match.point) return result('idb', match.ambiguous ? 'failed' : 'unsupported', false, match.ambiguous ? `Element "${label}" is ambiguous` : `Element "${label}" was not found by IDB`);
       return this.idb(target, 'long_press', { ...match.point, durationMs: duration }, provider);
@@ -570,7 +607,17 @@ export class NativeInputController {
           if (refs.length !== 1) return result('simview', 'failed', false, `Element "${label}" is ambiguous`);
           if (Date.now() >= deadline) return result('simview', 'unavailable', false, 'SimView setup timed out before input dispatch', 'not-sent');
           inputAttempted = true;
-          const tapResponse = await session.client.callTool({ name: 'tap_element', arguments: { ref: refs[0] } });
+          let tapResponse: SimViewCallResult;
+          try {
+            tapResponse = await this.simviewRequest(
+              () => session.client.callTool({ name: 'tap_element', arguments: { ref: refs[0] } }),
+              `tap element "${label}"`,
+              this.simviewDeadline(),
+            );
+          } catch (error) {
+            await this.invalidateSession(session, deadline);
+            throw error;
+          }
           const tapped = readStructuredResult(tapResponse);
           const interaction = tapped.interaction && typeof tapped.interaction === 'object'
             ? tapped.interaction as Record<string, unknown>
@@ -664,7 +711,17 @@ export class NativeInputController {
           if (!point) return result('simview', 'unsupported', false, `Element "${label}" has no usable frame`);
           if (Date.now() >= deadline) return result('simview', 'unavailable', false, 'SimView setup timed out before input dispatch', 'not-sent');
           inputAttempted = true;
-          const response = await session.client.callTool({ name: 'long_press', arguments: { ...point, durationMs: duration } });
+          let response: SimViewCallResult;
+          try {
+            response = await this.simviewRequest(
+              () => session.client.callTool({ name: 'long_press', arguments: { ...point, durationMs: duration } }),
+              `long press element "${label}"`,
+              this.simviewDeadline(),
+            );
+          } catch (error) {
+            await this.invalidateSession(session, deadline);
+            throw error;
+          }
           const structured = readStructuredResult(response);
           const interaction = structured.interaction && typeof structured.interaction === 'object'
             ? structured.interaction as Record<string, unknown>
@@ -775,10 +832,17 @@ export class NativeInputController {
         /* Try IDB when SimView is unavailable. */
       }
     }
-    const idb = providers.find((provider) => provider.kind === 'idb' && provider.available);
+    const idb = (await this.providersFor(target, deadline, true)).find((provider) => provider.kind === 'idb' && provider.available);
     if (!idb || !idb.capabilities?.has('describe')) return null;
     try {
-      const output = await this.options.runner.execFile(idb.command, [...idb.args, 'describe', '--udid', target.id, '--json'], { maxBuffer: 128 * 1024 });
+      const idbDeadline = this.simviewDeadline();
+      const output = await boundedExecFile(
+        this.options.runner,
+        idb.command,
+        [...idb.args, 'describe', '--udid', target.id, '--json'],
+        { maxBuffer: 128 * 1024 },
+        idbDeadline,
+      );
       const parsed = JSON.parse(output.toString('utf8')) as Record<string, unknown>;
       const dimensions = (parsed.screen_dimensions ?? parsed.screenDimensions) as Record<string, unknown> | undefined;
       const width = Number(dimensions?.width_points ?? dimensions?.widthPoints);
@@ -824,9 +888,10 @@ export class NativeInputController {
     deadline = this.simviewDeadline(),
     skipSimView = false,
   ): Promise<NativeDispatchResult> {
-    const providers = await this.providersFor(target, deadline);
+    let providers = await this.providersFor(target, deadline);
     let fallback: NativeDispatchResult | undefined;
-    for (const provider of providers) {
+    for (let index = 0; index < providers.length; index += 1) {
+      const provider = providers[index];
       if (!provider.available) continue;
       if (skipSimView && provider.kind === 'simview') continue;
       const dispatched = provider.kind === 'simview'
@@ -834,6 +899,7 @@ export class NativeInputController {
         : await this.idb(target, operation, args, provider);
       if (dispatched.status === 'unavailable' || dispatched.status === 'unsupported') {
         fallback = dispatched;
+        if (provider.kind === 'simview') providers = await this.providersFor(target, deadline, true);
         continue;
       }
       return dispatched;
@@ -841,7 +907,13 @@ export class NativeInputController {
     return fallback ?? result('none', 'unavailable', false, 'No supported native input provider is installed');
   }
 
-  private async idb(target: NativeInputTarget, operation: string, args: Record<string, unknown>, provider: Provider): Promise<NativeDispatchResult> {
+  private async idb(
+    target: NativeInputTarget,
+    operation: string,
+    args: Record<string, unknown>,
+    provider: Provider,
+    deadline = this.simviewDeadline(),
+  ): Promise<NativeDispatchResult> {
     let capability: string;
     switch (operation) {
       case 'long_press': capability = 'long_press'; break;
@@ -881,7 +953,13 @@ export class NativeInputController {
       default: return result('idb', 'unsupported');
     }
     try {
-      await this.options.runner.execFile(provider.command, [...provider.args, ...command], { maxBuffer: 256 * 1024 });
+      await boundedExecFile(
+        this.options.runner,
+        provider.command,
+        [...provider.args, ...command],
+        { maxBuffer: 256 * 1024 },
+        deadline,
+      );
       return result('idb', 'handled', true);
     } catch (error) {
       return result('idb', 'failed', false, error instanceof Error ? error.message : String(error), 'unknown');
@@ -950,7 +1028,17 @@ export class NativeInputController {
       if (Date.now() >= deadline) return result('simview', 'unavailable', false, 'SimView setup timed out before input dispatch', 'not-sent');
       const normalized = this.normalizeArgs(operation, args, session.width, session.height);
       try {
-        const response = await session.client.callTool({ name: tool, arguments: normalized });
+        let response: SimViewCallResult;
+        try {
+          response = await this.simviewRequest(
+            () => session.client.callTool({ name: tool, arguments: normalized }),
+            `${tool} input`,
+            this.simviewDeadline(),
+          );
+        } catch (error) {
+          await this.invalidateSession(session, deadline);
+          throw error;
+        }
         const structured = readStructuredResult(response);
         const interaction = structured.interaction && typeof structured.interaction === 'object'
           ? structured.interaction as Record<string, unknown>
