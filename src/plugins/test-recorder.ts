@@ -508,12 +508,14 @@ export const testRecorderPlugin = definePlugin({
             deadline,
           });
         };
-        const cleanupBestEffort = () => {
-          const remaining = deadline - Date.now();
-          if (remaining <= 0) return;
-          void ctx.evalInApp(CLEANUP_RECORDING_JS, {
-            timeout: Math.min(1000, remaining),
-            deadline,
+        const cleanupBestEffort = async () => {
+          // Cleanup has its own short deadline so an exhausted readiness budget
+          // cannot leave recorder hooks installed, while reconnects and the
+          // cleanup transport are still bounded.
+          const cleanupDeadline = Date.now() + 1000;
+          await ctx.evalInApp(CLEANUP_RECORDING_JS, {
+            timeout: 1000,
+            deadline: cleanupDeadline,
           }).catch(() => {});
         };
 
@@ -529,7 +531,7 @@ export const testRecorderPlugin = definePlugin({
           // CDP can report a transport error after the app evaluated part of
           // the script. Always attempt cleanup for a partially-installed
           // session before returning the failure.
-          cleanupBestEffort();
+          await cleanupBestEffort();
           return `Could not inject recording hooks — ${injectError}`;
         }
 
@@ -552,20 +554,20 @@ export const testRecorderPlugin = definePlugin({
           await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
         }
         if (!readiness?.ready) {
-          cleanupBestEffort();
+          await cleanupBestEffort();
           const reason = readiness?.traversal?.truncationReason
             ?? (readiness?.unwrapped?.length
               ? `unwrapped handlers: ${[...new Set(readiness.unwrapped)].join(', ')}`
               : injectError);
-          return `Could not start recording — React handler coverage did not become ready within 6000ms (${reason}). Cleanup was attempted within the startup deadline.`;
+          return `Could not start recording — React handler coverage did not become ready within 6000ms (${reason}). Instrumentation cleanup was attempted.`;
         }
 
         const activated = (deadline - Date.now() > 0
           ? await evaluateStartup(ACTIVATE_RECORDING_JS, 1000).catch(() => false)
           : false);
         if (!activated) {
-          cleanupBestEffort();
-          return 'Could not start recording — capture activation failed. Cleanup was attempted within the startup deadline.';
+          await cleanupBestEffort();
+          return 'Could not start recording — capture activation failed. Instrumentation cleanup was attempted.';
         }
 
         const route = (deadline - Date.now() > 0

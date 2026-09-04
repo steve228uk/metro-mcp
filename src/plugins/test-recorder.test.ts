@@ -356,7 +356,6 @@ describe('test recorder readiness', () => {
     }
     expect(replacedBeforeReadiness).toBe(true);
     expect(String(result)).toContain('unwrapped handlers: onLongPress');
-    await call('stop_test_recording');
     expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
     expect(vm.runInContext('globalThis.__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
   });
@@ -532,7 +531,6 @@ describe('test recorder readiness', () => {
     expect(String(result)).toContain('coverage did not become ready');
     expect(evaluations.filter(({ expression }) => expression.includes('handlerCount'))).toHaveLength(1);
     expect(evaluations.every(({ options }) => (options?.timeout ?? 0) > 0)).toBe(true);
-    await call('stop_test_recording');
     expect(vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app)).toBe(originalCommit);
     expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
     expect(vm.runInContext('globalThis.__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
@@ -551,7 +549,6 @@ describe('test recorder readiness', () => {
       Date.now = realNow;
     }
     expect(String(result)).toContain('coverage did not become ready');
-    await call('stop_test_recording');
     expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
   });
 });
