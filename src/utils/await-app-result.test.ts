@@ -181,6 +181,33 @@ describe('async app read results', () => {
     expect(releasedGroups).toHaveLength(0);
   });
 
+  test('does not delay a settled result for stalled mailbox cleanup', async () => {
+    const { runtime, evaluate, awaitResult } = hermesHarness();
+    let cleanupStarted = false;
+    let finishCleanup: (() => void) | undefined;
+    const cleanupEvaluate: PluginContext['evalInApp'] = async (expression, options) => {
+      cleanupStarted = true;
+      await new Promise<void>((resolve) => { finishCleanup = resolve; });
+      return evaluate(expression, options);
+    };
+    let resultSettled = false;
+    const result = awaitResult('Promise.resolve(42)', 1000, { cleanupEvaluate })
+      .then((value) => {
+        resultSettled = true;
+        return value;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    try {
+      expect(cleanupStarted).toBe(true);
+      expect(resultSettled).toBe(true);
+      await expect(result).resolves.toBe(42);
+    } finally {
+      finishCleanup?.();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(userRuntimeKeys(runtime)).toEqual([]);
+  });
+
   test('assimilates nested thenables and ignores repeated resolution', async () => {
     const { awaitResult } = hermesHarness();
     await expect(awaitResult(`({
