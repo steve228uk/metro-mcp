@@ -125,10 +125,11 @@ function vmTransport() {
             (typeof result === 'object' || typeof result === 'function')) {
           const objectId = `remote-${++nextObjectId}`;
           remoteObjects.set(objectId, result);
+          const isPromise = Object.prototype.toString.call(result) === '[object Promise]';
           return {
             result: {
               type: 'object',
-              subtype: result instanceof Promise ? 'promise' : undefined,
+              subtype: isPromise ? 'promise' : undefined,
               objectId,
             },
           };
@@ -305,6 +306,343 @@ describe('shared app evaluation policy', () => {
     expect(state.state().reconnectCount).toBe(0);
     expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('__appExceptionMarker'))).toHaveLength(1);
+  });
+
+  test('observes an immediately rejected Promise during source evaluation', async () => {
+    const { transport, calls } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      'Promise.reject(new Error("immediate rejection"));',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('immediate rejection');
+
+    const sourceCall = calls.find((call) =>
+      call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('immediate rejection'));
+    expect(sourceCall?.params.awaitPromise).toBe(false);
+    expect(String(sourceCall?.params.expression)).toContain('PromiseCtor.prototype.then.call');
+    expect(calls.filter((call) =>
+      call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('immediate rejection'))).toHaveLength(1);
+
+    await expect(evalInApp(
+      'Promise.reject(new Error("line comment rejection")); // trailing comment',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('line comment rejection');
+    await expect(evalInApp(
+      'Promise.reject(new Error("block comment rejection")); /* trailing comment */',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('block comment rejection');
+    await expect(evalInApp(
+      'Promise.reject(new Error("repeated terminator rejection"));; /* trailing comment */',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('repeated terminator rejection');
+    await expect(evalInApp(
+      'Promise.reject(new Error("mixed terminator rejection")); /* c */ ; // d',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('mixed terminator rejection');
+  });
+
+  test('observes a rejected Promise before a delayed Runtime.evaluate response', async () => {
+    const { transport } = vmTransport();
+    const originalSend = transport.send;
+    transport.send = async (method, params, options) => {
+      const result = await originalSend(method, params, options);
+      if (method === 'Runtime.evaluate' && String(params?.expression).includes('delayed rejection')) {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      }
+      return result;
+    };
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    let unhandledRejections = 0;
+    const onUnhandledRejection = () => { unhandledRejections += 1; };
+    process.on('unhandledRejection', onUnhandledRejection);
+    try {
+      await expect(evalInApp(
+        'const delayedPromise = Promise.reject(new Error("delayed rejection")); delayedPromise;',
+        { awaitPromise: true, timeout: 1000 },
+      )).rejects.toThrow('delayed rejection');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandledRejections).toBe(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+  });
+
+  test('observes completion Promises through control-flow statements before a delayed response', async () => {
+    const sources = [
+      '{ Promise.reject(new Error("block completion rejection")); }',
+      'if (true) Promise.reject(new Error("if completion rejection"));',
+      'if (false) {} else Promise.reject(new Error("else completion rejection"));',
+      'try { Promise.reject(new Error("try completion rejection")); } finally {}',
+      'try { Promise.reject(new Error("try/finally completion rejection")); } finally { Promise.resolve(1); }',
+      'switch (1) { case 1: Promise.resolve(1); case 2: Promise.reject(new Error("switch completion rejection")); break; }',
+      'switch (1) { case 1: Promise.reject(new Error("conditional break completion rejection")); if (true) break; Promise.resolve(2); }',
+      'for (let index = 0; index < 1; index += 1) { Promise.reject(new Error("conditional continue completion rejection")); if (true) continue; Promise.resolve(2); }',
+      'const flag = true; L: for (let index = 0; index < 1; index += 1) { Promise.reject(new Error("labeled continue completion rejection")); if (flag) continue L; Promise.resolve(2); }',
+    ];
+    let unhandledRejections = 0;
+    const onUnhandledRejection = () => { unhandledRejections += 1; };
+    process.on('unhandledRejection', onUnhandledRejection);
+    try {
+      for (const source of sources) {
+        const { transport } = vmTransport();
+        const originalSend = transport.send;
+        transport.send = async (method, params, options) => {
+          const result = await originalSend(method, params, options);
+          if (method === 'Runtime.evaluate' && String(params?.expression).includes('completion rejection')) {
+            await new Promise((resolve) => setTimeout(resolve, 30));
+          }
+          return result;
+        };
+        const evalInApp = createAppEvaluator(transport, lifecycle());
+        try {
+          await expect(evalInApp(source, { awaitPromise: true, timeout: 1000 }))
+            .rejects.toThrow('completion rejection');
+        } catch (error) {
+          throw new Error(`${source}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandledRejections).toBe(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+  });
+
+  test('retains labeled break paths through finalizers and nested switches', async () => {
+    const sources = [
+      'const flag = true; L: { try { throw 1; } finally { if (flag) break L; } } Promise.reject(new Error("outer labeled completion rejection"));',
+      'const flag = true; L: { switch (1) { case 1: Promise.reject(new Error("nested switch labeled break rejection")); if (flag) break L; Promise.resolve(2); } }',
+    ];
+    let unhandledRejections = 0;
+    const onUnhandledRejection = () => { unhandledRejections += 1; };
+    process.on('unhandledRejection', onUnhandledRejection);
+    try {
+      const first = vmTransport();
+      const firstSend = first.transport.send;
+      first.transport.send = async (method, params, options) => {
+        const result = await firstSend(method, params, options);
+        if (method === 'Runtime.evaluate' && String(params?.expression).includes('outer labeled completion rejection')) {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        return result;
+      };
+      await expect(createAppEvaluator(first.transport, lifecycle())(sources[0]!, {
+        awaitPromise: true,
+        timeout: 1000,
+      })).rejects.toThrow('outer labeled completion rejection');
+
+      const second = vmTransport();
+      const secondSend = second.transport.send;
+      second.transport.send = async (method, params, options) => {
+        const result = await secondSend(method, params, options);
+        if (method === 'Runtime.evaluate' && String(params?.expression).includes('nested switch labeled break rejection')) {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+        }
+        return result;
+      };
+      await expect(createAppEvaluator(second.transport, lifecycle())(sources[1]!, {
+        awaitPromise: true,
+        timeout: 1000,
+      })).rejects.toThrow('nested switch labeled break rejection');
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(unhandledRejections).toBe(0);
+    } finally {
+      process.off('unhandledRejection', onUnhandledRejection);
+    }
+  });
+
+  test('observes a completion expression before trailing declarations', async () => {
+    const { transport, calls } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      'const trailingPromise = Promise.reject(new Error("trailing declaration rejection")); trailingPromise; var afterCompletion = true;',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('trailing declaration rejection');
+    const sourceCall = calls.find((call) =>
+      call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('trailing declaration rejection'));
+    expect(String(sourceCall?.params.expression)).toContain('PromiseCtor.prototype.then.call');
+  });
+
+  test('does not invoke a native Promise subclass then override during observation', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      `(() => {
+        class TrackedPromise extends Promise {
+          then(...args) {
+            globalThis.thenOverrideCalls = (globalThis.thenOverrideCalls || 0) + 1;
+            return super.then(...args);
+          }
+        }
+        globalThis.thenOverrideCalls = 0;
+        return new TrackedPromise(resolve => resolve(7));
+      })()`,
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(7);
+    // The wrapper uses the intrinsic method; only SETTLE_REMOTE's single
+    // assimilation invokes the subclass override.
+    expect(transport.context).toHaveProperty('thenOverrideCalls', 1);
+  });
+
+  test('keeps declaration-form scripts in the direct evaluation scope', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp('/* leading */ function /* interstitial */ persistedFunction() {}', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBeUndefined();
+    await expect(evalInApp('/* leading */ class /* interstitial */ PersistedClass {}', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBeUndefined();
+    await expect(evalInApp('typeof persistedFunction', {
+      awaitPromise: false,
+    })).resolves.toBe('function');
+    await expect(evalInApp('typeof PersistedClass', {
+      awaitPromise: false,
+    })).resolves.toBe('function');
+  });
+
+  test('observes sequence and parenthesized Promise expressions', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      '(Promise.resolve(1), Promise.resolve(2)); // sequence',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(2);
+    await expect(evalInApp(
+      '((Promise.resolve(3))); /* parenthesized */',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(3);
+    await expect(evalInApp(
+      'Promise.resolve("string // marker ;"); // trailing',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('string // marker ;');
+    await expect(evalInApp(
+      'Promise.resolve("no semicolon") // trailing without terminator',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('no semicolon');
+    await expect(evalInApp(
+      'Promise.resolve(`/template ; // marker`); /* trailing */',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('/template ; // marker');
+    await expect(evalInApp(
+      'Promise.resolve(/[//;]/.test("//;")); /* trailing */',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(true);
+    await expect(evalInApp(
+      'Promise.resolve(1); // first statement\n Promise.resolve(2)',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(2);
+  });
+
+  test('preserves direct eval bindings when observing a Promise expression', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      'eval("var persistedByDirectEval = 41"), Promise.resolve(1);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(1);
+    await expect(evalInApp('persistedByDirectEval', {
+      awaitPromise: false,
+    })).resolves.toBe(41);
+  });
+
+  test('preserves top-level arguments errors while observing Promise expressions', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      'Promise.resolve(arguments.length);',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('arguments is not defined');
+  });
+
+  test('preserves brace-leading direct script completion semantics', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp('{ foo: 1 }', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBe(1);
+  });
+
+  test('leaves Proxy thenables to the single later assimilation path', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      `(() => {
+        globalThis.proxyPrototypeChecks = 0;
+        globalThis.proxyThenCalls = 0;
+        return new Proxy({
+        then(resolve) {
+          globalThis.proxyThenCalls = (globalThis.proxyThenCalls || 0) + 1;
+          resolve(9);
+        }
+      }, {
+        getPrototypeOf() {
+          globalThis.proxyPrototypeChecks = (globalThis.proxyPrototypeChecks || 0) + 1;
+          throw new Error('proxy prototype trap');
+        }
+        });
+      })()`,
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(9);
+    expect(transport.context).toMatchObject({
+      proxyPrototypeChecks: 0,
+      proxyThenCalls: 1,
+    });
+  });
+
+  test('does not mistake a Unicode identifier prefix for a declaration', async () => {
+    const { transport, calls } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp('globalThis.functioné = Promise.resolve(6)', {
+      awaitPromise: false,
+    })).resolves.toBeDefined();
+    await expect(evalInApp('functioné;', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBe(6);
+    expect(calls.some((call) =>
+      call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('observePromise'))).toBe(true);
+  });
+
+  test('keeps anonymous and async/generator declarations direct', async () => {
+    const { transport, calls } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    const invalidDeclarations = [
+      'function() {}',
+      'class {}',
+      'async function() {}',
+      'function*() {}',
+      'async function*() {}',
+    ];
+
+    for (const source of invalidDeclarations) {
+      await expect(evalInApp(source, {
+        awaitPromise: true,
+        timeout: 1000,
+      })).rejects.toThrow();
+    }
+    const sourceExpressions = calls
+      .filter((call) => call.method === 'Runtime.evaluate')
+      .map((call) => String(call.params.expression));
+    for (const source of invalidDeclarations) {
+      expect(sourceExpressions).toContain(source);
+    }
   });
 
   test('does not retry a remote settlement app exception that uses the Bridge disconnect message', async () => {
@@ -645,6 +983,38 @@ describe('shared app evaluation policy', () => {
     expect(calls).toHaveLength(1); // stalled setup; cleanup has no remaining budget
   });
 
+  test('releases a late completion with a bounded post-deadline cleanup budget', async () => {
+    let resolveSource: ((result: unknown) => void) | undefined;
+    const calls: Array<{ method: string; options?: Record<string, unknown> }> = [];
+    const transport = {
+      send: async (method: string, params?: Record<string, unknown>, options?: Record<string, unknown>) => {
+        calls.push({ method, options });
+        if (method === 'Runtime.evaluate' &&
+            String(params?.expression).includes('Object.defineProperty(globalThis')) {
+          return { result: { value: true } };
+        }
+        if (method === 'Runtime.evaluate') {
+          return new Promise((resolve) => { resolveSource = resolve; });
+        }
+        if (method === 'Runtime.releaseObjectGroup') return { result: { value: true } };
+        return { result: { value: true } };
+      },
+    };
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp('Promise.resolve(42)', { awaitPromise: true, timeout: 30 }))
+      .rejects.toThrow('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const release = calls.find((call) => call.method === 'Runtime.releaseObjectGroup');
+    expect(release?.options?.timeoutMs).toBe(250);
+
+    // A late source result gets the same best-effort cleanup path and never
+    // replays the source evaluation.
+    resolveSource?.({ result: { type: 'object', objectId: 'late-promise' } });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate')).toHaveLength(2);
+  });
+
   test('bounds a stalled mailbox poll and does not wait for cleanup', async () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
@@ -660,7 +1030,7 @@ describe('shared app evaluation policy', () => {
     await expect(evalInApp('Promise.resolve(1)', { awaitPromise: true, timeout: 40 }))
       .rejects.toThrow('timed out');
     expect(Date.now() - started).toBeLessThan(500);
-    expect(calls).toHaveLength(3); // setup, source, and stalled poll
+    expect(calls).toHaveLength(4); // setup, source, stalled poll, and bounded group cleanup
   });
 
   test('does not reconnect after a mailbox poll rejects after the deadline', async () => {
@@ -726,12 +1096,12 @@ describe('shared app evaluation policy', () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
     let groupReleaseStarted = false;
-    const deadline = Date.now() + 100;
+    const deadline = Date.now() + 300;
     transport.send = async (method, params, options) => {
       if (method === 'Runtime.releaseObjectGroup') {
         groupReleaseStarted = true;
         const timeoutMs = Number(options?.timeoutMs);
-        expect(timeoutMs).toBeLessThan(100);
+        expect(timeoutMs).toBeLessThanOrEqual(100);
         expect(timeoutMs).toBeLessThanOrEqual(deadline - Date.now() + 2);
         return new Promise(() => {});
       }
@@ -744,7 +1114,9 @@ describe('shared app evaluation policy', () => {
       'new Promise(resolve => setTimeout(() => resolve(42), 70));',
       { awaitPromise: true, timeout: 1000, deadline },
     )).resolves.toBe(42);
-    expect(Date.now() - started).toBeLessThan(100);
+    // Keep this separate from the cleanup budget: a stalled release must not
+    // delay delivery of a result that already settled.
+    expect(Date.now() - started).toBeLessThan(250);
     expect(groupReleaseStarted).toBe(true);
     expect(calls.some((call) => call.method === 'Runtime.releaseObject')).toBe(false);
   });

@@ -179,13 +179,24 @@ export async function resolveDevice(
 ): Promise<ResolvedDevice | null> {
   if (platform === 'android') {
     const devices = await discoverAndroidDevices(runner);
+    const connectedId = targetId(target);
+    // Inspect the complete ADB inventory before dropping unavailable entries.
+    // An offline or unauthorized exact match proves which Android target Metro
+    // is connected to and must never turn into a fallback to another handset.
+    const connectedDevice = connectedId
+      ? devices.find((device) => device.id === connectedId)
+      : undefined;
+    if (connectedDevice && connectedDevice.status !== 'device') {
+      throw new Error(
+        `Connected Android device "${connectedDevice.id}" is ${connectedDevice.status}; ` +
+        'refusing to select another device.',
+      );
+    }
     const authorized = devices.filter((device) => device.status === 'device');
     if (authorized.length === 0) return null;
     // A target's name is not platform-qualified. A concrete serial match is
     // the only inventory evidence that proves its metadata belongs to Android.
-    const platformTarget = targetId(target) && authorized.some(
-      (device) => device.id === targetId(target),
-    ) ? target : undefined;
+    const platformTarget = connectedDevice?.status === 'device' ? target : undefined;
     const selected = findAndroidTarget(
       authorized,
       targetId(platformTarget),

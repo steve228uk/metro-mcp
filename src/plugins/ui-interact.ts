@@ -19,11 +19,13 @@ import {
   resolveDevice,
 } from '../utils/device-discovery.js';
 import { NativeInputController, type NativeDispatchResult, type NativeInputConfig } from '../utils/native-input.js';
+import { isAppEvaluationError } from '../utils/evaluate-app.js';
 
 // Connection setup failures happen before Runtime.evaluate is dispatched, so
 // native input remains safe. Any other rejection may follow an app-side action
 // and must stop to avoid duplicate input.
 function isPreDispatchConnectionFailure(error: unknown): boolean {
+  if (isAppEvaluationError(error)) return false;
   return error instanceof Error && (
     error.message === 'Not connected to CDP target' ||
     error.message ===
