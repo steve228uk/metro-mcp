@@ -130,12 +130,6 @@ type Completion = CompletionPath & {
   breaks: ExitPath[];
   continues: ExitPath[];
 };
-type FinallyRestore = {
-  entry: number;
-  exit: number;
-  slot: string;
-};
-
 const emptyCompletion = (): Completion => ({
   expressions: [],
   clearRanges: [],
@@ -153,16 +147,6 @@ const abruptCompletion = (): Completion => ({
   breaks: [],
   continues: [],
 });
-
-function applyFinallyCompletion(
-  guarded: Completion,
-  _finalizer: Completion,
-): CompletionPath {
-  // A normal finally completion is always discarded by TryStatement. The
-  // guarded completion is returned whether the finalizer's own completion is
-  // empty, undefined, or a value; only an abrupt finalizer replaces it.
-  return guarded;
-}
 
 function completionFromExit(path: ExitPath): CompletionPath {
   return path.inherit ? { ...path, clearRanges: [] } : path;
@@ -292,12 +276,13 @@ function completionForStatement(statement: StatementLike): Completion {
           continues: finalizerContinues,
         };
       }
-      // A normal `finally` completion is UpdateEmpty: its expression value is
-      // discarded, while the prior try/catch completion is retained. This is
-      // why `try { 1 } finally { 2 }` evaluates to 1 in a script.
-      const applied = applyFinallyCompletion(guarded, finalizer);
+      // Hermes retains the last reached expression, including a normally
+      // completing finalizer. Capture both paths in execution order so an
+      // empty finalizer inherits the guarded value and a valued one replaces it.
       return {
-        ...applied,
+        ...mergePaths(guarded, finalizer),
+        empty: guarded.empty && finalizer.empty,
+        normal: guarded.normal,
         breaks: [...guarded.breaks, ...finalizerBreaks],
         continues: [...guarded.continues, ...finalizerContinues],
       };
@@ -388,74 +373,6 @@ function completionForStatements(statements: StatementLike[]): Completion {
   return completion;
 }
 
-function collectFinallyRestores(
-  statement: StatementLike,
-  restores: FinallyRestore[] = [],
-): FinallyRestore[] {
-  switch (statement.type) {
-    case 'BlockStatement':
-      for (const child of (statement.body as StatementLike[] | undefined) ?? []) {
-        collectFinallyRestores(child, restores);
-      }
-      break;
-    case 'IfStatement':
-      collectFinallyRestores(statement.consequent as StatementLike, restores);
-      if (statement.alternate) {
-        collectFinallyRestores(statement.alternate as StatementLike, restores);
-      }
-      break;
-    case 'TryStatement': {
-      collectFinallyRestores(statement.block as StatementLike, restores);
-      const handler = statement.handler as { body: StatementLike } | null | undefined;
-      if (handler) collectFinallyRestores(handler.body, restores);
-      const finalizer = statement.finalizer as StatementLike | null | undefined;
-      if (finalizer) {
-        const completion = completionForStatement(finalizer);
-        const hasEscapingValue = [...completion.breaks, ...completion.continues]
-          .some((path) => path.expressions.length > 0);
-        const start = finalizer.start;
-        const end = finalizer.end;
-        if (
-          completion.normal &&
-          hasEscapingValue &&
-          typeof start === 'number' &&
-          typeof end === 'number'
-        ) {
-          const directives = (finalizer.directives as Array<{ end?: number | null }> | undefined) ?? [];
-          restores.push({
-            entry: directives.length > 0
-              ? directives[directives.length - 1]!.end as number
-              : start + 1,
-            exit: end - 1,
-            slot: `finally:${start}:${end}`,
-          });
-        }
-        collectFinallyRestores(finalizer, restores);
-      }
-      break;
-    }
-    case 'LabeledStatement':
-    case 'WithStatement':
-    case 'ForStatement':
-    case 'ForInStatement':
-    case 'ForOfStatement':
-    case 'WhileStatement':
-    case 'DoWhileStatement':
-      collectFinallyRestores(statement.body as StatementLike, restores);
-      break;
-    case 'SwitchStatement':
-      for (const switchCase of (
-        statement.cases as Array<{ consequent: StatementLike[] }> | undefined
-      ) ?? []) {
-        for (const child of switchCase.consequent) {
-          collectFinallyRestores(child, restores);
-        }
-      }
-      break;
-  }
-  return restores;
-}
-
 function promiseObservationExpression(expression: string, completionKey?: string): string {
   let ast;
   try {
@@ -498,21 +415,6 @@ function promiseObservationExpression(expression: string, completionKey?: string
       other.label === range.label,
     ) === index,
   );
-  const finallyRestores = collectFinallyRestores({
-    type: 'BlockStatement',
-    body: ast.program.body as StatementLike[],
-  });
-  const saveFinallyCompletion = (slot: string): string => `(function(root) {
-    var state = root[${keyLiteral}];
-    if (state) state[${JSON.stringify(slot)}] = state.completionValue;
-  })(this)`;
-  const restoreFinallyCompletion = (slot: string): string => `(function(root) {
-    var state = root[${keyLiteral}];
-    if (state) {
-      state.completionValue = state[${JSON.stringify(slot)}];
-      delete state[${JSON.stringify(slot)}];
-    }
-  })(this)`;
   const replacements = [
     ...candidates.map(({ start, end }) => ({
       start: start as number,
@@ -527,15 +429,6 @@ function promiseObservationExpression(expression: string, completionKey?: string
       // capture that exit and change the caller's control flow.
       replacement: `{ ${clearCompletion}; ${kind}${label ? ` ${label}` : ''}; }`,
     })),
-    ...finallyRestores.flatMap(({ entry, exit, slot }) => [{
-      start: exit,
-      end: exit,
-      replacement: `;\n${restoreFinallyCompletion(slot)};\n`,
-    }, {
-      start: entry,
-      end: entry,
-      replacement: `;\n${saveFinallyCompletion(slot)};\n`,
-    }]),
   ].sort((left, right) => right.start - left.start);
   for (const { start, end, replacement } of replacements) {
     transformed = transformed.slice(0, start) + replacement +
