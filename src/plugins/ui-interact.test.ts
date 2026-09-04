@@ -20,6 +20,7 @@ type AppEvaluation =
   | {
       renderer: 'paper' | 'fabric';
       value: string;
+      selection?: { start: number; end: number };
       submitBehavior?: 'newline' | 'submit' | 'blurAndSubmit';
       blurOnSubmit?: boolean;
       multiline?: boolean;
@@ -133,6 +134,13 @@ async function createAppOnlyHarness(
           type: { displayName: 'TextInput' },
           memoizedProps: {
             ...(controlled ? { value } : { defaultValue: value }),
+            ...(controlled
+              ? {
+                  selection: 'selection' in evaluation
+                    ? evaluation.selection
+                    : { start: value.length, end: value.length },
+                }
+              : {}),
             ...('submitBehavior' in evaluation && evaluation.submitBehavior !== undefined
               ? { submitBehavior: evaluation.submitBehavior } : {}),
             ...('blurOnSubmit' in evaluation && evaluation.blurOnSubmit !== undefined
@@ -262,6 +270,58 @@ describe('UI handler actions without native inventory', () => {
     expect(harness.reactCalls).toEqual([
       { type: 'change', value: 'A' },
     ]);
+  });
+
+  test('deletes at the controlled Android caret and selection', async () => {
+    const caretHarness = await createAppOnlyHarness({
+      renderer: 'paper', value: 'abcd', selection: { start: 2, end: 2 },
+    });
+    const press = caretHarness.tools.get('press_button')!;
+    const caret = await press.handler(press.parameters.parse({ button: 'DELETE' }) as Record<string, unknown>);
+    expect(caret).toBe('Pressed DELETE');
+    expect(caretHarness.reactCalls).toEqual([{ type: 'change', value: 'acd' }]);
+
+    const rangeHarness = await createAppOnlyHarness({
+      renderer: 'paper', value: 'abcd', selection: { start: 1, end: 3 },
+    });
+    const rangePress = rangeHarness.tools.get('press_button')!;
+    expect(await rangePress.handler(rangePress.parameters.parse({ button: 'DELETE' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(rangeHarness.reactCalls).toEqual([{ type: 'change', value: 'ad' }]);
+
+    const unicodeHarness = await createAppOnlyHarness({
+      renderer: 'paper', value: 'A😀B', selection: { start: 3, end: 3 },
+    });
+    const unicodePress = unicodeHarness.tools.get('press_button')!;
+    expect(await unicodePress.handler(unicodePress.parameters.parse({ button: 'DELETE' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(unicodeHarness.reactCalls).toEqual([{ type: 'change', value: 'AB' }]);
+  });
+
+  test('defers controlled Android DELETE at the start caret to native input', async () => {
+    const harness = await createAppOnlyHarness(
+      { renderer: 'paper', value: 'abcd', selection: { start: 0, end: 0 } },
+      true,
+      'emulator-42',
+    );
+    const press = harness.tools.get('press_button')!;
+    expect(await press.handler(press.parameters.parse({ button: 'DELETE', platform: 'android' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(harness.reactCalls).toEqual([]);
+    expect(harness.execCommands).toEqual(['adb -s "emulator-42" shell input keyevent 67']);
+  });
+
+  test('defers controlled DELETE to Android when selection is unavailable', async () => {
+    const harness = await createAppOnlyHarness(
+      { renderer: 'paper', value: 'abcd', selection: undefined },
+      true,
+      'emulator-42',
+    );
+    const press = harness.tools.get('press_button')!;
+    expect(await press.handler(press.parameters.parse({ button: 'DELETE', platform: 'android' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(harness.reactCalls).toEqual([]);
+    expect(harness.execCommands.at(-1)).toBe('adb -s "emulator-42" shell input keyevent 67');
   });
 
   test('matches Android blurAndSubmit semantics for controlled Paper and Fabric inputs', async () => {

@@ -264,7 +264,10 @@ export async function awaitAppResult(
       sourceCompletedByValue = true;
     }
 
-    if (completion.objectId) {
+    const runtimeGenerationChanged = mailboxGeneration !== undefined &&
+      options?.getRuntimeGeneration !== undefined &&
+      options.getRuntimeGeneration() !== mailboxGeneration;
+    if (completion.objectId && !runtimeGenerationChanged) {
       if (!options?.settleRemote) {
         throw new Error('App evaluation returned a remote object without settlement support');
       }
@@ -277,7 +280,7 @@ export async function awaitAppResult(
         deadline,
         timeout,
       );
-    } else {
+    } else if (!completion.objectId) {
       // Runtime.evaluate returns primitives by value when the source has no
       // remote object completion. They are already complete, so writing them
       // back through the mailbox would add an unnecessary request and poll.
@@ -285,6 +288,10 @@ export async function awaitAppResult(
       sourceCompletedByValue = true;
       return completion.value;
     }
+
+    // The source may have completed just before a reconnect changed the
+    // runtime generation. Its completion handle is now stale, but the
+    // source's mailbox observation is still the safe one-shot result.
 
     while (Date.now() < deadline) {
       const result = await evaluateBeforeDeadline(pollEvaluate, `(function() {
