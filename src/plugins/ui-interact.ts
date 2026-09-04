@@ -14,6 +14,8 @@ import {
 } from '../utils/fiber.js';
 import {
   adbPrefix,
+  discoverAndroidDevices,
+  discoverBootedSimulators,
   getConnectedDeviceTarget,
   resolveDevice,
 } from '../utils/device-discovery.js';
@@ -45,6 +47,40 @@ export const uiInteractPlugin = definePlugin({
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
       resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
+    const prepareExplicitTarget = async (platform: 'ios' | 'android') => {
+      const connected = getConnectedDeviceTarget(ctx);
+      const logicalId = connected?.reactNative?.logicalDeviceId?.trim();
+      const target = await resolveDevice(ctx, platform, connected);
+      const sameId = (left: string, right: string, idPlatform: 'ios' | 'android') =>
+        idPlatform === 'ios'
+          ? left.toLowerCase() === right.toLowerCase()
+          : left === right;
+      if (!target || !logicalId || !sameId(target.id, logicalId, platform)) {
+        return { target, canUseReact: false };
+      }
+      const verifiedLogicalId = logicalId;
+
+      // A requested-platform match alone cannot prove which runtime owns a
+      // connected logical ID. The opposite inventory must also be available
+      // and must not contain that ID before app-side dispatch is permitted.
+      try {
+        let oppositeHasId = false;
+        if (platform === 'ios') {
+          const opposite = await discoverAndroidDevices(ctx);
+          oppositeHasId = opposite.some(
+            (device) => sameId(device.id, verifiedLogicalId, 'android'),
+          );
+        } else {
+          const opposite = await discoverBootedSimulators(ctx);
+          oppositeHasId = opposite.some((device) => sameId(device.udid, verifiedLogicalId, 'ios'));
+        }
+        return { target, canUseReact: !oppositeHasId };
+      } catch {
+        // Without a successful opposite inventory, the ID's platform is not
+        // proven. Keep the requested target for native fallback.
+        return { target, canUseReact: false };
+      }
+    };
 
     async function isIDBAvailable(): Promise<boolean> {
       if (idbAvailableCache !== null) return idbAvailableCache;
@@ -141,9 +177,10 @@ export const uiInteractPlugin = definePlugin({
         if (!label) return 'Provide a label/testID or x,y coordinates.';
 
         // ── Label/testID tap: CDP fiber tree (works on both platforms) ───────
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsLabel = JSON.stringify(label);
         let evaluationError: unknown;
-        const tapped = await ctx.evalInApp(`
+        const tapped = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             ${FIND_AND_INVOKE_JS}
@@ -158,7 +195,7 @@ export const uiInteractPlugin = definePlugin({
           return `Could not evaluate the connected app while tapping "${label}".`;
         }
 
-        const target = await resolveTarget(platform);
+        const target = prepared ? prepared.target : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const p = target.platform;
 
@@ -221,10 +258,11 @@ export const uiInteractPlugin = definePlugin({
       }),
       handler: async ({ text, testID, platform }) => {
         // ── CDP: find TextInput and call onChangeText ─────────────────────────
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsText = JSON.stringify(text);
         const jsTestID = testID ? JSON.stringify(testID) : 'null';
         let evaluationError: unknown;
-        const typed = await ctx.evalInApp(`
+        const typed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             var targetID = ${jsTestID};
@@ -265,7 +303,7 @@ export const uiInteractPlugin = definePlugin({
           return 'Could not evaluate the connected app while typing text.';
         }
 
-        const target = await resolveTarget(platform);
+        const target = prepared ? prepared.target : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const p = target.platform;
 
@@ -307,10 +345,14 @@ export const uiInteractPlugin = definePlugin({
       }),
       handler: async ({ label, x, y, duration, platform }) => {
         // ── CDP: find element by label/testID and call onLongPress ────────────
-        if (label) {
+        const hasCoordinates = x !== undefined && y !== undefined;
+        const prepared = label && !hasCoordinates && platform !== 'auto'
+          ? await prepareExplicitTarget(platform)
+          : undefined;
+        if (label && !hasCoordinates) {
           const jsLabel = JSON.stringify(label);
           let evaluationError: unknown;
-          const pressed = await ctx.evalInApp(`
+          const pressed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
@@ -323,7 +365,7 @@ export const uiInteractPlugin = definePlugin({
           if (pressed) return `Long pressed "${label}"`;
           if (
             evaluationError &&
-            (!isPreDispatchConnectionFailure(evaluationError) || x === undefined || y === undefined)
+            (!isPreDispatchConnectionFailure(evaluationError) || !hasCoordinates)
           ) {
             return `Could not evaluate the connected app while long pressing "${label}".`;
           }
@@ -361,11 +403,12 @@ export const uiInteractPlugin = definePlugin({
       }),
       handler: async ({ direction, platform }) => {
         let result: string | null = null;
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
 
         // ── CDP: find ScrollView and invoke scrollTo on its native node ────────
         const jsDir = JSON.stringify(direction);
         let evaluationError: unknown;
-        const scrolled = await ctx.evalInApp(`
+        const scrolled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             var dir = ${jsDir};
@@ -417,7 +460,7 @@ export const uiInteractPlugin = definePlugin({
         }
 
         if (!result) {
-          const target = await resolveTarget(platform);
+          const target = prepared ? prepared.target : await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
           const p = target.platform;
           // ── Native fallbacks (fixed midpoint coordinates) ───────────────────
@@ -435,7 +478,7 @@ export const uiInteractPlugin = definePlugin({
         }
 
         // ── Log to test recorder if a recording is active ─────────────────────
-        await ctx.evalInApp(`
+        if (prepared?.canUseReact ?? true) await ctx.evalInApp(`
           (function() {
             if (!globalThis.__METRO_MCP_REC_ACTIVE__) return;
             ${GET_ROUTE_FUNC_JS}
@@ -464,10 +507,13 @@ export const uiInteractPlugin = definePlugin({
           HOME: 3, BACK: 4, VOLUME_UP: 24, VOLUME_DOWN: 25,
           POWER: 26, ENTER: 66, DELETE: 67,
         };
+        const prepared = (button === 'ENTER' || button === 'DELETE') && platform !== 'auto'
+          ? await prepareExplicitTarget(platform)
+          : undefined;
 
         if (button === 'ENTER' || button === 'DELETE') {
           let evaluationError: unknown;
-          const handled = await ctx.evalInApp(`
+          const handled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               var handlerName = ${JSON.stringify(button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText')};
@@ -547,7 +593,7 @@ export const uiInteractPlugin = definePlugin({
           }
         }
 
-        const target = await resolveTarget(platform);
+        const target = prepared ? prepared.target : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const p = target.platform;
 
