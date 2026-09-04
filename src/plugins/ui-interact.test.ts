@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { z } from 'zod';
 import type { ComponentNode, PluginContext, ToolHandlerResult } from '../plugin.js';
+import { AppEvaluationError } from '../utils/evaluate-app.js';
 import { uiInteractPlugin } from './ui-interact.js';
 
 type Tool = {
@@ -14,6 +15,7 @@ type AppEvaluation =
   | 'pre-dispatch'
   | 'timeout'
   | 'ambiguous-timeout'
+  | 'app-error'
   | 'unhandled'
   | {
       renderer: 'paper' | 'fabric';
@@ -112,6 +114,9 @@ async function createAppOnlyHarness(
       if (evaluation === 'timeout') throw new Error('App evaluation timed out');
       if (evaluation === 'ambiguous-timeout') {
         throw new Error('App evaluation timed out after 30ms');
+      }
+      if (evaluation === 'app-error') {
+        throw new AppEvaluationError('Not connected to CDP target');
       }
       if (evaluation === 'unhandled') return false;
       if (typeof evaluation === 'object') {
@@ -334,6 +339,23 @@ describe('UI handler actions without native inventory', () => {
     const result = await tool.handler(tool.parameters.parse({ label: 'Save', platform: 'ios' }) as Record<string, unknown>);
     expect(result).toBe('Tapped "Save"');
     expect(harness.getNativeCalls()).toBeGreaterThan(0);
+  });
+
+  test('does not replay native actions after an app-originated connection-looking error', async () => {
+    const harness = await createAppOnlyHarness('app-error', true, 'SIMULATOR123');
+    const cases = [
+      ['tap_element', { label: 'Save', platform: 'ios' }],
+      ['type_text', { text: 'hello', platform: 'ios' }],
+      ['long_press', { label: 'Save', platform: 'ios' }],
+      ['swipe', { direction: 'up', platform: 'ios' }],
+      ['press_button', { button: 'ENTER', platform: 'ios' }],
+    ] as const;
+    for (const [name, args] of cases) {
+      const tool = harness.tools.get(name)!;
+      const result = await tool.handler(tool.parameters.parse(args) as Record<string, unknown>);
+      expect(result).toContain('Could not evaluate');
+    }
+    expect(harness.execCommands).toEqual([]);
   });
 
   test('uses native fallback for other known pre-dispatch handler failures', async () => {

@@ -19,6 +19,7 @@ import {
   getConnectedDeviceTarget,
   resolveDevice,
 } from '../utils/device-discovery.js';
+import { isAppEvaluationError } from '../utils/evaluate-app.js';
 
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let idbAvailableCache: boolean | null = null;
@@ -28,6 +29,7 @@ let idbAvailableCache: boolean | null = null;
 // These errors are raised before dispatch, while the connection is being
 // established, so the native backend is still safe to try.
 function isPreDispatchConnectionFailure(error: unknown): boolean {
+  if (isAppEvaluationError(error)) return false;
   return error instanceof Error && (
     error.message === 'Not connected to CDP target' ||
     error.message ===
