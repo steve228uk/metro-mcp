@@ -39,7 +39,8 @@ const SCROLLABLE_PROPS_JS = `
       'showsVerticalScrollIndicator' in props || 'showsHorizontalScrollIndicator' in props ||
       'keyboardShouldPersistTaps' in props || 'keyboardDismissMode' in props ||
       'scrollEnabled' in props || typeof props.onScrollBeginDrag === 'function' ||
-      typeof props.onScrollEndDrag === 'function';
+      typeof props.onScrollEndDrag === 'function' ||
+      typeof props.onMomentumScrollEnd === 'function';
   }
 `;
 
