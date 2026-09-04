@@ -117,7 +117,6 @@ type CompletionPath = {
   expressions: ExpressionLike[];
   clearRanges: Array<{ start: number; end: number; kind: 'break' | 'continue'; label: string | null }>;
   empty: boolean;
-  undefined: boolean;
   normal: boolean;
 };
 type ExitPath = CompletionPath & { label: string | null; inherit: boolean };
@@ -130,7 +129,6 @@ const emptyCompletion = (): Completion => ({
   expressions: [],
   clearRanges: [],
   empty: true,
-  undefined: false,
   normal: true,
   breaks: [],
   continues: [],
@@ -140,40 +138,10 @@ const abruptCompletion = (): Completion => ({
   expressions: [],
   clearRanges: [],
   empty: false,
-  undefined: false,
   normal: false,
   breaks: [],
   continues: [],
 });
-
-const undefinedCompletion = (): Completion => ({
-  expressions: [],
-  clearRanges: [],
-  empty: false,
-  undefined: true,
-  normal: true,
-  breaks: [],
-  continues: [],
-});
-
-function normalizeControlCompletion(completion: Completion): Completion {
-  return {
-    ...completion,
-    empty: false,
-    undefined: completion.undefined || completion.empty,
-  };
-}
-
-function asFinallyCompletion(completion: Completion): Completion {
-  // A normal finalizer uses UpdateEmpty. Control statements such as an
-  // untaken if/loop therefore preserve the guarded completion in a finally
-  // clause, even though they produce undefined at script level.
-  return {
-    ...completion,
-    empty: completion.empty || completion.undefined,
-    undefined: false,
-  };
-}
 
 function applyFinallyCompletion(
   guarded: Completion,
@@ -185,14 +153,6 @@ function applyFinallyCompletion(
   return guarded;
 }
 
-function markNonInheritingExits(completion: Completion): Completion {
-  return {
-    ...completion,
-    breaks: completion.breaks.map((path) => ({ ...path, inherit: false })),
-    continues: completion.continues.map((path) => ({ ...path, inherit: false })),
-  };
-}
-
 function completionFromExit(path: ExitPath): CompletionPath {
   return path.inherit ? { ...path, clearRanges: [] } : path;
 }
@@ -201,11 +161,10 @@ function mergePaths(left: CompletionPath, right: CompletionPath): CompletionPath
   return {
     expressions: [...left.expressions, ...right.expressions],
     clearRanges: [...left.clearRanges, ...right.clearRanges],
-    // A merged path is empty only when every contributing completion is
-    // empty. An explicit undefined completion from a catch/finally or a later
-    // empty loop iteration must replace an earlier value.
-    empty: left.empty && right.empty,
-    undefined: left.undefined || right.undefined,
+    // Hermes reports the previous value for an empty control-flow path. Keep
+    // empty completion inheritance here; the mailbox starts empty for each
+    // evaluation, so this cannot leak a prior request's value.
+    empty: left.empty || right.empty,
     normal: left.normal || right.normal,
   };
 }
@@ -268,7 +227,6 @@ function completionForStatement(statement: StatementLike): Completion {
         expressions: [statement.expression],
         clearRanges: [],
         empty: false,
-        undefined: false,
         normal: true,
         breaks: [],
         continues: [],
@@ -281,10 +239,8 @@ function completionForStatement(statement: StatementLike): Completion {
       const consequent = completionForStatement(statement.consequent as StatementLike);
       const alternate = statement.alternate
         ? completionForStatement(statement.alternate as StatementLike)
-        : undefinedCompletion();
-      return normalizeControlCompletion(markNonInheritingExits(
-        mergeCompletions(consequent, alternate),
-      ));
+        : emptyCompletion();
+      return mergeCompletions(consequent, alternate);
     }
     case 'TryStatement': {
       const body = completionForStatement(statement.block as StatementLike);
@@ -292,27 +248,18 @@ function completionForStatement(statement: StatementLike): Completion {
         ? completionForStatement((statement.handler as { body: StatementLike }).body)
         : abruptCompletion();
       const guarded = mergeCompletions(body, handler);
-      if (!statement.finalizer) return normalizeControlCompletion(guarded);
-      const finalizer = asFinallyCompletion(
-        completionForStatement(statement.finalizer as StatementLike),
-      );
+      if (!statement.finalizer) return guarded;
+      const finalizer = completionForStatement(statement.finalizer as StatementLike);
       if (!finalizer.normal) return finalizer;
       // A normal `finally` completion is UpdateEmpty: its expression value is
       // discarded, while the prior try/catch completion is retained. This is
       // why `try { 1 } finally { 2 }` evaluates to 1 in a script.
       const applied = applyFinallyCompletion(guarded, finalizer);
-      const result = {
+      return {
         ...applied,
-        breaks: [
-          ...guarded.breaks,
-          ...finalizer.breaks.map((path) => ({ ...path, inherit: false })),
-        ],
-        continues: [
-          ...guarded.continues,
-          ...finalizer.continues.map((path) => ({ ...path, inherit: false })),
-        ],
+        breaks: [...guarded.breaks, ...finalizer.breaks],
+        continues: [...guarded.continues, ...finalizer.continues],
       };
-      return result.normal ? normalizeControlCompletion(result) : result;
     }
     case 'LabeledStatement':
       return consumeLabelExits(
@@ -320,35 +267,30 @@ function completionForStatement(statement: StatementLike): Completion {
         (statement.label as { name: string } | null | undefined)?.name ?? '',
       );
     case 'WithStatement':
-      return normalizeControlCompletion(markNonInheritingExits(
-        completionForStatement(statement.body as StatementLike),
-      ));
+      return completionForStatement(statement.body as StatementLike);
     case 'SwitchStatement': {
       const cases = (statement.cases as Array<{ consequent: StatementLike[] }> | undefined) ?? [];
-      let completion = undefinedCompletion();
+      let completion = emptyCompletion();
       for (let index = 0; index < cases.length; index += 1) {
         const caseCompletion = completionForStatements(
           cases.slice(index).flatMap((entry) => entry.consequent),
         );
         completion = mergeCompletions(
           completion,
-          normalizeControlCompletion(consumeBreaks(caseCompletion)),
+          consumeBreaks(caseCompletion),
         );
       }
-      return normalizeControlCompletion(completion);
+      return completion;
     }
     case 'ForStatement':
     case 'ForInStatement':
     case 'ForOfStatement':
     case 'WhileStatement':
     case 'DoWhileStatement':
-      const body = normalizeControlCompletion(
-        completionForStatement(statement.body as StatementLike),
+      return mergeCompletions(
+        consumeLoopExits(completionForStatement(statement.body as StatementLike)),
+        emptyCompletion(),
       );
-      const loop = consumeLoopExits(body);
-      return statement.type === 'DoWhileStatement'
-        ? normalizeControlCompletion(loop)
-        : normalizeControlCompletion(mergeCompletions(loop, undefinedCompletion()));
     case 'ThrowStatement':
     case 'ReturnStatement':
       return abruptCompletion();
@@ -409,85 +351,6 @@ function completionForStatements(statements: StatementLike[]): Completion {
   return completion;
 }
 
-type SourceInsertion = { start: number; end?: number; replacement: string };
-
-function collectLoopEntryInsertions(
-  statement: StatementLike,
-  clearCompletion: string,
-  insertions: SourceInsertion[],
-): void {
-  const visit = (child: unknown): void => {
-    if (child && typeof child === 'object' && 'type' in child) {
-      collectLoopEntryInsertions(child as StatementLike, clearCompletion, insertions);
-    }
-  };
-  const visitList = (children: unknown): void => {
-    if (Array.isArray(children)) children.forEach(visit);
-  };
-
-  switch (statement.type) {
-    case 'BlockStatement':
-      visitList(statement.body);
-      return;
-    case 'IfStatement':
-      visit(statement.consequent);
-      visit(statement.alternate);
-      return;
-    case 'TryStatement':
-      visit(statement.block);
-      visit((statement.handler as { body?: unknown } | null | undefined)?.body);
-      visit(statement.finalizer);
-      return;
-    case 'LabeledStatement':
-    case 'WithStatement':
-      visit(statement.body);
-      return;
-    case 'SwitchStatement':
-      for (const switchCase of (statement.cases as Array<{ consequent?: unknown }> | undefined) ?? []) {
-        visitList(switchCase.consequent);
-      }
-      return;
-    case 'ForStatement':
-    case 'ForInStatement':
-    case 'ForOfStatement':
-    case 'WhileStatement':
-    case 'DoWhileStatement': {
-      const body = statement.body as StatementLike | undefined;
-      if (body?.start !== null && body?.start !== undefined &&
-          body.end !== null && body.end !== undefined) {
-        const bodyCompletion = completionForStatement(body);
-        // Each iteration computes a fresh body completion. A reached
-        // candidate immediately replaces this reset; a runtime path that
-        // reaches none of the candidates completes with undefined instead of
-        // leaking a value from an earlier iteration.
-        if (bodyCompletion.expressions.length === 0) {
-          visit(body);
-          return;
-        }
-        if (body.type === 'BlockStatement') {
-          const directives = (body.directives as Array<{ end?: number | null }> | undefined) ?? [];
-          const entry = directives.length > 0
-            ? directives[directives.length - 1]!.end
-            : (body.start as number) + 1;
-          if (entry !== null && entry !== undefined) {
-            insertions.push({ start: entry, replacement: ` ${clearCompletion}; ` });
-          }
-        } else {
-          insertions.push({
-            start: body.start as number,
-            replacement: `{ ${clearCompletion}; `,
-          });
-          insertions.push({ start: body.end as number, replacement: ' }' });
-        }
-      }
-      visit(body);
-      return;
-    }
-    default:
-      return;
-  }
-}
-
 function promiseObservationExpression(expression: string, completionKey?: string): string {
   let ast;
   try {
@@ -530,10 +393,6 @@ function promiseObservationExpression(expression: string, completionKey?: string
       other.label === range.label,
     ) === index,
   );
-  const loopInsertions: SourceInsertion[] = [];
-  for (const statement of ast.program.body as StatementLike[]) {
-    collectLoopEntryInsertions(statement, clearCompletion, loopInsertions);
-  }
   const replacements = [
     ...candidates.map(({ start, end }) => ({
       start: start as number,
@@ -548,7 +407,6 @@ function promiseObservationExpression(expression: string, completionKey?: string
       // capture that exit and change the caller's control flow.
       replacement: `{ ${clearCompletion}; ${kind}${label ? ` ${label}` : ''}; }`,
     })),
-    ...loopInsertions,
   ].sort((left, right) => right.start - left.start);
   for (const { start, end, replacement } of replacements) {
     transformed = transformed.slice(0, start) + replacement +
@@ -561,19 +419,23 @@ function promiseObservationExpression(expression: string, completionKey?: string
   const directiveEnd = directives.length > 0
     ? directives[directives.length - 1]!.end as number
     : 0;
+  // Babel stores a hashbang separately from the program body. Keep it as the
+  // first source line when inserting mailbox setup or the generated script
+  // becomes invalid JavaScript.
+  const prefixEnd = Math.max(directiveEnd, ast.program.interpreter?.end ?? 0);
   const setup = `;\n(function(root) {
     var state = root[${keyLiteral}];
     if (state) state.completionValue = void 0;
   })(this);\n`;
-  transformed = transformed.slice(0, directiveEnd) + setup + transformed.slice(directiveEnd);
+  transformed = transformed.slice(0, prefixEnd) + setup + transformed.slice(prefixEnd);
   const observe = `(function(root) {
     var state = root[${keyLiteral}];
     var value = state ? state.completionValue : void 0;
     try {
-      var PromiseCtor = state && (state.promiseConstructor || root.Promise);
-      var promiseThen = (state && state.promiseThen) ||
-        (PromiseCtor && PromiseCtor.prototype && PromiseCtor.prototype.then);
-      if (promiseThen) promiseThen.call(value, function() {}, function() {});
+      // Start the mailbox's single realm-internal assimilation in the same
+      // JavaScript job, so an immediately rejected completion is observed
+      // before Runtime.evaluate returns.
+      if (state && typeof state.observe === 'function') state.observe(value);
     } catch (_) {}
     if (state) state.completionValue = void 0;
     return value;
@@ -637,49 +499,12 @@ const SETTLE_REMOTE_FUNCTION = `function(key) {
   var root = (function() { return this; })();
   var state = root[key];
   if (!state) return false;
-  function fulfill(value) {
-    if (root[key] !== state) return;
-    state.unserializableValue = undefined;
-    if (typeof value === 'number') {
-      if (value !== value) state.unserializableValue = 'NaN';
-      else if (value === Infinity) state.unserializableValue = 'Infinity';
-      else if (value === -Infinity) state.unserializableValue = '-Infinity';
-      else if (value === 0 && 1 / value === -Infinity) state.unserializableValue = '-0';
-    } else if (typeof value === 'bigint') {
-      state.unserializableValue = String(value) + 'n';
-    }
-    state.value = state.unserializableValue === undefined ? value : undefined;
-    state.status = 'fulfilled';
-  }
-  function rejectionMessage(error) {
-    var message;
-    try {
-      if (error !== null && error !== undefined) message = error.message;
-    } catch (_) {}
-    if (message !== undefined && message !== null) {
-      try { return String(message); } catch (_) {}
-    }
-    try { return String(error); } catch (_) {}
-    return 'Promise rejected with an unstringifiable reason';
-  }
-  function reject(error) {
-    if (root[key] !== state) return;
-    state.error = rejectionMessage(error);
-    state.status = 'rejected';
-  }
   try {
-    // Assimilate arbitrary thenables exactly once. Calling this.then
-    // directly would accept a second callback or a nested thenable as the
-    // final value, unlike JavaScript Promise resolution.
-    var PromiseCtor = state.promiseConstructor || root.Promise;
-    var promiseResolve = state.promiseResolve || (PromiseCtor && PromiseCtor.resolve);
-    if (!promiseResolve) throw new Error('Promise constructor unavailable');
-    var resolved = promiseResolve.call(PromiseCtor, this);
-    var promiseThen = state.promiseThen ||
-      (PromiseCtor && PromiseCtor.prototype && PromiseCtor.prototype.then);
-    if (!promiseThen) throw new Error('Promise then unavailable');
-    promiseThen.call(resolved, fulfill, reject);
-  } catch (error) { reject(error); }
+    // Transformed sources start this before Runtime.evaluate returns. Sources
+    // that could not be transformed start the same one-shot assimilation here.
+    if (typeof state.observe !== 'function') return false;
+    state.observe(this);
+  } catch (_) { return false; }
   return true;
 }`;
 

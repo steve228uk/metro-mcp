@@ -257,7 +257,7 @@ describe('async app read results', () => {
     let mailboxWriteAttempts = 0;
     let reconnects = 0;
     const evaluateWithDisconnect: PluginContext['evalInApp'] = async (expression, options) => {
-      if (expression.includes('state.value =')) {
+      if (expression.includes('state.unserializableValue = void 0;')) {
         mailboxWriteAttempts += 1;
         if (mailboxWriteAttempts === 1) throw new Error('transport disconnected');
       }
@@ -267,7 +267,7 @@ describe('async app read results', () => {
       try {
         return await evaluateWithDisconnect(expression, options);
       } catch (error) {
-        if (!expression.includes('state.value =')) throw error;
+        if (!expression.includes('state.unserializableValue = void 0;')) throw error;
         reconnects += 1;
         return evaluateWithDisconnect(expression, options);
       }

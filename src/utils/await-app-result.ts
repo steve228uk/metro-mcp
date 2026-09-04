@@ -227,12 +227,41 @@ export async function awaitAppResult(
     ) + 1000;
     const mailboxSetup = `(function() {
       var root = this;
-      var PromiseCtor = root.Promise;
-      var state = {
-        status: 'pending',
-        promiseConstructor: PromiseCtor,
-        promiseResolve: PromiseCtor && PromiseCtor.resolve,
-        promiseThen: PromiseCtor && PromiseCtor.prototype && PromiseCtor.prototype.then
+      var state = { status: 'pending', observing: false };
+      function rejectionMessage(error) {
+        var message;
+        try {
+          if (error !== null && error !== undefined) message = error.message;
+        } catch (_) {}
+        if (message !== undefined && message !== null) {
+          try { return String(message); } catch (_) {}
+        }
+        try { return String(error); } catch (_) {}
+        return 'Promise rejected with an unstringifiable reason';
+      }
+      function fulfill(value) {
+        if (root[${key}] !== state) return;
+        state.unserializableValue = undefined;
+        if (typeof value === 'number') {
+          if (value !== value) state.unserializableValue = 'NaN';
+          else if (value === Infinity) state.unserializableValue = 'Infinity';
+          else if (value === -Infinity) state.unserializableValue = '-Infinity';
+          else if (value === 0 && 1 / value === -Infinity) state.unserializableValue = '-0';
+        } else if (typeof value === 'bigint') {
+          state.unserializableValue = String(value) + 'n';
+        }
+        state.value = state.unserializableValue === undefined ? value : undefined;
+        state.status = 'fulfilled';
+      }
+      function reject(error) {
+        if (root[${key}] !== state) return;
+        state.error = rejectionMessage(error);
+        state.status = 'rejected';
+      }
+      state.observe = async function(value) {
+        if (state.observing) return;
+        state.observing = true;
+        try { fulfill(await value); } catch (error) { reject(error); }
       };
       root.Object.defineProperty(root, ${key}, {
         value: state, configurable: true
