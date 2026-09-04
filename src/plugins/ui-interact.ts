@@ -581,16 +581,42 @@ export const uiInteractPlugin = definePlugin({
                   typeof targetInstance.blur === 'function') targetInstance.blur();
               } else {
                 var val = targetProps.value;
-                var end = val.length;
-                var last = end > 0 ? val.charCodeAt(end - 1) : 0;
-                var previous = end > 1 ? val.charCodeAt(end - 2) : 0;
-                // Remove one complete Unicode code point. Hermes supports
-                // these primitive string operations, while String spread and
-                // Array.from are not available in every React Native runtime.
-                if (last >= 0xdc00 && last <= 0xdfff &&
-                  previous >= 0xd800 && previous <= 0xdbff) end -= 2;
-                else if (end > 0) end -= 1;
-                targetProps.onChangeText(val.slice(0, end));
+                // The native DELETE key acts at the current caret/selection,
+                // while a controlled value alone does not tell us where that
+                // caret is. Only synthesize the change when React has exposed
+                // a valid UTF-16 selection; otherwise return false so the
+                // platform backend can preserve the native selection.
+                var selection = targetProps.selection;
+                if (!selection || typeof selection !== 'object' ||
+                  typeof selection.start !== 'number' || typeof selection.end !== 'number' ||
+                  selection.start !== selection.start || selection.end !== selection.end ||
+                  selection.start % 1 !== 0 || selection.end % 1 !== 0 ||
+                  selection.start < 0 || selection.end < selection.start ||
+                  selection.end > val.length) return false;
+                var start = selection.start;
+                var end = selection.end;
+                // Never manufacture an invalid surrogate pair when a stale or
+                // malformed selection splits a code point. Native input can
+                // resolve the same selection safely.
+                if ((start > 0 && start < val.length &&
+                    val.charCodeAt(start - 1) >= 0xd800 && val.charCodeAt(start - 1) <= 0xdbff &&
+                    val.charCodeAt(start) >= 0xdc00 && val.charCodeAt(start) <= 0xdfff) ||
+                  (end > 0 && end < val.length &&
+                    val.charCodeAt(end - 1) >= 0xd800 && val.charCodeAt(end - 1) <= 0xdbff &&
+                    val.charCodeAt(end) >= 0xdc00 && val.charCodeAt(end) <= 0xdfff)) return false;
+                if (start === end) {
+                  if (start === 0) {
+                    targetProps.onChangeText(val);
+                    return true;
+                  }
+                  start -= 1;
+                  // Remove one complete Unicode code point. Hermes supports
+                  // these primitive string operations, while String spread and
+                  // Array.from are not available in every React Native runtime.
+                  if (start > 0 && val.charCodeAt(start) >= 0xdc00 && val.charCodeAt(start) <= 0xdfff &&
+                    val.charCodeAt(start - 1) >= 0xd800 && val.charCodeAt(start - 1) <= 0xdbff) start -= 1;
+                }
+                targetProps.onChangeText(val.slice(0, start) + val.slice(end));
               }
               return true;
             })()
