@@ -29,7 +29,11 @@ function isPreDispatchConnectionFailure(error: unknown): boolean {
   return error instanceof Error && (
     error.message === 'Not connected to CDP target' ||
     error.message ===
-      'Not connected to Metro. Use list_devices to check connection status.'
+      'Not connected to Metro. Use list_devices to check connection status.' ||
+    // ensureConnected raises this exact error before Runtime.evaluate is
+    // submitted. Duration-bearing timeout errors may follow dispatch and
+    // must not trigger a duplicate native action.
+    error.message === 'App evaluation timed out'
   );
 }
 

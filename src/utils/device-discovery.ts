@@ -181,7 +181,16 @@ export async function resolveDevice(
     const devices = await discoverAndroidDevices(runner);
     const authorized = devices.filter((device) => device.status === 'device');
     if (authorized.length === 0) return null;
-    const selected = findAndroidTarget(authorized, targetId(target), target?.deviceName?.trim())
+    // A target's name is not platform-qualified. A concrete serial match is
+    // the only inventory evidence that proves its metadata belongs to Android.
+    const platformTarget = targetId(target) && authorized.some(
+      (device) => device.id === targetId(target),
+    ) ? target : undefined;
+    const selected = findAndroidTarget(
+      authorized,
+      targetId(platformTarget),
+      platformTarget?.deviceName?.trim(),
+    )
       ?? (authorized.length === 1 ? authorized[0] : undefined);
     if (!selected) {
       throw new Error(
@@ -193,7 +202,10 @@ export async function resolveDevice(
 
   if (platform === 'ios') {
     const devices = await discoverBootedSimulators(runner);
-    return resolveIosDevice(devices, target);
+    // A target's name is not platform-qualified. A concrete simulator UDID
+    // match is positive evidence that the connected target is iOS.
+    const platformTarget = findIosId(devices, targetId(target)) ? target : undefined;
+    return resolveIosDevice(devices, platformTarget);
   }
 
   const [iosResult, androidResult] = await Promise.allSettled([
