@@ -1212,6 +1212,57 @@ describe('shared app evaluation policy', () => {
     expect(settlementAttempts).toBe(1);
   });
 
+  test('polls the mailbox when the runtime generation changes after source dispatch', async () => {
+    const { transport, calls } = vmTransport();
+    let generation = 1;
+    const originalSend = transport.send;
+    transport.send = async (method, params, options) => {
+      const result = await originalSend(method, params, options);
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('generationAfterSource')) {
+        generation += 1;
+      }
+      return result;
+    };
+    const base = lifecycle();
+    const evalInApp = createAppEvaluator(transport, {
+      ...base,
+      getGeneration: () => generation,
+    });
+
+    await expect(evalInApp(
+      'globalThis.generationAfterSourceExecutions = (globalThis.generationAfterSourceExecutions || 0) + 1; globalThis.generationAfterSource = new Promise(resolve => setTimeout(() => resolve(7), 10)); generationAfterSource;',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(7);
+    expect(transport.context).toHaveProperty('generationAfterSourceExecutions', 1);
+    expect(calls.filter((call) => call.method === 'Runtime.callFunctionOn')).toHaveLength(0);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('generationAfterSource'))).toHaveLength(1);
+  });
+
+  test('polls the mailbox after a stale completion handle error', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    let settlementAttempts = 0;
+    transport.send = async (method, params, options) => {
+      if (method === 'Runtime.callFunctionOn') {
+        settlementAttempts += 1;
+        await originalSend(method, params, options);
+        throw new Error('Could not find object with given id');
+      }
+      return originalSend(method, params, options);
+    };
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      'globalThis.staleSettlementExecutions = (globalThis.staleSettlementExecutions || 0) + 1; new Promise(resolve => setTimeout(() => resolve(8), 10));',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(8);
+    expect(transport.context).toHaveProperty('staleSettlementExecutions', 1);
+    expect(settlementAttempts).toBe(1);
+    expect(calls.filter((call) => call.method === 'Runtime.callFunctionOn')).toHaveLength(1);
+  });
+
   test('recreates the mailbox when generation changes after mailbox setup', async () => {
     const { transport, calls } = vmTransport();
     let generation = 0;

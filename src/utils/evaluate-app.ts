@@ -59,6 +59,17 @@ function isServerDisconnectedError(error: unknown): boolean {
     error.message === 'Not connected to Metro. Use list_devices to check connection status.';
 }
 
+// A Runtime.evaluate completion handle belongs to the runtime generation that
+// created it. Reconnects can invalidate that handle after the source has
+// already started observing its completion in the mailbox. In that case the
+// mailbox is still the only safe source of the result; calling the source or
+// the stale handle again could replay user code or a thenable.
+function isStaleRemoteHandleError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /(?:cannot|could not|can't) find (?:the )?(?:remote )?object with given id/i.test(error.message) ||
+    /(?:invalid|unknown|stale) (?:remote )?object(?: handle)?/i.test(error.message);
+}
+
 function timeoutError(timeout: number): Error {
   return new Error(`App evaluation timed out after ${timeout}ms`);
 }
@@ -798,6 +809,10 @@ export function createAppEvaluator(
     try {
       return await attachRemoteSettlement();
     } catch (error) {
+      // A reconnect can invalidate the completion handle after the source has
+      // run. Its transformed observation is already attached to the mailbox,
+      // so continue polling rather than trying to reattach or replay it.
+      if (isStaleRemoteHandleError(error)) return false;
       if (!isTransportError(error)) throw error;
       // The request may have run the user's thenable before its response was
       // lost. Remote handles are invalid after reconnect, so replaying this
