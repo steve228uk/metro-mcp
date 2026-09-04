@@ -132,9 +132,19 @@ async function createHarness(
   app: Record<string, unknown>,
   plugins: PluginDefinition[],
   beforeEval?: (expression: string, options?: EvalOptions) => void,
+  evalInAppOverride?: (
+    expression: string,
+    options: EvalOptions | undefined,
+    evaluate: (expression: string, options?: EvalOptions) => Promise<unknown>,
+  ) => Promise<unknown>,
 ): Promise<Runner> {
   const tools = new Map<string, Tool>();
   const resources = new Map<string, () => Promise<string>>();
+  const evaluateInApp = async (expression: string, options?: EvalOptions) => {
+    beforeEval?.(expression, options);
+    const value = new vm.Script(expression).runInContext(app as vm.Context);
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  };
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true, getTarget: () => null,
@@ -155,11 +165,9 @@ async function createHarness(
       summarize: () => '', compact: (value: unknown) => JSON.stringify(value),
       truncate: (value: string) => value, structureOnly: (value: ComponentNode) => value,
     },
-    evalInApp: async (expression, options) => {
-      beforeEval?.(expression, options);
-      const value = new vm.Script(expression).runInContext(app as vm.Context);
-      return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
-    },
+    evalInApp: evalInAppOverride
+      ? (expression, options) => evalInAppOverride(expression, options, evaluateInApp)
+      : evaluateInApp,
     getActiveDeviceKey: () => 'device', getActiveDeviceName: () => 'Device',
     notifyResourceUpdated: () => {},
   };
@@ -206,6 +214,62 @@ describe('test recorder readiness', () => {
     await call('stop_profiling');
     await call('stop_test_recording');
     expect(vm.runInContext('hook.onCommitFiberRoot', app)).toBe(originalHook);
+  });
+
+  test('does not let an older concurrent startup clean up the newer recorder', async () => {
+    const app = appWithDeepButton();
+    let releaseFirstReadiness!: () => void;
+    let firstReadinessEntered!: () => void;
+    const firstReadiness = new Promise<void>((resolve) => { firstReadinessEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseFirstReadiness = resolve; });
+    let readinessBlocked = false;
+    const call = await createHarness(app, [testRecorderPlugin], undefined, async (expression, options, evaluate) => {
+      if (!readinessBlocked && expression.includes('handlerCount')) {
+        readinessBlocked = true;
+        firstReadinessEntered();
+        await release;
+      }
+      return evaluate(expression, options);
+    });
+
+    const olderStartup = call('start_test_recording');
+    await firstReadiness;
+
+    expect(await call('start_test_recording')).toContain('Recording started');
+    releaseFirstReadiness();
+    expect(String(await olderStartup)).toContain('replaced by a newer startup');
+
+    vm.runInContext('leaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
+  });
+
+  test('does not let a stale pre-injection startup replace the newer recorder', async () => {
+    const app = appWithDeepButton();
+    let releaseOlderInjection!: () => void;
+    let olderInjectionEntered!: () => void;
+    const olderInjection = new Promise<void>((resolve) => { olderInjectionEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseOlderInjection = resolve; });
+    let injectionBlocked = false;
+    const call = await createHarness(app, [testRecorderPlugin], undefined, async (expression, options, evaluate) => {
+      if (!injectionBlocked && expression.includes('var currentState = globalThis.__METRO_MCP_REC_STATE__')) {
+        injectionBlocked = true;
+        olderInjectionEntered();
+        await release;
+      }
+      return evaluate(expression, options);
+    });
+
+    const olderStartup = call('start_test_recording');
+    await olderInjection;
+
+    expect(await call('start_test_recording')).toContain('Recording started');
+    releaseOlderInjection();
+    expect(String(await olderStartup)).toContain('replaced by a newer startup');
+
+    vm.runInContext('leaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
   });
 
   test('bounds cyclic ancestor refresh searches and still instruments through the renderer', async () => {
