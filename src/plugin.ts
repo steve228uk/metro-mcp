@@ -213,7 +213,7 @@ export interface PluginContext {
   execFile(
     command: string,
     args: string[],
-    options?: { maxBuffer?: number },
+    options?: { maxBuffer?: number; timeout?: number },
   ): Promise<Buffer>;
   format: FormatUtils;
   /** Evaluate a JavaScript expression in the connected app runtime */
