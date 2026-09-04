@@ -301,6 +301,53 @@ describe('native input providers', () => {
     }
   });
 
+  test('resolves relative configured SimView and IDB executables from the project root', async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), 'metro-mcp-relative-provider-'));
+    try {
+      await mkdir(join(projectRoot, 'tools'));
+      const simviewPath = join(projectRoot, 'tools', 'simview');
+      const idbPath = join(projectRoot, 'tools', 'idb');
+      await writeFile(simviewPath, '#!/bin/sh\nprintf 0.4.0\n');
+      await writeFile(idbPath, '#!/bin/sh\nprintf 1.0.0\n');
+      await chmod(simviewPath, 0o755);
+      await chmod(idbPath, 0o755);
+
+      const discoveryRunner = fakeRunner();
+      const providers = await discoverNativeProviders({
+        projectRoot,
+        config: {
+          nativeBackend: 'auto',
+          simviewCommand: './tools/simview --fixture',
+          idbCommand: 'tools/idb --fixture',
+        },
+        runner: discoveryRunner,
+      });
+
+      expect(providers).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'simview', command: simviewPath, args: ['--fixture'], available: true }),
+        expect.objectContaining({ kind: 'idb', command: idbPath, args: ['--fixture'], available: true }),
+      ]));
+      expect(discoveryRunner.calls.filter(({ args }) => args.at(-1) === '--version')).toEqual([
+        { command: simviewPath, args: ['--fixture', '--version'] },
+        { command: idbPath, args: ['--fixture', '--version'] },
+      ]);
+
+      const dispatchRunner = fakeRunner();
+      const controller = new NativeInputController({
+        projectRoot,
+        config: { nativeBackend: 'idb', idbCommand: './tools/idb' },
+        runner: dispatchRunner,
+      });
+      await expect(controller.tap({ platform: 'ios', id: 'relative-provider' }, 12, 34)).resolves.toMatchObject({
+        backend: 'idb', status: 'handled', dispatched: true,
+      });
+      expect(dispatchRunner.calls.some(({ command, args }) => command === idbPath && args[0] === 'ui')).toBe(true);
+      await controller.close();
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   test('uses supported IDB syntax and concrete simulator UDID', async () => {
     const runner = fakeRunner();
     const controller = new NativeInputController({

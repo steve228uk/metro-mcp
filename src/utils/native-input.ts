@@ -1,7 +1,7 @@
 import { access, readFile, readdir } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
@@ -149,6 +149,14 @@ function unquoteCommandToken(value: string): string {
   return value.startsWith('"') || value.startsWith("'") ? value.slice(1, -1) : value;
 }
 
+function resolveConfiguredExecutable(command: string, projectRoot?: string): string {
+  // Bare configured commands are provider names resolved through PATH. Only
+  // path-like values should be rooted at the project, so a project root does
+  // not accidentally shadow an explicitly selected PATH installation.
+  if (!projectRoot || isAbsolute(command) || !command.includes('/')) return command;
+  return resolve(projectRoot, command);
+}
+
 const defaultSimViewFileSystem: SimViewFileSystem = {
   executable: async (path) => {
     try {
@@ -257,11 +265,15 @@ export async function discoverNativeProviders(
       const tokens = commandTokens(candidate.command);
       for (let index = tokens.length; index > 0; index--) {
         const possiblePath = tokens.slice(0, index).map(unquoteCommandToken).join(' ');
-        if (await executable(possiblePath, discoveryDeadline, fileSystem)) {
-          parts = { command: possiblePath, args: tokens.slice(index).map(unquoteCommandToken) };
+        const resolvedPath = resolveConfiguredExecutable(possiblePath, options.projectRoot);
+        if (await executable(resolvedPath, discoveryDeadline, fileSystem)) {
+          parts = { command: resolvedPath, args: tokens.slice(index).map(unquoteCommandToken) };
           break;
         }
       }
+    }
+    if (candidate.explicit) {
+      parts = { ...parts, command: resolveConfiguredExecutable(parts.command, options.projectRoot) };
     }
     const paths = candidate.explicit
       ? [parts.command]
