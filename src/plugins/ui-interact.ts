@@ -418,15 +418,48 @@ export const uiInteractPlugin = definePlugin({
                   typeof instance.blur === 'function') instance.blur();
               } else {
                 var value = props.value;
-                var end = value.length;
-                var last = end > 0 ? value.charCodeAt(end - 1) : 0;
-                var previous = end > 1 ? value.charCodeAt(end - 2) : 0;
-                // Remove one complete Unicode code point. Hermes supports
-                // these primitive operations on all supported RN versions.
-                if (last >= 0xdc00 && last <= 0xdfff &&
-                  previous >= 0xd800 && previous <= 0xdbff) end -= 2;
-                else if (end > 0) end -= 1;
-                props.onChangeText(value.slice(0, end));
+                // A controlled value does not reveal the native caret. Only
+                // synthesize DELETE when React exposes a valid UTF-16
+                // selection; otherwise let the native provider preserve the
+                // current selection and key-event behavior.
+                var selection = props.selection;
+                if (!selection || typeof selection !== 'object' ||
+                  typeof selection.start !== 'number' || typeof selection.end !== 'number' ||
+                  selection.start !== selection.start || selection.end !== selection.end ||
+                  selection.start % 1 !== 0 || selection.end % 1 !== 0 ||
+                  selection.start < 0 || selection.end < selection.start ||
+                  selection.end > value.length) {
+                  nativeRequired = true;
+                  return { prune: true };
+                }
+                var start = selection.start;
+                var end = selection.end;
+                // A stale or malformed selection which splits a surrogate
+                // pair must be resolved by the native input.
+                if ((start > 0 && start < value.length &&
+                    value.charCodeAt(start - 1) >= 0xd800 && value.charCodeAt(start - 1) <= 0xdbff &&
+                    value.charCodeAt(start) >= 0xdc00 && value.charCodeAt(start) <= 0xdfff) ||
+                  (end > 0 && end < value.length &&
+                    value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff &&
+                    value.charCodeAt(end) >= 0xdc00 && value.charCodeAt(end) <= 0xdfff)) {
+                  nativeRequired = true;
+                  return { prune: true };
+                }
+                if (start === end) {
+                  if (start === 0) {
+                    nativeRequired = true;
+                    return { prune: true };
+                  }
+                  start -= 1;
+                  // Remove one complete Unicode code point. Hermes supports
+                  // these primitive operations on all supported RN versions.
+                  if (start > 0 &&
+                    value.charCodeAt(start) >= 0xdc00 && value.charCodeAt(start) <= 0xdfff &&
+                    value.charCodeAt(start - 1) >= 0xd800 && value.charCodeAt(start - 1) <= 0xdbff) {
+                    start -= 1;
+                  }
+                }
+                props.onChangeText(value.slice(0, start) + value.slice(end));
               }
               handled = true;
               return { prune: true };
