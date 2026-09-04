@@ -251,12 +251,16 @@ describe('UI handler actions without native inventory', () => {
     }
   });
 
-  test('invokes controlled Paper and Fabric handlers with exact empty payloads', async () => {
+  test('invokes controlled Paper and Fabric submit handlers with exact empty payloads', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
-      const harness = await pressTextInputKeys({ renderer, value: '' });
+      const harness = await createAppOnlyHarness({ renderer, value: '' });
+      const press = harness.tools.get('press_button')!;
+      expect(await press.handler(press.parameters.parse({
+        button: 'ENTER',
+        platform: 'auto',
+      }) as Record<string, unknown>)).toBe('Pressed ENTER');
       expect(harness.reactCalls).toEqual([
         { type: 'submit', value: { nativeEvent: { text: '' } } },
-        { type: 'change', value: '' },
       ]);
       expect(harness.getNativeCalls()).toBe(0);
     }
