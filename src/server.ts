@@ -100,6 +100,16 @@ const execFileAsync = promisify(execFile);
 const logger = createLogger('server');
 const RESOURCE_UPDATE_COALESCE_MS = 250;
 
+/** Keep long-lived plugin contexts aligned with the Metro endpoint in use. */
+export function updateMetroEndpoint(
+  config: Required<MetroMCPConfig>,
+  host: string,
+  port: number,
+): void {
+  config.metro.host = host;
+  config.metro.port = port;
+}
+
 const BUILT_IN_PLUGINS: PluginDefinition[] = [
   consolePlugin,
   networkPlugin,
@@ -620,8 +630,13 @@ export async function createMetroRuntime(
       config: cfg as unknown as Record<string, unknown>,
       logger: pluginLogger,
       metro: {
-        host: cfg.metro.host!,
-        port: cfg.metro.port!,
+        // Auto-discovery can replace the configured endpoint after plugin
+        // contexts are created. Accessors keep fallback transports on the
+        // Metro server that owns the active target.
+        get host() { return cfg.metro.host!; },
+        set host(host: string) { cfg.metro.host = host; },
+        get port() { return cfg.metro.port!; },
+        set port(port: number) { cfg.metro.port = port; },
         fetch: async (path: string) => {
           return fetch(`http://${cfg.metro.host}:${cfg.metro.port}${path}`);
         },
@@ -740,7 +755,7 @@ export async function createMetroRuntime(
           };
           await cdpSession.connectToTarget(target);
           eventsClient.connect(metroHost, metroPort);
-          config.metro.port = metroPort;
+          updateMetroEndpoint(config, metroHost, metroPort);
           targetPin ??= createMetroTargetPin(
             { host: metroHost, port: metroPort },
             target,
@@ -835,7 +850,7 @@ export async function createMetroRuntime(
         return false;
       }
       const { server, target } = selected;
-      config.metro.port = server.port;
+      updateMetroEndpoint(config, server.host, server.port);
 
       // Set active device key BEFORE connecting so plugin event handlers
       // that fire on the 'reconnected' event can store events immediately.
