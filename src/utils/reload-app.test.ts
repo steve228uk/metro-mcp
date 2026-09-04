@@ -203,6 +203,17 @@ describe('verified app reload', () => {
     expect(await reloadApp(app.ctx, 500)).toMatchObject({ status: 'failed', dispatch: 'not-sent', verified: false });
     expect(messages).toEqual([]);
   });
+
+  test('treats Metro Bridge disconnected-target errors as unsent', async () => {
+    const messages: Record<string, unknown>[] = [];
+    const socketTarget = await messageServer({ selected: 'app=com.example.app&device=Test+Device' }, (message) => messages.push(message));
+    const app = harness(async () => { throw new Error('Not connected to CDP target'); }, socketTarget);
+    expect(await reloadApp(app.ctx, 500)).toMatchObject({
+      status: 'failed', method: 'Page.reload', dispatch: 'not-sent', verified: false,
+    });
+    expect(messages).toEqual([]);
+    expect(app.reloads).toBe(1);
+  });
 });
 
 test('message peer selection requires a unique app and device match', () => {

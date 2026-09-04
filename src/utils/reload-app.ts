@@ -157,6 +157,10 @@ export async function reloadApp(ctx: PluginContext, timeout: number): Promise<Re
     dispatch = 'submitted';
   } catch (error) {
     dispatchError = error instanceof Error ? error.message : String(error);
+    // Metro Bridge reports this exact error before a CDP request can be
+    // dispatched. Keep the operation definitively unsent; retrying through
+    // another transport could turn a stale target into a duplicate reload.
+    if (dispatchError === 'Not connected to CDP target') dispatch = 'not-sent';
     if (/unsupported method|method not found|method not supported|'Page\.reload' wasn't found/i.test(dispatchError)) {
       method = 'metro-message';
       dispatch = 'not-sent';
