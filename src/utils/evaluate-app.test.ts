@@ -728,6 +728,48 @@ describe('shared app evaluation policy', () => {
       'L: try { Promise.resolve("guarded"); } finally { "use strict"; Promise.resolve("discarded finalizer"); if (false) break L; }',
       { awaitPromise: true, timeout: 1000 },
     )).resolves.toBe('guarded');
+
+    const nestedFinallyExit = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(nestedFinallyExit(
+      'L: try { Promise.resolve("outer"); } finally { try { Promise.resolve("inner"); } finally { break L; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('inner');
+
+    const nestedConditionalFinallyExit = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(nestedConditionalFinallyExit(
+      'globalThis.flag = false; L: try { Promise.resolve("outer"); } finally { try { Promise.resolve("inner"); } finally { if (flag) break L; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('outer');
+
+    const nestedFinallyContinue = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(nestedFinallyContinue(
+      'let i = 0; L: while (i < 1) { i += 1; try { Promise.resolve("outer"); } finally { try { Promise.resolve("inner"); } finally { continue L; } } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('inner');
+
+    const conditionalGuardedBreak = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(conditionalGuardedBreak(
+      'globalThis.flag = true; L: { Promise.resolve("before"); try { if (flag) Promise.resolve("guarded"); else {} } finally { break L; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('guarded');
+
+    const emptyGuardedBreak = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(emptyGuardedBreak(
+      'globalThis.flag = false; L: { Promise.resolve("before"); try { if (flag) Promise.resolve("guarded"); else {} } finally { break L; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('before');
+
+    const conditionalGuardedContinue = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(conditionalGuardedContinue(
+      'globalThis.flag = true; let i = 0; L: while (i < 1) { i += 1; Promise.resolve("before"); try { if (flag) Promise.resolve("guarded"); else {} } finally { continue L; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('guarded');
+
+    const emptyGuardedContinue = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(emptyGuardedContinue(
+      'globalThis.flag = false; let i = 0; L: while (i < 1) { i += 1; Promise.resolve("before"); try { if (flag) Promise.resolve("guarded"); else {} } finally { continue L; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('before');
   });
 
   test('observes a completion expression before trailing declarations', async () => {
