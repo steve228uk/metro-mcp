@@ -20,6 +20,7 @@ interface TargetFixture {
   id: string;
   name: string;
   opaque?: boolean;
+  inventoryId?: string;
 }
 
 function appWithDeepButton() {
@@ -196,7 +197,7 @@ async function createHarness(
         const devices = targetFixture?.platform === 'ios'
           ? [{
               name: targetFixture.name,
-              udid: targetFixture.id,
+              udid: targetFixture.inventoryId ?? targetFixture.id,
               state: 'Booted',
               isAvailable: true,
             }]
@@ -207,7 +208,7 @@ async function createHarness(
       }
       if (command === 'adb') {
         const device = targetFixture?.platform === 'android'
-          ? `${targetFixture.id}\tdevice model:${targetFixture.name.replace(/[^a-zA-Z0-9]/g, '_')}`
+          ? `${targetFixture.inventoryId ?? targetFixture.id}\tdevice model:${targetFixture.name.replace(/[^a-zA-Z0-9]/g, '_')}`
           : '';
         return Buffer.from(`List of devices attached\n${device}\n`);
       }
@@ -886,6 +887,32 @@ describe('test recorder readiness', () => {
     }));
     expect(explicit).toContain('"appium:bundleId": "com.explicit.ios"');
     expect(explicit).not.toContain('com.connected.android');
+  });
+
+  test('compares Android target serials case-sensitively', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'SERIAL-ABC',
+      inventoryId: 'serial-abc',
+      name: 'Pixel QA',
+    });
+
+    await expect(call('generate_wdio_config', { platform: 'android' }))
+      .resolves.toContain('could not be verified as the resolved android device');
+  });
+
+  test('retains normalized Android name verification for opaque inspector IDs', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'opaque-inspector-id',
+      inventoryId: 'emulator-5554',
+      name: 'Pixel QA',
+    });
+
+    await expect(call('generate_wdio_config', { platform: 'android' }))
+      .resolves.toContain('"appium:appPackage": "com.connected.android"');
   });
 
   test('does not treat a sole-device fallback as proof of the app ID platform', async () => {

@@ -35,7 +35,13 @@ function targetIdentifiesResolvedDevice(
   device: ResolvedDevice,
 ): boolean {
   const targetId = target.reactNative?.logicalDeviceId?.trim();
-  if (targetId && targetId.toLowerCase() === device.id.toLowerCase()) return true;
+  if (targetId) {
+    if (device.platform === 'android') {
+      if (targetId === device.id) return true;
+      if (targetId.toLowerCase() === device.id.toLowerCase()) return false;
+    }
+    if (targetId.toLowerCase() === device.id.toLowerCase()) return true;
+  }
 
   const targetName = target.deviceName?.trim();
   if (!targetName || !device.name) return false;
