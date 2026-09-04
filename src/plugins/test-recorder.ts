@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 import { readdir, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -52,10 +53,19 @@ const RECORDER_METADATA_JS = `
   }
 `;
 
-const START_RECORDING_JS = `
+const START_RECORDING_JS = (sessionId: string, epoch: string, attemptOrder: number) => `
 (function() {
   var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
   if (!hook || !hook.getFiberRoots) return false;
+
+  // Concurrent starts can be evaluated out of order. Once a later attempt
+  // from this server instance has installed a recorder, an older attempt must
+  // leave it intact rather than cleaning it up and taking ownership back.
+  var currentState = globalThis.__METRO_MCP_REC_STATE__;
+  if (currentState && currentState.epoch === ${JSON.stringify(epoch)} &&
+      Number(currentState.attemptOrder) > ${attemptOrder}) {
+    return { __mcpRecorderSession: ${JSON.stringify(RECORDER_SESSION_REPLACED)} };
+  }
 
   // A previous session may have been interrupted by a disconnected CDP
   // session. Clean it up when it is still the current installation.
@@ -63,10 +73,10 @@ const START_RECORDING_JS = `
     try { globalThis.__METRO_MCP_REC_CLEANUP__(); } catch (_) {}
   }
 
-  var counter = Number(globalThis.__METRO_MCP_REC_SESSION_COUNTER__ || 0) + 1;
-  globalThis.__METRO_MCP_REC_SESSION_COUNTER__ = counter;
   var state = {
-    sessionId: 'recording-' + counter + '-' + Date.now(),
+    sessionId: ${JSON.stringify(sessionId)},
+    epoch: ${JSON.stringify(epoch)},
+    attemptOrder: ${attemptOrder},
     capture: false,
     active: true,
     ready: false,
@@ -351,7 +361,7 @@ const START_RECORDING_JS = `
     }
   }, { routes: [] });
 
-  return true;
+  return state.sessionId;
 })()
 `;
 
@@ -417,6 +427,25 @@ const CLEANUP_RECORDING_JS = `(function() {
   globalThis.__METRO_MCP_REC_ACTIVE__ = false;
   return true;
 })()`;
+
+const RECORDER_SESSION_REPLACED = '__mcp_recorder_session_replaced__';
+
+function sessionGuardedExpression(expression: string, sessionId: string): string {
+  return `(function() {
+    var state = globalThis.__METRO_MCP_REC_STATE__;
+    if (!state || state.sessionId !== ${JSON.stringify(sessionId)})
+      return { __mcpRecorderSession: ${JSON.stringify(RECORDER_SESSION_REPLACED)} };
+    return (${expression});
+  })()`;
+}
+
+function sessionCleanupExpression(sessionId: string): string {
+  return `(function() {
+    var state = globalThis.__METRO_MCP_REC_STATE__;
+    if (!state || state.sessionId !== ${JSON.stringify(sessionId)}) return false;
+    return ${CLEANUP_RECORDING_JS};
+  })()`;
+}
 
 interface RecordingReadiness {
   ready?: boolean;
@@ -573,6 +602,8 @@ export const testRecorderPlugin = definePlugin({
   description: 'Unified mobile test recorder: captures taps, text entry, swipes and navigation via fiber patching; generates Appium, Maestro, and Detox tests',
 
   async setup(ctx) {
+    const recorderEpoch = randomUUID();
+    let recorderStartCounter = 0;
 
     // ────────────────────────────────────────────────────────────────────────────
     // start_test_recording
@@ -588,26 +619,32 @@ export const testRecorderPlugin = definePlugin({
       parameters: z.object({}),
       handler: async () => {
         storedEvents = null;
+        const attemptOrder = ++recorderStartCounter;
+        const attemptSessionId = `recording-${recorderEpoch}-${attemptOrder}`;
 
         // Keep injection, readiness, activation, and the final route lookup
         // inside one startup budget. EvalOptions.deadline also bounds any
         // reconnect wait in the shared app evaluator; per-request timeouts
         // must never reserve time beyond this deadline.
         const deadline = Date.now() + 6000;
-        const evaluateStartup = async (expression: string, timeout: number) => {
+        const evaluateStartup = async (expression: string, timeout: number, sessionId?: string) => {
           const remaining = deadline - Date.now();
           if (remaining <= 0) throw new Error('recording startup deadline exceeded');
-          return ctx.evalInApp(expression, {
+          // A later concurrent startup may replace the app-side session while
+          // this request is waiting for readiness. Guard every post-injection
+          // expression so the older request cannot activate or inspect the
+          // newer recorder.
+          return ctx.evalInApp(sessionId ? sessionGuardedExpression(expression, sessionId) : expression, {
             timeout: Math.min(timeout, remaining),
             deadline,
           });
         };
-        const cleanupBestEffort = async () => {
+        const cleanupBestEffort = async (sessionId: string) => {
           // Cleanup has its own short deadline so an exhausted readiness budget
           // cannot leave recorder hooks installed, while reconnects and the
           // cleanup transport are still bounded.
           const cleanupDeadline = Date.now() + 1000;
-          await ctx.evalInApp(CLEANUP_RECORDING_JS, {
+          await ctx.evalInApp(sessionCleanupExpression(sessionId), {
             timeout: 1000,
             deadline: cleanupDeadline,
           }).catch(() => {});
@@ -616,18 +653,27 @@ export const testRecorderPlugin = definePlugin({
         let injected: unknown;
         let injectError = 'script returned false (check __REACT_DEVTOOLS_GLOBAL_HOOK__ availability)';
         try {
-          injected = await evaluateStartup(START_RECORDING_JS, 6000);
+          injected = await evaluateStartup(
+            START_RECORDING_JS(attemptSessionId, recorderEpoch, attemptOrder),
+            6000,
+          );
         } catch (err) {
           injectError = err instanceof Error ? err.message : String(err);
           injected = false;
+        }
+        if (isRecorderSessionReplaced(injected)) {
+          return 'Could not start recording — this recorder startup was replaced by a newer startup; the newer recorder remains active.';
         }
         if (!injected) {
           // CDP can report a transport error after the app evaluated part of
           // the script. Always attempt cleanup for a partially-installed
           // session before returning the failure.
-          await cleanupBestEffort();
+          await cleanupBestEffort(attemptSessionId);
           return `Could not inject recording hooks — ${injectError}`;
         }
+
+        const sessionId = typeof injected === 'string' ? injected : attemptSessionId;
+        let sessionReplaced = false;
 
         // The injection only installs instrumentation. Wait for a complete
         // bounded scan after React has had a chance to refresh frozen props;
@@ -638,7 +684,12 @@ export const testRecorderPlugin = definePlugin({
           try {
             const remaining = deadline - Date.now();
             if (remaining <= 0) break;
-            readiness = await evaluateStartup(RECORDING_READINESS_JS, Math.min(1000, remaining)) as RecordingReadiness;
+            const readinessResult = await evaluateStartup(RECORDING_READINESS_JS, Math.min(1000, remaining), sessionId);
+            if (isRecorderSessionReplaced(readinessResult)) {
+              sessionReplaced = true;
+              break;
+            }
+            readiness = readinessResult as RecordingReadiness;
             if (readiness?.ready) break;
           } catch (err) {
             injectError = err instanceof Error ? err.message : String(err);
@@ -647,8 +698,11 @@ export const testRecorderPlugin = definePlugin({
           if (remaining <= 0) break;
           await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
         }
+        if (sessionReplaced) {
+          return 'Could not start recording — this recorder startup was replaced by a newer startup; the newer recorder remains active.';
+        }
         if (!readiness?.ready) {
-          await cleanupBestEffort();
+          await cleanupBestEffort(sessionId);
           const reason = readiness?.traversal?.truncationReason
             ?? (readiness?.unwrapped?.length
               ? `unwrapped handlers: ${[...new Set(readiness.unwrapped)].join(', ')}`
@@ -656,17 +710,25 @@ export const testRecorderPlugin = definePlugin({
           return `Could not start recording — React handler coverage did not become ready within 6000ms (${reason}). Instrumentation cleanup was attempted.`;
         }
 
-        const activated = (deadline - Date.now() > 0
-          ? await evaluateStartup(ACTIVATE_RECORDING_JS, 1000).catch(() => false)
+        const activationResult = (deadline - Date.now() > 0
+          ? await evaluateStartup(ACTIVATE_RECORDING_JS, 1000, sessionId).catch(() => false)
           : false);
+        if (isRecorderSessionReplaced(activationResult)) {
+          return 'Could not start recording — this recorder startup was replaced by a newer startup; the newer recorder remains active.';
+        }
+        const activated = activationResult === true;
         if (!activated) {
-          await cleanupBestEffort();
+          await cleanupBestEffort(sessionId);
           return 'Could not start recording — capture activation failed. Instrumentation cleanup was attempted.';
         }
 
-        const route = (deadline - Date.now() > 0
-          ? await evaluateStartup(CURRENT_ROUTE_JS, 3000).catch(() => null)
+        const routeResult = (deadline - Date.now() > 0
+          ? await evaluateStartup(CURRENT_ROUTE_JS, 3000, sessionId).catch(() => null)
           : null) as string | null;
+        if (isRecorderSessionReplaced(routeResult)) {
+          return 'Could not start recording — this recorder startup was replaced by a newer startup; the newer recorder remains active.';
+        }
+        const route = routeResult;
         const routeInfo = route ? ` on screen "${route}"` : '';
         return (
           `Recording started${routeInfo}. ` +
@@ -1022,6 +1084,11 @@ export const testRecorderPlugin = definePlugin({
     });
   },
 });
+
+function isRecorderSessionReplaced(value: unknown): boolean {
+  return !!value && typeof value === 'object' &&
+    (value as { __mcpRecorderSession?: unknown }).__mcpRecorderSession === RECORDER_SESSION_REPLACED;
+}
 
 // ────────────────────────────────────────────────────────────────────────────────
 // Code generators
