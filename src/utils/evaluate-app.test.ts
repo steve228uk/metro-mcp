@@ -443,6 +443,68 @@ describe('shared app evaluation policy', () => {
     }
   });
 
+  test('observes only the final loop completion without touching discarded values', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp(
+      `globalThis.observedPromises = [];
+       const originalThen = Promise.prototype.then;
+       globalThis.originalThen = originalThen;
+       Promise.prototype.then = function(...args) {
+         if (this.marker) globalThis.observedPromises.push(this.marker);
+         return originalThen.apply(this, args);
+       };
+       function marked(value, marker) { value.marker = marker; return value; }
+       for (let index = 0; index < 2; index += 1) {
+         if (index === 0) marked(Promise.resolve('discarded loop value'), 'discarded');
+         else marked(Promise.resolve('final loop completion'), 'final');
+       }`,
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('final loop completion');
+    expect(transport.context.observedPromises).toContain('final');
+    expect(transport.context.observedPromises).not.toContain('discarded');
+    await expect(evalInApp('Promise.prototype.then = globalThis.originalThen; void 0;', {
+      awaitPromise: false,
+    })).resolves.toBeUndefined();
+  });
+
+  test('uses the intrinsic global when the source shadows globalThis', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp(
+      'let globalThis = { shadowed: true }; Promise.resolve(7);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(7);
+
+    const byValue = vmTransport();
+    const evaluateByValue = createAppEvaluator(byValue.transport, lifecycle());
+    await expect(evaluateByValue('let globalThis = null; 42;', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBe(42);
+  });
+
+  test('preserves directive prologues while observing the final completion', async () => {
+    const { transport, calls } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp('"use strict"; Promise.resolve(8);', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBe(8);
+    const sourceCall = calls.find((call) =>
+      call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('"use strict"'));
+    expect(String(sourceCall?.params.expression).startsWith('"use strict";')).toBe(true);
+    await expect(evalInApp('"use strict"; if (false) Promise.resolve(9)', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBe('use strict');
+    await expect(evalInApp('Promise.resolve(9) // trailing line comment', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBe(9);
+  });
+
   test('observes completion Promises through control-flow statements before a delayed response', async () => {
     const sources = [
       '{ Promise.reject(new Error("block completion rejection")); }',
@@ -690,7 +752,7 @@ describe('shared app evaluation policy', () => {
     })).resolves.toBe(6);
     expect(calls.some((call) =>
       call.method === 'Runtime.evaluate' &&
-      String(call.params.expression).includes('observePromise'))).toBe(true);
+      String(call.params.expression).includes('PromiseCtor.prototype.then.call'))).toBe(true);
   });
 
   test('keeps anonymous and async/generator declarations direct', async () => {
@@ -774,7 +836,7 @@ describe('shared app evaluation policy', () => {
     let generation = 0;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+          String(params?.expression).includes('Object.defineProperty(root')) {
         setupAttempts += 1;
       }
       if (method === 'Runtime.evaluate' &&
@@ -806,7 +868,7 @@ describe('shared app evaluation policy', () => {
     let setupAttempts = 0;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+          String(params?.expression).includes('Object.defineProperty(root')) {
         setupAttempts += 1;
         if (setupAttempts === 1) throw new Error('WebSocket closed');
       }
@@ -946,7 +1008,7 @@ describe('shared app evaluation policy', () => {
     transport.send = async (method, params) => {
       const result = await originalSend(method, params);
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+          String(params?.expression).includes('Object.defineProperty(root')) {
         generation += 1;
       }
       return result;
@@ -974,7 +1036,7 @@ describe('shared app evaluation policy', () => {
     const originalSend = transport.send;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+          String(params?.expression).includes('Object.defineProperty(root')) {
         mailboxSetups += 1;
       }
       return originalSend(method, params);
@@ -1100,7 +1162,7 @@ describe('shared app evaluation policy', () => {
       send: async (method: string, params?: Record<string, unknown>, options?: Record<string, unknown>) => {
         calls.push({ method, options });
         if (method === 'Runtime.evaluate' &&
-            String(params?.expression).includes('Object.defineProperty(globalThis')) {
+            String(params?.expression).includes('Object.defineProperty(root')) {
           return { result: { value: true } };
         }
         if (method === 'Runtime.evaluate') {
