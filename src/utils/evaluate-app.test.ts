@@ -226,6 +226,20 @@ describe('shared app evaluation policy', () => {
       String(call.params.expression).includes('executionCount'))).toHaveLength(1);
   });
 
+  test('settles hostile Promise rejection reasons instead of timing out', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      'Promise.reject(Object.create(null))',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('unstringifiable reason');
+    await expect(evalInApp(
+      'Promise.reject({ get message() { throw new Error("message unavailable"); } })',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('[object Object]');
+  });
+
   test('reconnects mailbox reads without replaying the original source', async () => {
     const { transport, calls } = vmTransport();
     let firstPoll = true;
@@ -458,6 +472,30 @@ describe('shared app evaluation policy', () => {
       .rejects.toThrow('timed out');
     expect(Date.now() - started).toBeLessThan(500);
     expect(calls).toHaveLength(4); // setup, source, stalled poll, and bounded cleanup
+  });
+
+  test('does not reconnect after a mailbox poll rejects after the deadline', async () => {
+    const { transport } = vmTransport();
+    const originalSend = transport.send;
+    let reconnects = 0;
+    transport.send = async (method, params, options) => {
+      if (method === 'Runtime.evaluate' && String(params?.expression).includes('return { status:')) {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        throw new Error('WebSocket closed');
+      }
+      return originalSend(method, params, options);
+    };
+    const evalInApp = createAppEvaluator(transport, lifecycle({
+      reconnect: async () => { reconnects += 1; },
+    }));
+
+    await expect(evalInApp(
+      'globalThis.executionCount = (globalThis.executionCount || 0) + 1; Promise.resolve(executionCount);',
+      { awaitPromise: true, timeout: 30 },
+    )).rejects.toThrow('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(reconnects).toBe(0);
   });
 
   test('bounds reconnect recovery after a dropped mailbox read', async () => {
