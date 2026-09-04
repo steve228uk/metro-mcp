@@ -21,6 +21,7 @@ function runnerFor(options: {
   ios?: string[];
   android?: string;
   iosFailure?: boolean;
+  iosMissingSimctl?: boolean;
   iosUnavailable?: boolean;
   androidFailure?: boolean;
   androidUnavailable?: boolean;
@@ -36,6 +37,12 @@ function runnerFor(options: {
       if (command === 'xcrun') {
         if (options.iosUnavailable) {
           throw Object.assign(new Error('spawn xcrun ENOENT'), { code: 'ENOENT' });
+        }
+        if (options.iosMissingSimctl) {
+          throw Object.assign(
+            new Error('Command failed: xcrun: error: unable to find utility "simctl", not a developer tool or in PATH'),
+            { code: 69, stderr: 'xcrun: error: unable to find utility "simctl", not a developer tool or in PATH' },
+          );
         }
         if (options.iosFailure) throw new Error('simctl unavailable');
         const output = ios.shift() ?? ios.at(-1) ?? iosInventory([]);
@@ -109,6 +116,17 @@ describe('device discovery', () => {
   test('uses a unique Android name when xcrun is unavailable for a connected target', async () => {
     const runner = runnerFor({
       iosUnavailable: true,
+      android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).resolves.toMatchObject({ platform: 'android', id: 'emulator-42' });
+  });
+
+  test('uses a verified Android target when xcrun cannot find simctl', async () => {
+    const runner = runnerFor({
+      iosMissingSimctl: true,
       android: 'List of devices attached\nemulator-42\tdevice model:Pixel_8\n',
     });
     await expect(resolveDevice(runner, 'auto', {
