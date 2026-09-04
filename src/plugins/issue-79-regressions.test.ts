@@ -16,6 +16,7 @@ function createContext(options: {
   ios?: string[];
   android?: string[];
   connected?: boolean;
+  packageName?: string | null;
   target?: { deviceName: string; logicalDeviceId: string };
 }) {
   const tools = new Map<string, RegisteredTool>();
@@ -46,7 +47,11 @@ function createContext(options: {
       handler: config.handler as RegisteredTool['handler'],
     }),
     registerResource: () => {}, registerAppResource: () => {}, registerPrompt: () => {},
-    config: { packageName: 'com.example.app' },
+    config: options.packageName === undefined
+      ? { packageName: 'com.example.app' }
+      : options.packageName === null
+        ? {}
+        : { packageName: options.packageName },
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
     metro: { host: 'localhost', port: 8081, fetch: async () => new Response() },
     exec: async (command) => {
@@ -79,6 +84,25 @@ function createContext(options: {
 }
 
 describe('issue 79 device discovery regressions', () => {
+  test('requests a package name instead of using a stale disconnected target title', async () => {
+    const harness = createContext({
+      inventory: 'android',
+      connected: false,
+      packageName: null,
+      target: { deviceName: 'Old emulator', logicalDeviceId: 'old-serial' },
+    });
+    await permissionsPlugin.setup(harness.ctx);
+    const tool = harness.tools.get('grant_permission')!;
+
+    const result = await tool.handler(tool.parameters.parse({
+      platform: 'auto',
+      service: 'camera',
+    }) as Record<string, unknown>);
+
+    expect(result).toBe('Bundle ID / package name required. Provide bundleId or ensure the app is running.');
+    expect(harness.execCalls).toEqual([]);
+  });
+
   test('filesystem resolves a replacement device when its disconnected target is stale', async () => {
     const harness = createContext({
       inventory: 'android',

@@ -107,7 +107,9 @@ export const permissionsPlugin = definePlugin({
       if (platform === 'android' && config.packageName)
         return (bundleIdCache = String(config.packageName));
       if (config.bundleId) return (bundleIdCache = String(config.bundleId));
-      const title = ctx.cdp.getTarget()?.title;
+      // metro-bridge can retain the last target after its CDP connection has
+      // closed.  That title must not identify a replacement native device.
+      const title = ctx.cdp.isConnected ? ctx.cdp.getTarget()?.title : undefined;
       if (title) {
         const match = title.match(/^(.+?)\s+\(/);
         if (match?.[1]) return (bundleIdCache = match[1]);
