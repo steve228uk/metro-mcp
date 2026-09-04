@@ -394,7 +394,7 @@ describe('shared app evaluation policy', () => {
       call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('immediate rejection'));
     expect(sourceCall?.params.awaitPromise).toBe(false);
-    expect(String(sourceCall?.params.expression)).toContain('promiseThen.call');
+    expect(String(sourceCall?.params.expression)).toContain('state.observe(value)');
     expect(calls.filter((call) =>
       call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('immediate rejection'))).toHaveLength(1);
@@ -465,27 +465,29 @@ describe('shared app evaluation policy', () => {
       `markedThenable('discarded branch value', 'discarded-branch');
        if (false) markedThenable('untaken', 'untaken');`,
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBeUndefined();
+    )).resolves.toBe('discarded branch value');
     await expect(evalInApp(
       `while (true) {
          markedThenable('discarded break value', 'discarded-break');
          if (true) break;
        }`,
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBeUndefined();
-    expect(transport.context.observedThenables).toEqual(['final']);
+    )).resolves.toBe('discarded break value');
+    expect(transport.context.observedThenables).toEqual([
+      'final', 'discarded-branch', 'discarded-break',
+    ]);
     await expect(evalInApp(
       'let index = 0; while (index < 2) { index += 1; if (index === 1) Promise.resolve("first"); }',
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBeUndefined();
+    )).resolves.toBe(2);
     await expect(evalInApp(
       "let switchIndex = 0; while (switchIndex++ < 2) { switch (switchIndex) { case 1: Promise.resolve('kept'); break; default: continue; } }",
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBeUndefined();
+    )).resolves.toBe('kept');
     await expect(evalInApp(
       "let mixedIndex = 0; while (mixedIndex++ < 2) { if (mixedIndex === 1) Promise.resolve('first'); if (false) Promise.resolve('never'); continue; }",
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBeUndefined();
+    )).resolves.toBe('first');
     await expect(evalInApp(
       "let continueIndex = 0; while (continueIndex++ < 2) { Promise.resolve('kept'); continue; }",
       { awaitPromise: true, timeout: 1000 },
@@ -531,6 +533,10 @@ describe('shared app evaluation policy', () => {
       awaitPromise: true,
       timeout: 1000,
     })).resolves.toBe(9);
+    await expect(evalInApp('#! /usr/bin/env node\nPromise.resolve(10)', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBe(10);
   });
 
   test('observes completion Promises through control-flow statements before a delayed response', async () => {
@@ -571,7 +577,7 @@ describe('shared app evaluation policy', () => {
     }
   });
 
-  test('leaves discarded prior values untransformed before empty catch or finally statements', async () => {
+  test('retains prior values through empty catch and finally statements', async () => {
     for (const source of [
       "Promise.resolve('discarded'); try {} finally {}",
       "Promise.resolve('discarded'); try {} catch {}",
@@ -582,7 +588,8 @@ describe('shared app evaluation policy', () => {
         observePromiseRejection: true,
         completionKey: 'empty-completion',
       });
-      expect(calls[0]?.params?.expression).toBe(source);
+      expect(calls[0]?.params?.expression).not.toBe(source);
+      expect(String(calls[0]?.params?.expression)).toContain('Promise.resolve');
     }
   });
 
@@ -615,35 +622,62 @@ describe('shared app evaluation policy', () => {
     }
   });
 
-  test('matches native empty completions across untaken branches and exits', async () => {
+  test('matches Hermes completion inheritance across control-flow paths', async () => {
     const evaluate = (source: string) => createAppEvaluator(vmTransport().transport, lifecycle())(
       source,
       { awaitPromise: true, timeout: 1000 },
     );
 
-    await expect(evaluate('Promise.resolve("discarded"); if (false) 2')).resolves.toBeUndefined();
+    await expect(evaluate('Promise.resolve("discarded"); if (false) 2')).resolves.toBe('discarded');
     await expect(evaluate('while (false) Promise.resolve("discarded")')).resolves.toBeUndefined();
     await expect(evaluate('for (let i = 0; i < 0; i += 1) Promise.resolve("discarded")'))
       .resolves.toBeUndefined();
     await expect(evaluate('while (true) { Promise.resolve("direct"); break; }'))
       .resolves.toBe('direct');
     await expect(evaluate('while (true) { Promise.resolve("conditional"); if (true) break; }'))
-      .resolves.toBeUndefined();
+      .resolves.toBe('conditional');
     await expect(evaluate(
       'let i = 0; while (i < 2) { i += 1; if (i === 1) { Promise.resolve("discarded"); continue; } Promise.resolve("final"); }',
     )).resolves.toBe('final');
     await expect(evaluate('switch (1) { case 1: Promise.resolve("direct"); break; }'))
       .resolves.toBe('direct');
     await expect(evaluate('switch (1) { case 1: Promise.resolve("conditional"); if (true) break; }'))
-      .resolves.toBeUndefined();
+      .resolves.toBe('conditional');
+    await expect(evaluate(
+      'let continueIndex = 0; while (continueIndex++ < 1) { Promise.resolve("conditional continue"); if (true) continue; }',
+    )).resolves.toBe('conditional continue');
+    await expect(evaluate(
+      'let outerIndex = 0; outer: while (outerIndex++ < 2) { if (outerIndex === 1) Promise.resolve("nested value"); else for (let inner = 0; inner < 0; inner += 1) {} }',
+    )).resolves.toBe('nested value');
+    await expect(evaluate(
+      'let emptyIndex = 0; while (emptyIndex++ < 2) { if (emptyIndex === 1) Promise.resolve("empty iteration"); else {} }',
+    )).resolves.toBe('empty iteration');
+    await expect(evaluate(
+      'L: { Promise.resolve("label break"); if (true) break L; Promise.resolve("unreachable"); }',
+    )).resolves.toBe('label break');
+    await expect(evaluate(
+      'L: { Promise.resolve("try break"); try {} finally { if (true) break L; } }',
+    )).resolves.toBe('try break');
+    await expect(evaluate(
+      'L: { Promise.resolve("try catch break"); try { throw new Error("stop"); } catch { if (true) break L; } }',
+    )).resolves.toBe('try catch break');
+    await expect(evaluate(
+      'L: switch (1) { case 1: Promise.resolve("switch label"); if (true) break L; }',
+    )).resolves.toBe('switch label');
+    await expect(evaluate(
+      'L: switch (1) { case 1: try { Promise.resolve("switch finally"); } finally { if (true) break L; } }',
+    )).resolves.toBe('switch finally');
+    await expect(evaluate(
+      'let loopIndex = 0; while (loopIndex++ < 1) { Promise.resolve("loop abrupt"); if (true) break; }',
+    )).resolves.toBe('loop abrupt');
     await expect(evaluate(
       'while (true) { if (true) break; Promise.resolve("unreachable after break"); }',
     )).resolves.toBeUndefined();
     await expect(evaluate(
       'let i = 0; while (i < 1) { i += 1; if (true) continue; Promise.resolve("unreachable after continue"); }',
-    )).resolves.toBeUndefined();
+    )).resolves.toBe(1);
     await expect(evaluate('1; L: { 2; if (false) break L; {} }'))
-      .resolves.toBeUndefined();
+      .resolves.toBe(2);
   });
 
   test('keeps guarded values only when a finally exit is not taken', async () => {
@@ -651,7 +685,7 @@ describe('shared app evaluation policy', () => {
     await expect(taken(
       'globalThis.flag = true; L: try { Promise.resolve("guarded"); } finally { if (flag) break L; }',
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBeUndefined();
+    )).resolves.toBe('guarded');
 
     const skipped = createAppEvaluator(vmTransport().transport, lifecycle());
     await expect(skipped(
@@ -663,7 +697,7 @@ describe('shared app evaluation policy', () => {
     await expect(continued(
       'let i = 0; outer: while (i < 1) { i += 1; try { Promise.resolve("guarded"); } finally { if (i === 1) continue outer; } }',
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBeUndefined();
+    )).resolves.toBe('guarded');
   });
 
   test('observes a completion expression before trailing declarations', async () => {
@@ -677,7 +711,7 @@ describe('shared app evaluation policy', () => {
     const sourceCall = calls.find((call) =>
       call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('trailing declaration rejection'));
-    expect(String(sourceCall?.params.expression)).toContain('promiseThen.call');
+    expect(String(sourceCall?.params.expression)).toContain('state.observe(value)');
   });
 
   test('does not invoke a native Promise subclass then override during observation', async () => {
@@ -722,6 +756,23 @@ describe('shared app evaluation policy', () => {
        value;`,
       { awaitPromise: true, timeout: 1000 },
     )).resolves.toBe(12);
+  });
+
+  test('settles through the realm after an earlier evaluation poisons Promise.then', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp(
+      'Promise.prototype.then = function() { throw new Error("poisoned then"); }; 0;',
+      { awaitPromise: false, timeout: 1000 },
+    )).resolves.toBe(0);
+    await expect(evalInApp(
+      'Promise.resolve(42);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(42);
+    await expect(evalInApp(
+      'Promise.reject(new Error("poisoned rejection"));',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('poisoned rejection');
   });
 
   test('keeps declaration-form scripts in the direct evaluation scope', async () => {
@@ -851,7 +902,7 @@ describe('shared app evaluation policy', () => {
     })).resolves.toBe(6);
     expect(calls.some((call) =>
       call.method === 'Runtime.evaluate' &&
-      String(call.params.expression).includes('promiseThen.call'))).toBe(true);
+      String(call.params.expression).includes('state.observe(value)'))).toBe(true);
   });
 
   test('keeps anonymous and async/generator declarations direct', async () => {
@@ -1024,7 +1075,7 @@ describe('shared app evaluation policy', () => {
     expect(calls.length).toBeGreaterThan(2);
   });
 
-  test('leaves a pre-dispatch settlement loss pending without replay', async () => {
+  test('survives a lost redundant settlement response without replaying the source', async () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
     let settlementAttempts = 0;
@@ -1041,7 +1092,7 @@ describe('shared app evaluation policy', () => {
     await expect(evalInApp(
       'globalThis.executionCount = (globalThis.executionCount || 0) + 1; Promise.resolve(executionCount);',
       { awaitPromise: true, timeout: 40 },
-    )).rejects.toThrow('timed out');
+    )).resolves.toBe(1);
     expect(transport.context).toHaveProperty('executionCount', 1);
     expect(state.state().reconnectCount).toBe(1);
     expect(settlementAttempts).toBe(1);
