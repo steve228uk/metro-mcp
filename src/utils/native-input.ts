@@ -814,7 +814,13 @@ export class NativeInputController {
   private async geometry(target: NativeInputTarget, deadline = this.simviewDeadline()): Promise<({ width: number; height: number; simviewUnavailable?: boolean }) | null> {
     if (target.platform === 'android') {
       try {
-        const output = (await this.options.runner.execFile('adb', ['-s', target.id, 'shell', 'wm', 'size'], { maxBuffer: 16 * 1024 })).toString('utf8');
+        const output = (await boundedExecFile(
+          this.options.runner,
+          'adb',
+          ['-s', target.id, 'shell', 'wm', 'size'],
+          { maxBuffer: 16 * 1024 },
+          deadline,
+        )).toString('utf8');
         const matches = [...output.matchAll(/(Override|Physical) size:\s*(\d+)x(\d+)/gi)];
         const match = matches.findLast((entry) => entry[1]?.toLowerCase() === 'override') ?? matches.at(-1);
         return match ? { width: Number(match[2]), height: Number(match[3]) } : null;
@@ -873,7 +879,13 @@ export class NativeInputController {
 
   private async adb(target: NativeInputTarget, args: string[], description: string): Promise<NativeDispatchResult> {
     try {
-      await this.options.runner.execFile('adb', ['-s', target.id, ...args], { maxBuffer: 64 * 1024 });
+      await boundedExecFile(
+        this.options.runner,
+        'adb',
+        ['-s', target.id, ...args],
+        { maxBuffer: 64 * 1024 },
+        this.simviewDeadline(),
+      );
       return result('adb', 'handled', true, `${description} dispatched to ${target.id}`);
     } catch (error) {
       return result('adb', 'failed', false, error instanceof Error ? error.message : String(error), 'unknown');

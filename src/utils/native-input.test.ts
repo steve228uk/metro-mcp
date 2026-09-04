@@ -385,6 +385,37 @@ describe('native input providers', () => {
     expect((await controller.button({ platform: 'ios', id: 'ios-device' }, 'ENTER')).status).toBe('unsupported');
   });
 
+  test('bounds a stalled Android action and reports uncertain dispatch', async () => {
+    let timeout: number | undefined;
+    const runner = {
+      exec: async () => '',
+      execFile: async (
+        _command: string,
+        _args: string[],
+        options?: { maxBuffer?: number; timeout?: number },
+      ) => {
+        timeout = options?.timeout;
+        return new Promise<Buffer>(() => {});
+      },
+    };
+    const controller = new NativeInputController({
+      runner,
+      simviewRequestTimeoutMs: 20,
+    });
+
+    const started = Date.now();
+    await expect(controller.tap({ platform: 'android', id: 'emulator-5556' }, 1, 2))
+      .resolves.toMatchObject({
+        backend: 'adb',
+        status: 'failed',
+        dispatched: false,
+        dispatch: 'unknown',
+      });
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThanOrEqual(20);
+  });
+
   test('discovers IDB ui key as a provider capability', async () => {
     const runner = fakeRunner();
     const baseExecFile = runner.execFile;
