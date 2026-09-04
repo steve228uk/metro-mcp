@@ -389,6 +389,33 @@ describe('device discovery', () => {
     });
   });
 
+  test('does not use Android target metadata for an ambiguous explicit iOS selection', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'Pixel 8', udid: 'IOS-16', state: 'Booted' },
+        { name: 'iPhone 17', udid: 'IOS-17', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nandroid-1\tdevice model:Pixel_8\n',
+    });
+    await expect(resolveDevice(runner, 'ios', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'android-1' },
+    })).rejects.toThrow('Ambiguous booted iOS simulators');
+  });
+
+  test('does not use iOS target metadata for an ambiguous explicit Android selection', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      android: 'List of devices attached\nandroid-1\tdevice model:Pixel_8\nandroid-2\tdevice model:Pixel_9\n',
+    });
+    await expect(resolveDevice(runner, 'android', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'IOS-16' },
+    })).rejects.toThrow('Ambiguous Android devices');
+  });
+
   test('does not choose the first Android device when target identity is absent', async () => {
     const runner = runnerFor({
       ios: [iosInventory([])],
@@ -408,10 +435,13 @@ describe('device discovery', () => {
         ios: [iosInventory([])],
         android: 'List of devices attached\none\tdevice model:Pixel_8\ntwo\tdevice model:Pixel_8\n',
       });
-      await expect(resolveDevice(duplicates, platform, { deviceName: 'Pixel_8' }))
-        .rejects.toThrow('Ambiguous Android devices named');
+      await expect(resolveDevice(duplicates, platform, {
+        deviceName: 'Pixel_8',
+      }))
+        .rejects.toThrow(platform === 'auto' ? 'Ambiguous Android devices named' : 'Ambiguous Android devices:');
       expect(await resolveDevice(duplicates, platform, {
-        deviceName: 'Pixel_8', reactNative: { logicalDeviceId: 'two' },
+        deviceName: 'Pixel_8',
+        reactNative: { logicalDeviceId: 'two' },
       })).toMatchObject({ platform: 'android', id: 'two' });
     }
   });
@@ -428,7 +458,7 @@ describe('device discovery', () => {
     );
   });
 
-  test('matches a unique inventory name when Metro supplies an opaque logical ID', async () => {
+  test('matches concrete inventory IDs during explicit platform selection', async () => {
     const runner = runnerFor({
       ios: [iosInventory([
         { name: 'First simulator', udid: 'IOS-1', state: 'Booted' },
@@ -436,15 +466,15 @@ describe('device discovery', () => {
       ])],
       android: 'List of devices attached\none\tdevice model:Pixel_8\ntwo\tdevice model:Pixel_9\n',
     });
-    // Metro's logical ID is an inspector identity, not necessarily a simctl
-    // UDID or adb serial. A unique inventory name remains usable evidence.
+    // Explicit platform selection only trusts a concrete inventory ID. Names
+    // alone are not platform-qualified and cannot identify a target safely.
     expect(await resolveDevice(runner, 'ios', {
       deviceName: 'Connected simulator',
-      reactNative: { logicalDeviceId: 'opaque-metro-inspector-id' },
+      reactNative: { logicalDeviceId: 'IOS-2' },
     })).toMatchObject({ id: 'IOS-2' });
     expect(await resolveDevice(runner, 'android', {
       deviceName: 'Pixel_9',
-      reactNative: { logicalDeviceId: 'another-opaque-inspector-id' },
+      reactNative: { logicalDeviceId: 'two' },
     })).toMatchObject({ id: 'two' });
   });
 
@@ -465,13 +495,16 @@ describe('device discovery', () => {
         android: 'List of devices attached\none\tdevice model:Pixel_8\ntwo\tdevice model:Pixel_9_Pro\n',
       });
       expect(await resolveDevice(runner, platform, {
-        deviceName: 'Pixel 9 Pro', reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+        deviceName: 'Pixel 9 Pro',
+        reactNative: { logicalDeviceId: platform === 'android' ? 'two' : 'opaque-inspector-id' },
       })).toMatchObject({ platform: 'android', id: 'two' });
       const duplicates = runnerFor({
         android: 'List of devices attached\none\tdevice model:Pixel_8\ntwo\tdevice model:Pixel_8\n',
       });
-      await expect(resolveDevice(duplicates, platform, { deviceName: 'Pixel 8' }))
-        .rejects.toThrow('Ambiguous Android devices named');
+      await expect(resolveDevice(duplicates, platform, {
+        deviceName: 'Pixel 8',
+      }))
+        .rejects.toThrow(platform === 'auto' ? 'Ambiguous Android devices named' : 'Ambiguous Android devices:');
     }
   });
 
@@ -482,7 +515,8 @@ describe('device discovery', () => {
           android: `List of devices attached\none\tdevice model:Other\ntwo\tdevice model:${model}\n`,
         });
         expect(await resolveDevice(runner, platform, {
-          deviceName: name, reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+          deviceName: name,
+          reactNative: { logicalDeviceId: platform === 'android' ? 'two' : 'opaque-inspector-id' },
         })).toMatchObject({ platform: 'android', id: 'two' });
       }
     }
@@ -490,7 +524,7 @@ describe('device discovery', () => {
       android: 'List of devices attached\none\tdevice model:SM_G991B\ntwo\tdevice model:SM_G991B\n',
     });
     await expect(resolveDevice(collision, 'android', { deviceName: 'SM-G991B' }))
-      .rejects.toThrow('Ambiguous Android devices named');
+      .rejects.toThrow('Ambiguous Android devices:');
   });
 
   test('excludes an unavailable booted entry and supports explicit platform selection', async () => {
