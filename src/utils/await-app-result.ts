@@ -127,56 +127,6 @@ export interface AwaitAppResultOptions {
   setupMailbox?: SetupMailbox;
 }
 
-function serializeCompletionValue(value: unknown): {
-  expression: string;
-  unserializableValue?: string;
-} {
-  if (value === undefined) return { expression: 'void 0' };
-  if (typeof value === 'number') {
-    if (Number.isNaN(value)) return { expression: 'void 0', unserializableValue: 'NaN' };
-    if (value === Number.POSITIVE_INFINITY) return { expression: 'void 0', unserializableValue: 'Infinity' };
-    if (value === Number.NEGATIVE_INFINITY) return { expression: 'void 0', unserializableValue: '-Infinity' };
-    if (Object.is(value, -0)) return { expression: 'void 0', unserializableValue: '-0' };
-  }
-  if (typeof value === 'bigint') {
-    return {
-      expression: 'void 0',
-      unserializableValue: `${value.toString()}n`,
-    };
-  }
-  const serialized = JSON.stringify(value);
-  if (serialized === undefined) {
-    throw new Error('App evaluation result could not be serialized');
-  }
-  return { expression: serialized };
-}
-
-async function completeByValue(
-  evaluate: Evaluate,
-  key: string,
-  value: unknown,
-  options: { deadline: number; timeout: number },
-): Promise<void> {
-  const serialized = serializeCompletionValue(value);
-  const unserializableValue = serialized.unserializableValue === undefined
-    ? 'void 0'
-    : JSON.stringify(serialized.unserializableValue);
-  await evaluateBeforeDeadline(
-    evaluate,
-    `(function() {
-      var root = this;
-      var state = root[${key}];
-      if (state) {
-        state.unserializableValue = ${unserializableValue};
-        state.value = ${serialized.expression};
-        state.status = 'fulfilled';
-      }
-    })()`,
-    options,
-    options.timeout,
-  );
-}
-
 /**
  * Await a read expression without relying on CDP's awaitPromise support.
  * Hermes can return a serialized JS Promise instead of its resolved value.
@@ -328,11 +278,12 @@ export async function awaitAppResult(
         timeout,
       );
     } else {
+      // Runtime.evaluate returns primitives by value when the source has no
+      // remote object completion. They are already complete, so writing them
+      // back through the mailbox would add an unnecessary request and poll.
+      // The finally block still performs best-effort mailbox cleanup.
       sourceCompletedByValue = true;
-      // The source has already executed. A transport failure while writing its
-      // completion is safe to retry through the mailbox evaluator, which owns
-      // reconnect policy and never replays the caller's source.
-      await completeByValue(pollEvaluate, key, completion.value, { deadline, timeout });
+      return completion.value;
     }
 
     while (Date.now() < deadline) {
