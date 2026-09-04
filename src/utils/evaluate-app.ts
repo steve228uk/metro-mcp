@@ -1,4 +1,5 @@
 import type { CDPConnection, EvalOptions } from '../plugin.js';
+import { parse } from '@babel/parser';
 import {
   decodeCDPUnserializableValue,
   extractCDPExceptionMessage,
@@ -23,15 +24,20 @@ export interface AppEvaluationLifecycle {
 }
 
 /** An exception returned by the app runtime, after Runtime.evaluate ran. */
-class AppEvaluationError extends Error {
+export class AppEvaluationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AppEvaluationError';
   }
 }
 
+/** Identify an exception returned by the app after Runtime.evaluate ran. */
+export function isAppEvaluationError(error: unknown): boolean {
+  return error instanceof AppEvaluationError;
+}
+
 function isTransportError(error: unknown): boolean {
-  if (error instanceof AppEvaluationError) return false;
+  if (isAppEvaluationError(error)) return false;
   return (
     error instanceof Error &&
     (error.message === 'WebSocket closed' ||
@@ -48,7 +54,7 @@ function isTransportError(error: unknown): boolean {
 function isDefinitivePreDispatchFailure(error: unknown): boolean {
   return (
     error instanceof Error &&
-    !(error instanceof AppEvaluationError) &&
+    !isAppEvaluationError(error) &&
     error.message === 'Not connected to CDP target'
   );
 }
@@ -93,6 +99,244 @@ async function sendRuntimeEvaluate(
   return result;
 }
 
+type StatementLike = {
+  type: string;
+  body?: unknown;
+  expression?: ExpressionLike;
+  [key: string]: unknown;
+};
+type ExpressionLike = { start: number | null; end: number | null };
+type CompletionPath = {
+  expressions: ExpressionLike[];
+  empty: boolean;
+  normal: boolean;
+};
+type ExitPath = CompletionPath & { label: string | null };
+type Completion = CompletionPath & {
+  breaks: ExitPath[];
+  continues: ExitPath[];
+};
+
+const emptyCompletion = (): Completion => ({
+  expressions: [],
+  empty: true,
+  normal: true,
+  breaks: [],
+  continues: [],
+});
+
+const abruptCompletion = (): Completion => ({
+  expressions: [],
+  empty: false,
+  normal: false,
+  breaks: [],
+  continues: [],
+});
+
+function mergePaths(left: CompletionPath, right: CompletionPath): CompletionPath {
+  return {
+    expressions: [...left.expressions, ...right.expressions],
+    empty: left.empty || right.empty,
+    normal: left.normal || right.normal,
+  };
+}
+
+function mergeCompletions(left: Completion, right: Completion): Completion {
+  const merged = mergePaths(left, right);
+  return {
+    ...merged,
+    breaks: [...left.breaks, ...right.breaks],
+    continues: [...left.continues, ...right.continues],
+  };
+}
+
+function consumeBreaks(completion: Completion, label: string | null = null): Completion {
+  let normal: CompletionPath = completion;
+  const remaining: ExitPath[] = [];
+  for (const path of completion.breaks) {
+    if (path.label === label) normal = mergePaths(normal, path);
+    else remaining.push(path);
+  }
+  return { ...normal, breaks: remaining, continues: completion.continues };
+}
+
+function consumeLoopExits(completion: Completion): Completion {
+  let normal: CompletionPath = completion;
+  const breaks: ExitPath[] = [];
+  const continues: ExitPath[] = [];
+  for (const path of completion.breaks) {
+    if (path.label === null) normal = mergePaths(normal, path);
+    else breaks.push(path);
+  }
+  for (const path of completion.continues) {
+    if (path.label === null) normal = mergePaths(normal, path);
+    else continues.push(path);
+  }
+  return { ...normal, breaks, continues };
+}
+
+function consumeLabelExits(completion: Completion, label: string): Completion {
+  const afterBreaks = consumeBreaks(completion, label);
+  let normal: CompletionPath = afterBreaks;
+  const continues: ExitPath[] = [];
+  for (const path of afterBreaks.continues) {
+    if (path.label === label) normal = mergePaths(normal, path);
+    else continues.push(path);
+  }
+  return { ...normal, breaks: afterBreaks.breaks, continues };
+}
+
+function completionForStatement(statement: StatementLike): Completion {
+  switch (statement.type) {
+    case 'EmptyStatement':
+    case 'VariableDeclaration':
+    case 'FunctionDeclaration':
+    case 'ClassDeclaration':
+    case 'DebuggerStatement':
+      return emptyCompletion();
+    case 'ExpressionStatement':
+      return statement.expression ? {
+        expressions: [statement.expression],
+        empty: false,
+        normal: true,
+        breaks: [],
+        continues: [],
+      } : emptyCompletion();
+    case 'BlockStatement':
+      return Array.isArray(statement.body)
+        ? completionForStatements(statement.body as StatementLike[])
+        : emptyCompletion();
+    case 'IfStatement': {
+      const consequent = completionForStatement(statement.consequent as StatementLike);
+      const alternate = statement.alternate
+        ? completionForStatement(statement.alternate as StatementLike)
+        : emptyCompletion();
+      return mergeCompletions(consequent, alternate);
+    }
+    case 'TryStatement': {
+      const body = completionForStatement(statement.block as StatementLike);
+      const handler = statement.handler
+        ? completionForStatement((statement.handler as { body: StatementLike }).body)
+        : abruptCompletion();
+      const guarded = mergeCompletions(body, handler);
+      if (!statement.finalizer) return guarded;
+      const finalizer = completionForStatement(statement.finalizer as StatementLike);
+      if (!finalizer.normal) return finalizer;
+      // A normal `finally` completion is UpdateEmpty: its expression value is
+      // discarded, while the prior try/catch completion is retained. This is
+      // why `try { 1 } finally { 2 }` evaluates to 1 in a script.
+      return {
+        ...guarded,
+        breaks: [...guarded.breaks, ...finalizer.breaks],
+        continues: [...guarded.continues, ...finalizer.continues],
+      };
+    }
+    case 'LabeledStatement':
+      return consumeLabelExits(
+        completionForStatement(statement.body as StatementLike),
+        (statement.label as { name: string } | null | undefined)?.name ?? '',
+      );
+    case 'WithStatement':
+      return completionForStatement(statement.body as StatementLike);
+    case 'SwitchStatement': {
+      const cases = (statement.cases as Array<{ consequent: StatementLike[] }> | undefined) ?? [];
+      let completion = emptyCompletion();
+      for (let index = 0; index < cases.length; index += 1) {
+        const caseCompletion = completionForStatements(
+          cases.slice(index).flatMap((entry) => entry.consequent),
+        );
+        completion = mergeCompletions(
+          completion,
+          consumeBreaks(caseCompletion),
+        );
+      }
+      return completion;
+    }
+    case 'ForStatement':
+    case 'ForInStatement':
+    case 'ForOfStatement':
+    case 'WhileStatement':
+    case 'DoWhileStatement':
+      return mergeCompletions(
+        consumeLoopExits(completionForStatement(statement.body as StatementLike)),
+        emptyCompletion(),
+      );
+    case 'ThrowStatement':
+    case 'ReturnStatement':
+      return abruptCompletion();
+    case 'BreakStatement':
+      return {
+        ...abruptCompletion(),
+        breaks: [{ ...emptyCompletion(), label: (statement.label as { name: string } | null | undefined)?.name ?? null }],
+      };
+    case 'ContinueStatement':
+      return {
+        ...abruptCompletion(),
+        continues: [{ ...emptyCompletion(), label: (statement.label as { name: string } | null | undefined)?.name ?? null }],
+      };
+    default:
+      return abruptCompletion();
+  }
+}
+
+function completionForStatements(statements: StatementLike[]): Completion {
+  let completion = emptyCompletion();
+  for (const statement of statements) {
+    const next = completionForStatement(statement);
+    const breaks: ExitPath[] = [
+      ...completion.breaks,
+      ...next.breaks.map((path) => path.empty ? { ...completion, label: path.label } : path),
+    ];
+    const continues: ExitPath[] = [
+      ...completion.continues,
+      ...next.continues.map((path) => path.empty ? { ...completion, label: path.label } : path),
+    ];
+    if (!next.normal) {
+      return { ...next, breaks, continues };
+    }
+    completion = {
+      ...(next.empty ? mergePaths(completion, next) : next),
+      breaks,
+      continues,
+    };
+  }
+  return completion;
+}
+
+function promiseObservationExpression(expression: string): string {
+  let ast;
+  try {
+    ast = parse(expression, { sourceType: 'script' });
+  } catch {
+    return expression;
+  }
+  const completion = completionForStatements(ast.program.body as StatementLike[]);
+  if (!completion.normal || completion.expressions.length === 0) return expression;
+  const edits = completion.expressions
+    .filter(({ start, end }) => start !== null && end !== null)
+    .map(({ start, end }) => ({ start: start as number, end: end as number }))
+    .filter((edit, index, all) =>
+      all.findIndex((candidate) => candidate.start === edit.start && candidate.end === edit.end) === index,
+    )
+    .sort((left, right) => right.start - left.start);
+  let transformed = expression;
+  for (const { start, end } of edits) {
+    const candidate = expression.slice(start, end);
+    const observer = `(function observePromise(value) {
+      try {
+        var PromiseCtor = globalThis.Promise;
+        if (PromiseCtor) {
+          PromiseCtor.prototype.then.call(value, function() {}, function() {});
+        }
+      } catch (_) {}
+      return value;
+    })((${candidate}
+  ))`;
+    transformed = transformed.slice(0, start) + observer + transformed.slice(end);
+  }
+  return transformed;
+}
+
 /**
  * Send one Runtime.evaluate request and return its by-value completion value.
  *
@@ -123,10 +367,12 @@ export async function evaluateAppScript(
 export async function evaluateAppScriptCompletion(
   cdp: Pick<CDPConnection, 'send'>,
   expression: string,
-  options?: EvalOptions,
+  options?: EvalOptions & { observePromiseRejection?: boolean },
 ): Promise<AppEvaluationCompletion> {
   const result = await sendRuntimeEvaluate(cdp, {
-    expression,
+    expression: options?.observePromiseRejection
+      ? promiseObservationExpression(expression)
+      : expression,
     returnByValue: false,
     awaitPromise: false,
     ...(options?.timeout === undefined ? {} : { timeout: options.timeout }),
@@ -241,7 +487,11 @@ export function createAppEvaluator(
         throw new Error('App evaluation context changed before source dispatch');
       }
       const timeout = boundedRequestTimeout(options);
-      return evaluateAppScriptCompletion(cdp, expression, { timeout, objectGroup: options?.objectGroup });
+      return evaluateAppScriptCompletion(cdp, expression, {
+        timeout,
+        objectGroup: options?.objectGroup,
+        observePromiseRejection: true,
+      });
     };
     try {
       return await evaluateOnce();

@@ -512,6 +512,20 @@ describe('device discovery', () => {
     })).toMatchObject({ id: 'two' });
   });
 
+  test('rejects an unavailable explicit Android target before fallback selection', async () => {
+    for (const status of ['offline', 'unauthorized'] as const) {
+      const runner = runnerFor({
+        android: `List of devices attached\nconnected-android\t${status} model:Pixel_8\nother-android\tdevice model:Pixel_9\n`,
+      });
+      await expect(resolveDevice(runner, 'android', {
+        deviceName: 'Pixel 9',
+        reactNative: { logicalDeviceId: 'connected-android' },
+      })).rejects.toThrow(
+        `Connected Android device "connected-android" is ${status}; refusing to select another device.`,
+      );
+    }
+  });
+
   test('retries discovery on every call after a missed boot', async () => {
     const runner = runnerFor({
       ios: [iosInventory([]), iosInventory([
