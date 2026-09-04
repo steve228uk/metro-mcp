@@ -89,6 +89,9 @@ async function harness(runtime: Record<string, unknown>, appId: string | null = 
   } as unknown as PluginContext);
   return {
     get evaluations() { return evaluations; },
+    async evaluate(expression: string) {
+      return evaluate(expression, { awaitPromise: false, timeout: 1000 });
+    },
     async call(args: Record<string, unknown> = {}) {
       return tool.handler(tool.parameters.parse(args) as Record<string, unknown>, {});
     },
@@ -172,6 +175,20 @@ describe('open_app_settings', () => {
       },
     }]));
     expect(await tool.call()).toBe('Failed to open app settings: native rejected');
+    expect(calls).toBe(1);
+  });
+
+  test('does not reuse a mutable app Promise resolver after opening settings', async () => {
+    let calls = 0;
+    const tool = await harness(registry([{
+      AppRegistry: {}, View: {}, Platform: { OS: 'ios' }, Linking: {
+        openSettings: async () => { calls++; },
+      },
+    }]));
+    await tool.evaluate(
+      'Promise.resolve = function() { throw new Error("mutated resolver"); }; 0;',
+    );
+    expect(await tool.call()).toBe('Opened app settings for com.example.app.');
     expect(calls).toBe(1);
   });
 });

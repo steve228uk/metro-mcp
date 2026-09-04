@@ -47,8 +47,6 @@ export function openAppSettingsExpression(platform: 'auto' | 'ios' | 'android'):
         ? 'Connected app platform does not match requested platform ' + requestedPlatform + '.'
         : 'Unsupported capability: connected app platform could not be verified.');
     }
-    return Promise.resolve(linking.openSettings()).then(function() {
-      return { opened: true, platform: runtimePlatform || null };
-    });
+    return linking.openSettings();
   })()`;
 }
