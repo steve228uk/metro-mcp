@@ -891,13 +891,13 @@ export const testRecorderPlugin = definePlugin({
           ? undefined
           : getConnectedDeviceTarget(ctx);
         let connectedAppId: string | undefined;
+        let connectedDevice: ResolvedDevice | null | undefined;
         if (
           platform !== 'both' &&
           !bundleId &&
           !appPath &&
           connectedTarget?.appId
         ) {
-          let connectedDevice;
           try {
             connectedDevice = await resolveDevice(ctx, 'auto', connectedTarget);
           } catch (error) {
@@ -942,7 +942,9 @@ export const testRecorderPlugin = definePlugin({
             appPath: platform === 'both'
               ? (p === 'ios' ? iosAppPath : androidAppPath)
               : appPath,
-            udid: p === 'ios' ? (iosUdid ?? udid) : (androidUdid ?? udid),
+            udid: p === 'ios'
+              ? (iosUdid ?? udid ?? connectedDevice?.id)
+              : (androidUdid ?? udid ?? connectedDevice?.id),
             deviceName: p === 'ios' ? (iosDeviceName ?? deviceName) : (androidDeviceName ?? deviceName),
             platformVersion: p === 'ios' ? (iosPlatformVersion ?? platformVersion) : (androidPlatformVersion ?? platformVersion),
             noReset,

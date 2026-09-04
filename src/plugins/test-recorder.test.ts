@@ -21,6 +21,10 @@ interface TargetFixture {
   name: string;
   opaque?: boolean;
   inventoryId?: string;
+  inventory?: {
+    ios?: Array<{ name: string; udid: string; state: string; isAvailable?: boolean }>;
+    android?: Array<{ id: string; status: string; model?: string }>;
+  };
 }
 
 function appWithDeepButton() {
@@ -195,21 +199,28 @@ async function createHarness(
     execFile: async (command) => {
       if (command === 'xcrun') {
         const devices = targetFixture?.platform === 'ios'
-          ? [{
-              name: targetFixture.name,
-              udid: targetFixture.inventoryId ?? targetFixture.id,
-              state: 'Booted',
-              isAvailable: true,
-            }]
+          ? targetFixture.inventory?.ios ?? [{
+            name: targetFixture.name,
+            udid: targetFixture.inventoryId ?? targetFixture.id,
+            state: 'Booted',
+            isAvailable: true,
+          }]
           : [];
         return Buffer.from(JSON.stringify({
           devices: { 'com.apple.CoreSimulator.SimRuntime.iOS-26-0': devices },
         }));
       }
       if (command === 'adb') {
-        const device = targetFixture?.platform === 'android'
-          ? `${targetFixture.inventoryId ?? targetFixture.id}\tdevice model:${targetFixture.name.replace(/[^a-zA-Z0-9]/g, '_')}`
-          : '';
+        const devices = targetFixture?.platform === 'android'
+          ? targetFixture.inventory?.android ?? [{
+            id: targetFixture.inventoryId ?? targetFixture.id,
+            status: 'device',
+            model: targetFixture.name.replace(/[^a-zA-Z0-9]/g, '_'),
+          }]
+          : [];
+        const device = devices
+          .map((entry) => `${entry.id}\t${entry.status}${entry.model ? ` model:${entry.model}` : ''}`)
+          .join('\n');
         return Buffer.from(`List of devices attached\n${device}\n`);
       }
       return Buffer.alloc(0);
@@ -865,9 +876,56 @@ describe('test recorder readiness', () => {
     const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], 'com.connected.app');
     const generated = String(await call('generate_wdio_config', { platform: 'ios' }));
     expect(generated).toContain('"appium:bundleId": "com.connected.app"');
+    expect(generated).toContain('"appium:udid": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"');
     expect(generated).toContain('"appium:noReset": true');
     expect(generated).not.toContain('com.example.app');
     expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('uses the verified connected Android serial when inferring the app target', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'emulator-5556',
+      name: 'Pixel QA',
+    });
+    const generated = String(await call('generate_wdio_config', { platform: 'android' }));
+    expect(generated).toContain('"appium:appPackage": "com.connected.android"');
+    expect(generated).toContain('"appium:udid": "emulator-5556"');
+  });
+
+  test('keeps an explicit device override over the verified connected device', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'emulator-5556',
+      name: 'Pixel QA',
+    });
+    const generated = String(await call('generate_wdio_config', {
+      platform: 'android',
+      udid: 'emulator-explicit',
+    }));
+    expect(generated).toContain('"appium:udid": "emulator-explicit"');
+    expect(generated).not.toContain('"appium:udid": "emulator-5556"');
+  });
+
+  test('uses the exact verified device when multiple simulators are booted', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.app',
+      platform: 'ios',
+      id: 'IOS-TARGET',
+      name: 'iPhone Target',
+      inventory: {
+        ios: [
+          { name: 'iPhone Other', udid: 'IOS-OTHER', state: 'Booted', isAvailable: true },
+          { name: 'iPhone Target', udid: 'IOS-TARGET', state: 'Booted', isAvailable: true },
+        ],
+      },
+    });
+    const generated = String(await call('generate_wdio_config', { platform: 'ios' }));
+    expect(generated).toContain('"appium:bundleId": "com.connected.app"');
+    expect(generated).toContain('"appium:udid": "IOS-TARGET"');
+    expect(generated).not.toContain('"appium:udid": "IOS-OTHER"');
   });
 
   test('does not reuse a connected app ID for a different requested platform', async () => {
