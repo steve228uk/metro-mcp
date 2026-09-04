@@ -52,6 +52,8 @@ export interface DeviceDiscoveryRunner {
 const DEVICE_DISCOVERY_TIMEOUT_MS = 5_000;
 
 export interface ConnectedDeviceTarget {
+  id?: string;
+  title?: string;
   appId?: string;
   deviceName?: string;
   reactNative?: { logicalDeviceId?: string };
@@ -66,6 +68,17 @@ export function getConnectedDeviceTarget(
   ctx: { cdp: { isConnected: boolean; getTarget(): ConnectedDeviceTarget | null } },
 ): ConnectedDeviceTarget | undefined {
   return ctx.cdp.isConnected ? ctx.cdp.getTarget() ?? undefined : undefined;
+}
+
+/** Retain the target identity while asynchronous native discovery runs. */
+export function snapshotConnectedDeviceTarget(
+  target: ConnectedDeviceTarget | undefined,
+): ConnectedDeviceTarget | undefined {
+  if (!target) return undefined;
+  return {
+    ...target,
+    ...(target.reactNative ? { reactNative: { ...target.reactNative } } : {}),
+  };
 }
 
 function outputText(output: Buffer | string): string {

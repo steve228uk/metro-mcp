@@ -18,6 +18,8 @@ function createContext(options: {
   connected?: boolean;
   packageName?: string | null;
   target?: { deviceName: string; logicalDeviceId: string };
+  targetTitle?: string;
+  targetAfterInventory?: { title?: string; appId?: string };
 }) {
   const tools = new Map<string, RegisteredTool>();
   const execCalls: string[] = [];
@@ -26,9 +28,17 @@ function createContext(options: {
   const android = [...(options.android ?? (options.inventory === 'android'
     ? ['List of devices attached\nemulator-42\tdevice model:Pixel_8\n']
     : []))];
-  const target = {
+  let target: {
+    id: string;
+    title: string;
+    description: string;
+    type: string;
+    deviceName: string;
+    reactNative: { logicalDeviceId: string };
+    appId?: string;
+  } = {
     id: 'metro-target',
-    title: 'com.example.app (React Native)',
+    title: options.targetTitle ?? 'com.example.app (React Native)',
     description: 'React Native',
     type: 'node',
     deviceName: options.target?.deviceName ?? 'Pixel 8',
@@ -64,6 +74,12 @@ function createContext(options: {
     },
     execFile: async (command, args) => {
       execFileCalls.push([command, ...args]);
+      if (command === 'xcrun' && options.targetAfterInventory) {
+        target = {
+          ...target,
+          ...options.targetAfterInventory,
+        };
+      }
       if (command === 'adb' && options.inventory === 'missing') {
         throw new Error('adb unavailable');
       }
@@ -243,6 +259,62 @@ describe('issue 79 device discovery regressions', () => {
       'xcrun simctl privacy "IOS-1" grant "calendar" "com.example.app"',
     ]);
     expect(harness.execFileCalls.filter(([command]) => command === 'xcrun')).toHaveLength(1);
+  });
+
+  test('derives the permission app ID from the same target snapshot as inventory', async () => {
+    const ios = (udid: string) => JSON.stringify({ devices: {
+      'com.apple.CoreSimulator.SimRuntime.iOS-18-0': [
+        { name: 'iPhone 16', udid, state: 'Booted' },
+      ],
+    } });
+    const harness = createContext({
+      ios: [ios('IOS-1')],
+      target: { deviceName: 'iPhone 16', logicalDeviceId: 'IOS-1' },
+      targetAfterInventory: { title: 'com.other.app (React Native)' },
+    });
+    await permissionsPlugin.setup(harness.ctx);
+    const tool = harness.tools.get('grant_permission')!;
+    const result = await tool.handler(tool.parameters.parse({
+      platform: 'ios', service: 'calendar',
+    }) as Record<string, unknown>);
+
+    expect(result).toContain('Granted');
+    expect(harness.execCalls).toEqual([
+      'xcrun simctl privacy "IOS-1" grant "calendar" "com.example.app"',
+    ]);
+  });
+
+  test('does not reuse an app ID across permission plugin targets', async () => {
+    const ios = (udid: string) => JSON.stringify({ devices: {
+      'com.apple.CoreSimulator.SimRuntime.iOS-18-0': [
+        { name: 'iPhone 16', udid, state: 'Booted' },
+      ],
+    } });
+    const first = createContext({
+      ios: [ios('IOS-1')],
+      target: { deviceName: 'iPhone 16', logicalDeviceId: 'IOS-1' },
+      targetTitle: 'com.first.app (React Native)',
+    });
+    await permissionsPlugin.setup(first.ctx);
+    const firstTool = first.tools.get('grant_permission')!;
+    await firstTool.handler(firstTool.parameters.parse({
+      platform: 'ios', service: 'calendar',
+    }) as Record<string, unknown>);
+
+    const second = createContext({
+      ios: [ios('IOS-2')],
+      target: { deviceName: 'iPhone 16', logicalDeviceId: 'IOS-2' },
+      targetTitle: 'com.second.app (React Native)',
+    });
+    await permissionsPlugin.setup(second.ctx);
+    const secondTool = second.tools.get('grant_permission')!;
+    await secondTool.handler(secondTool.parameters.parse({
+      platform: 'ios', service: 'calendar',
+    }) as Record<string, unknown>);
+
+    expect(second.execCalls).toEqual([
+      'xcrun simctl privacy "IOS-2" grant "calendar" "com.second.app"',
+    ]);
   });
 
   test('uses the originally resolved Android serial for permission reads', async () => {

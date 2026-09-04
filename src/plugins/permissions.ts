@@ -5,11 +5,8 @@ import {
   adbPrefix,
   getConnectedDeviceTarget,
   resolveDevice,
+  snapshotConnectedDeviceTarget,
 } from '../utils/device-discovery.js';
-
-// Bundle IDs are stable for a plugin session; device state is deliberately
-// resolved on every call so a simulator booted after a miss is visible.
-let bundleIdCache: string | null = null;
 
 // TCC service name → friendly name
 const TCC_SERVICE_MAP: Record<string, string> = {
@@ -101,18 +98,19 @@ export const permissionsPlugin = definePlugin({
   description: 'Inspect and manage app permissions on iOS Simulator and Android Emulator',
 
   async setup(ctx) {
-    async function detectBundleId(platform: 'ios' | 'android'): Promise<string | null> {
-      if (bundleIdCache) return bundleIdCache;
+    function detectBundleId(
+      platform: 'ios' | 'android',
+      target: ReturnType<typeof getConnectedDeviceTarget>,
+    ): string | null {
       const config = ctx.config as Record<string, unknown>;
       if (platform === 'android' && config.packageName)
-        return (bundleIdCache = String(config.packageName));
-      if (config.bundleId) return (bundleIdCache = String(config.bundleId));
-      // metro-bridge can retain the last target after its CDP connection has
-      // closed.  That title must not identify a replacement native device.
-      const title = ctx.cdp.isConnected ? ctx.cdp.getTarget()?.title : undefined;
+        return String(config.packageName);
+      if (config.bundleId) return String(config.bundleId);
+      if (target?.appId) return String(target.appId);
+      const title = target?.title;
       if (title) {
         const match = title.match(/^(.+?)\s+\(/);
-        if (match?.[1]) return (bundleIdCache = match[1]);
+        if (match?.[1]) return match[1];
       }
       return null;
     }
@@ -121,14 +119,15 @@ export const permissionsPlugin = definePlugin({
       platform: 'ios' | 'android' | 'auto' | undefined,
       bundleId: string | undefined
     ): Promise<{ p: 'ios' | 'android'; id: string; deviceId: string } | string> {
+      const connected = snapshotConnectedDeviceTarget(getConnectedDeviceTarget(ctx));
       const device = await resolveDevice(
         ctx,
         platform === 'auto' || !platform ? 'auto' : platform,
-        getConnectedDeviceTarget(ctx),
+        connected,
       );
       if (!device) return 'No simulator/emulator detected.';
       const p = device.platform;
-      const id = bundleId || (await detectBundleId(p));
+      const id = bundleId || detectBundleId(p, connected);
       if (!id)
         return 'Bundle ID / package name required. Provide bundleId or ensure the app is running.';
       return { p, id, deviceId: device.id };
@@ -379,10 +378,11 @@ export const permissionsPlugin = definePlugin({
         'Current permission statuses for the connected app (auto-detected platform and bundle ID)',
       mimeType: 'text/plain',
       handler: async () => {
-        const target = await resolveDevice(ctx, 'auto', getConnectedDeviceTarget(ctx));
+        const connected = snapshotConnectedDeviceTarget(getConnectedDeviceTarget(ctx));
+        const target = await resolveDevice(ctx, 'auto', connected);
         if (!target) return '(no simulator/emulator detected)';
         const p = target.platform;
-        const id = await detectBundleId(p);
+        const id = detectBundleId(p, connected);
         if (!id) return `(${p}) bundle ID not detected — run the app first`;
         const perms = await fetchPermissions(p, id, target.id);
         if (typeof perms === 'string') return perms;
