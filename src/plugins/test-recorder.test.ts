@@ -259,7 +259,8 @@ describe('test recorder readiness', () => {
     for (const { options, remaining } of evaluations) {
       expect(options?.timeout).toBeGreaterThan(0);
       expect(options?.timeout).toBeLessThanOrEqual(6000);
-      expect(options?.timeout).toBeLessThanOrEqual(remaining);
+      // `evaluateStartup` and this observer read the clock separately.
+      expect((options?.timeout ?? 0) - remaining).toBeLessThanOrEqual(25);
     }
   });
 
