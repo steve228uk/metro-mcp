@@ -182,7 +182,7 @@ describe('device discovery', () => {
     })).rejects.toThrow('iOS simulator discovery failed');
   });
 
-  test('uses a unique iOS name when adb is unavailable for a connected target', async () => {
+  test('uses a verified iOS target when adb is unavailable for a connected target', async () => {
     const runner = runnerFor({
       ios: [iosInventory([
         { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
@@ -192,8 +192,21 @@ describe('device discovery', () => {
     });
     await expect(resolveDevice(runner, 'auto', {
       deviceName: 'iPhone 17',
-      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+      reactNative: { logicalDeviceId: 'IOS-17' },
     })).resolves.toMatchObject({ platform: 'ios', id: 'IOS-17' });
+  });
+
+  test('does not use a same-name iOS simulator when adb is unavailable', async () => {
+    const runner = runnerFor({
+      ios: [iosInventory([
+        { name: 'Pixel 8', udid: 'IOS-16', state: 'Booted' },
+      ])],
+      androidUnavailable: true,
+    });
+    await expect(resolveDevice(runner, 'auto', {
+      deviceName: 'Pixel 8',
+      reactNative: { logicalDeviceId: 'opaque-inspector-id' },
+    })).rejects.toThrow('Android device discovery failed');
   });
 
   test('uses the sole iOS simulator when adb is unavailable and Metro ID is opaque', async () => {
