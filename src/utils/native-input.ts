@@ -442,7 +442,11 @@ export class NativeInputController {
   private readonly config: Required<NativeInputConfig>;
   private session: SimViewSession | null = null;
   private pendingSession: Promise<SimViewSession> | null = null;
-  private providers: Provider[] | null = null;
+  // Provider availability is independent of the concrete device, but the
+  // supported provider set depends on the target platform. Keep those
+  // discoveries separate so an Android lookup (where IDB is filtered out)
+  // cannot cache an empty result for a later iOS action.
+  private readonly providers = new Map<NativeInputTarget['platform'], Provider[]>();
   private cleanupRegistered = false;
   private cleanupPromise: Promise<void> | null = null;
   private closed = false;
@@ -483,14 +487,17 @@ export class NativeInputController {
     // provider permanent for the lifetime of the controller. A provider can
     // be installed, added to PATH, or recover from a transient probe failure
     // while the daemon is still running.
-    if (!this.providers || this.providers.some((provider) => !provider.available)) {
-      this.providers = await this.discoverProviders(target, deadline);
+    let providers = this.providers.get(target.platform);
+    if (!providers || providers.some((provider) => !provider.available)) {
+      providers = await this.discoverProviders(target, deadline);
+      this.providers.set(target.platform, providers);
     }
     if (includeFallback && this.config.nativeBackend === 'auto' && target.platform === 'ios'
-      && !this.providers.some((provider) => provider.kind === 'idb')) {
-      this.providers = [...this.providers, ...await discoverNativeProviders(this.options, this.simviewDeadline(), ['idb'])];
+      && !providers.some((provider) => provider.kind === 'idb')) {
+      providers = [...providers, ...await discoverNativeProviders(this.options, this.simviewDeadline(), ['idb'])];
+      this.providers.set(target.platform, providers);
     }
-    return this.providers.filter((provider) =>
+    return providers.filter((provider) =>
       this.config.nativeBackend === 'auto' || provider.kind === this.config.nativeBackend,
     ).filter((provider) => target.platform === 'ios' || provider.kind === 'simview');
   }

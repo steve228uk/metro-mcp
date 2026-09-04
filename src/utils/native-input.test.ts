@@ -1317,6 +1317,23 @@ describe('native input providers', () => {
     await controller.close();
   });
 
+  test('does not cache Android provider filtering for a later iOS discovery', async () => {
+    const runner = fakeRunner();
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'idb', idbCommand: '/bin/echo' },
+      runner,
+    });
+
+    // IDB is deliberately filtered from Android provider results, but the
+    // probe must remain available when the same controller handles iOS.
+    expect(await controller.providersFor({ platform: 'android', id: 'emulator-5556' })).toEqual([]);
+    const iosProviders = await controller.providersFor({ platform: 'ios', id: 'ios-device' });
+
+    expect(iosProviders).toHaveLength(1);
+    expect(iosProviders[0]).toMatchObject({ kind: 'idb', available: true });
+    expect(runner.calls.filter(({ command, args }) => command === '/bin/echo' && args.at(-1) === '--version')).toHaveLength(1);
+  });
+
   test('falls back to IDB long press using the accessibility frame center', async () => {
     const runner = fakeRunner();
     const baseExecFile = runner.execFile;
