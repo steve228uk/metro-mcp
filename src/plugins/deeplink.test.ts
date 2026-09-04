@@ -27,7 +27,7 @@ function createHarness(options: {
   const calls: Array<{
     command: string;
     args: string[];
-    options?: { maxBuffer?: number };
+    options?: { maxBuffer?: number; timeout?: number };
   }> = [];
   const target = options.target === undefined ? {
     id: 'target',
@@ -166,6 +166,7 @@ describe('list_url_schemes', () => {
     expect(harness.calls).toContainEqual({
       command: 'adb',
       args: ['devices', '-l'],
+      options: { timeout: 5000 },
     });
     expect(harness.calls).toContainEqual({
       command: 'adb',
@@ -300,6 +301,7 @@ describe('list_url_schemes', () => {
     expect(harness.calls).toContainEqual({
       command: 'xcrun',
       args: ['simctl', 'list', 'devices', 'booted', '--json'],
+      options: { timeout: 5000 },
     });
     expect(harness.calls).toContainEqual({
       command: 'xcrun',
