@@ -151,16 +151,37 @@ const START_RECORDING_JS = `
       function existingScrollState(fn) {
         return fn && fn.__mcpRecSession === state.sessionId && fn.__mcpRecScrollState;
       }
-      var scrollStart = existingScrollState(originalBegin) ||
-        existingScrollState(originalEnd) ||
-        existingScrollState(originalMomentumEnd) ||
-        { x: null, y: null };
-      function tagScrollWrapper(fn, kind) {
+      var scrollStates = [];
+      var existingStates = [originalBegin, originalEnd, originalMomentumEnd];
+      for (var stateIndex = 0; stateIndex < existingStates.length; stateIndex++) {
+        var existingState = existingScrollState(existingStates[stateIndex]);
+        if (existingState && scrollStates.indexOf(existingState) < 0) scrollStates.push(existingState);
+      }
+      var scrollStateConflict = scrollStates.length > 1;
+      var scrollStart = scrollStates[0] || { x: null, y: null };
+      function unwrapScrollHandler(fn) {
+        var seen = new Set();
+        while (fn && fn.__mcpRecSession === state.sessionId && fn.__mcpRecOriginal && !seen.has(fn)) {
+          seen.add(fn);
+          fn = fn.__mcpRecOriginal;
+        }
+        return fn;
+      }
+      if (scrollStateConflict) {
+        // Forwarded props can combine callbacks from separate renders. Rebuild
+        // the complete callback set around one state so begin/end cannot split
+        // a gesture between independent recorder sessions.
+        originalBegin = unwrapScrollHandler(originalBegin);
+        originalEnd = unwrapScrollHandler(originalEnd);
+        originalMomentumEnd = unwrapScrollHandler(originalMomentumEnd);
+      }
+      function tagScrollWrapper(fn, kind, original) {
         Object.defineProperty(fn, '__mcpRecSession', { value: state.sessionId });
+        Object.defineProperty(fn, '__mcpRecOriginal', { value: original });
         Object.defineProperty(fn, '__mcpRecMetadata', { value: { testID: tid, label: lbl, kind: kind } });
         Object.defineProperty(fn, '__mcpRecScrollState', { value: scrollStart });
       }
-      if (!hasMetadata(originalBegin, tid, lbl, 'onScrollBeginDrag')) {
+      if (scrollStateConflict || !hasMetadata(originalBegin, tid, lbl, 'onScrollBeginDrag')) {
         var begin = function(e) {
           var outermost = state.invocationDepth === 0;
           state.invocationDepth++;
@@ -175,7 +196,7 @@ const START_RECORDING_JS = `
           } finally { state.invocationDepth--; }
         };
         try {
-          tagScrollWrapper(begin, 'onScrollBeginDrag');
+          tagScrollWrapper(begin, 'onScrollBeginDrag', originalBegin);
           obj.onScrollBeginDrag = begin;
           wrapped = obj.onScrollBeginDrag === begin || wrapped;
         } catch (_) {}
@@ -196,26 +217,26 @@ const START_RECORDING_JS = `
         } catch (_) {}
         scrollStart.x = scrollStart.y = null;
       }
-      if (!hasMetadata(originalEnd, tid, lbl, 'onScrollEndDrag')) {
+      if (scrollStateConflict || !hasMetadata(originalEnd, tid, lbl, 'onScrollEndDrag')) {
         var end = function(e) {
           state.invocationDepth++;
           try { emitSwipe(e); return originalEnd ? originalEnd.apply(this, arguments) : undefined; }
           finally { state.invocationDepth--; }
         };
         try {
-          tagScrollWrapper(end, 'onScrollEndDrag');
+          tagScrollWrapper(end, 'onScrollEndDrag', originalEnd);
           obj.onScrollEndDrag = end;
           wrapped = obj.onScrollEndDrag === end || wrapped;
         } catch (_) {}
       }
-      if (!hasMetadata(originalMomentumEnd, tid, lbl, 'onMomentumScrollEnd')) {
+      if (scrollStateConflict || !hasMetadata(originalMomentumEnd, tid, lbl, 'onMomentumScrollEnd')) {
         var momentum = function(e) {
           state.invocationDepth++;
           try { emitSwipe(e); return originalMomentumEnd ? originalMomentumEnd.apply(this, arguments) : undefined; }
           finally { state.invocationDepth--; }
         };
         try {
-          tagScrollWrapper(momentum, 'onMomentumScrollEnd');
+          tagScrollWrapper(momentum, 'onMomentumScrollEnd', originalMomentumEnd);
           obj.onMomentumScrollEnd = momentum;
           wrapped = obj.onMomentumScrollEnd === momentum || wrapped;
         } catch (_) {}
@@ -295,9 +316,16 @@ const START_RECORDING_JS = `
     }
     if (isScrollable(props)) {
       var scrollNames = ['onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'];
+      var scrollStates = [];
       for (var scrollIndex = 0; scrollIndex < scrollNames.length; scrollIndex++) {
-        if (!isWrapped(props[scrollNames[scrollIndex]])) { needsRefresh = true; break; }
+        var scrollHandler = props[scrollNames[scrollIndex]];
+        if (scrollHandler && scrollHandler.__mcpRecScrollState &&
+            scrollStates.indexOf(scrollHandler.__mcpRecScrollState) < 0) {
+          scrollStates.push(scrollHandler.__mcpRecScrollState);
+        }
+        if (!isWrapped(scrollHandler)) { needsRefresh = true; break; }
       }
+      if (scrollStates.length > 1) needsRefresh = true;
     }
     if (!needsRefresh) return;
     var context = arguments[1] || {};
@@ -349,13 +377,20 @@ const RECORDING_READINESS_JS = buildFiberReadExpression(`
     }
     if (isScrollable(props)) {
       var scrollHandlers = ['onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'];
+      var scrollStates = [];
       for (var scrollIndex = 0; scrollIndex < scrollHandlers.length; scrollIndex++) {
         var scrollName = scrollHandlers[scrollIndex];
         var scrollTestID = props.testID || null;
         var scrollLabel = props.accessibilityLabel || props['aria-label'] || null;
-        if (typeof props[scrollName] !== 'function' || !hasMetadata(props[scrollName], scrollTestID, scrollLabel, scrollName))
+        var scrollHandler = props[scrollName];
+        if (typeof scrollHandler === 'function' && scrollHandler.__mcpRecScrollState &&
+            scrollStates.indexOf(scrollHandler.__mcpRecScrollState) < 0) {
+          scrollStates.push(scrollHandler.__mcpRecScrollState);
+        }
+        if (typeof scrollHandler !== 'function' || !hasMetadata(scrollHandler, scrollTestID, scrollLabel, scrollName))
           unwrapped.push(scrollName);
       }
+      if (scrollStates.length > 1) unwrapped.push('scroll-state-conflict');
     }
   }, { routes: [] });
   return {
