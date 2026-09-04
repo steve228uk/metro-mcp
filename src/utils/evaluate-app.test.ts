@@ -859,6 +859,57 @@ describe('shared app evaluation policy', () => {
     )).rejects.toThrow('poisoned rejection');
   });
 
+  test('keeps the awaited mailbox hidden and read-only with normal intrinsics', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp(`(function() {
+      var prefix = '__METRO_MCP_ASYNC_';
+      var key = Object.getOwnPropertyNames(this).find(name => name.startsWith(prefix));
+      var descriptor = Object.getOwnPropertyDescriptor(this, key);
+      var iterated = [];
+      for (var name in this) if (name.startsWith(prefix)) iterated.push(name);
+      return {
+        enumerable: descriptor.enumerable,
+        writable: descriptor.writable,
+        configurable: descriptor.configurable,
+        keys: Object.keys(this).filter(name => name.startsWith(prefix)),
+        iterated: iterated
+      };
+    })()`, { awaitPromise: true, timeout: 1000 })).resolves.toEqual({
+      enumerable: false, writable: false, configurable: true, keys: [], iterated: [],
+    });
+  });
+
+  test('creates a mailbox after an earlier evaluation mutates Object globals', async () => {
+    for (const mutation of [
+      'Object.defineProperty = null; 0;',
+      'Object = null; 0;',
+      'Object.defineProperty = function() {}; 0;',
+    ]) {
+      const { transport } = vmTransport();
+      const evalInApp = createAppEvaluator(transport, lifecycle());
+      await expect(evalInApp(mutation, { awaitPromise: true, timeout: 1000 }))
+        .resolves.toBe(0);
+      await expect(evalInApp(
+        'Promise.resolve(13);',
+        { awaitPromise: true, timeout: 1000 },
+      )).resolves.toBe(13);
+      await expect(evalInApp(`(function() {
+        var root = this;
+        var keys = Reflect.ownKeys(root).filter(name => typeof name === 'string' && name.startsWith('__METRO_MCP_ASYNC_'));
+        return {
+          found: keys.length > 0,
+          hidden: keys.every(function(key) {
+            var descriptor = Reflect.getOwnPropertyDescriptor(root, key);
+            return descriptor.enumerable === false && descriptor.writable === false;
+          })
+        };
+      })()`, { awaitPromise: true, timeout: 1000 })).resolves.toEqual({
+        found: true, hidden: true,
+      });
+    }
+  });
+
   test('keeps declaration-form scripts in the direct evaluation scope', async () => {
     const { transport } = vmTransport();
     const evalInApp = createAppEvaluator(transport, lifecycle());
@@ -1070,7 +1121,7 @@ describe('shared app evaluation policy', () => {
     let generation = 0;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(root')) {
+          String(params?.expression).includes("status: 'pending'")) {
         setupAttempts += 1;
       }
       if (method === 'Runtime.evaluate' &&
@@ -1102,7 +1153,7 @@ describe('shared app evaluation policy', () => {
     let setupAttempts = 0;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(root')) {
+          String(params?.expression).includes("status: 'pending'")) {
         setupAttempts += 1;
         if (setupAttempts === 1) throw new Error('WebSocket closed');
       }
@@ -1293,7 +1344,7 @@ describe('shared app evaluation policy', () => {
     transport.send = async (method, params) => {
       const result = await originalSend(method, params);
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(root')) {
+          String(params?.expression).includes("status: 'pending'")) {
         generation += 1;
       }
       return result;
@@ -1321,7 +1372,7 @@ describe('shared app evaluation policy', () => {
     const originalSend = transport.send;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(root')) {
+          String(params?.expression).includes("status: 'pending'")) {
         mailboxSetups += 1;
       }
       return originalSend(method, params);
@@ -1447,7 +1498,7 @@ describe('shared app evaluation policy', () => {
       send: async (method: string, params?: Record<string, unknown>, options?: Record<string, unknown>) => {
         calls.push({ method, options });
         if (method === 'Runtime.evaluate' &&
-            String(params?.expression).includes('Object.defineProperty(root')) {
+            String(params?.expression).includes("status: 'pending'")) {
           return { result: { value: true } };
         }
         if (method === 'Runtime.evaluate') {
