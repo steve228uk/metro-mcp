@@ -22,7 +22,16 @@ export interface AppEvaluationLifecycle {
   getGeneration?: () => number;
 }
 
+/** An exception returned by the app runtime, after Runtime.evaluate ran. */
+class AppEvaluationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AppEvaluationError';
+  }
+}
+
 function isTransportError(error: unknown): boolean {
+  if (error instanceof AppEvaluationError) return false;
   return (
     error instanceof Error &&
     (error.message === 'WebSocket closed' ||
@@ -37,7 +46,11 @@ function isTransportError(error: unknown): boolean {
 // connection recovery; errors such as WebSocket closed can follow a request
 // that already ran and must remain one-shot.
 function isDefinitivePreDispatchFailure(error: unknown): boolean {
-  return error instanceof Error && error.message === 'Not connected to CDP target';
+  return (
+    error instanceof Error &&
+    !(error instanceof AppEvaluationError) &&
+    error.message === 'Not connected to CDP target'
+  );
 }
 
 function timeoutError(timeout: number): Error {
@@ -71,7 +84,7 @@ async function sendRuntimeEvaluate(
     timeout === undefined ? undefined : { timeoutMs: timeout },
   )) as Record<string, unknown>;
   if (result.exceptionDetails) {
-    throw new Error(
+    throw new AppEvaluationError(
       extractCDPExceptionMessage(
         result.exceptionDetails as Record<string, unknown>,
       ),
@@ -302,7 +315,7 @@ export function createAppEvaluator(
         { timeoutMs: Math.min(options.timeout ?? remaining, remaining) },
       )) as Record<string, unknown>;
       if (result.exceptionDetails) {
-        throw new Error(
+        throw new AppEvaluationError(
           extractCDPExceptionMessage(
             result.exceptionDetails as Record<string, unknown>,
           ),
@@ -390,6 +403,7 @@ export function createAppEvaluator(
           releaseObjectGroup,
           getRuntimeGeneration: lifecycle.getGeneration,
           setupMailbox,
+          deadline: options.deadline,
         },
       );
     }
