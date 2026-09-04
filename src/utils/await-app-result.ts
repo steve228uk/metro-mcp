@@ -32,6 +32,7 @@ type EvaluateScript = (
     timeout?: number;
     deadline?: number;
     objectGroup?: string;
+    completionKey?: string;
     generation?: number;
     /** Recreate the mailbox after a safe pre-dispatch source retry. */
     retryMailboxSetup?: RetryMailboxSetup;
@@ -163,7 +164,8 @@ async function completeByValue(
   await evaluateBeforeDeadline(
     evaluate,
     `(function() {
-      var state = globalThis[${key}];
+      var root = this;
+      var state = root[${key}];
       if (state) {
         state.unserializableValue = ${unserializableValue};
         state.value = ${serialized.expression};
@@ -225,11 +227,12 @@ export async function awaitAppResult(
     ) + 1000;
     const mailboxSetup = `(function() {
       var state = { status: 'pending' };
-      Object.defineProperty(globalThis, ${key}, {
+      var root = this;
+      root.Object.defineProperty(root, ${key}, {
         value: state, configurable: true
       });
-      state.timer = setTimeout(function() {
-        if (globalThis[${key}] === state) delete globalThis[${key}];
+      state.timer = root.setTimeout(function() {
+        if (root[${key}] === state) delete root[${key}];
       }, ${mailboxLifetime});
       return true;
     })()`;
@@ -260,6 +263,7 @@ export async function awaitAppResult(
         timeout,
         deadline,
         objectGroup,
+        completionKey: mailboxName,
         generation: mailboxGeneration,
         retryMailboxSetup: options.setupMailbox
           ? (retryOptions) => options.setupMailbox!(mailboxSetup, retryOptions)
@@ -298,7 +302,8 @@ export async function awaitAppResult(
 
     while (Date.now() < deadline) {
       const result = await evaluateBeforeDeadline(pollEvaluate, `(function() {
-        var state = globalThis[${key}];
+        var root = this;
+        var state = root[${key}];
         if (!state) return { status: 'missing' };
         return {
           status: state.status,
@@ -346,9 +351,10 @@ export async function awaitAppResult(
       // already settled. The mailbox also has an in-app expiry for a lost
       // host, so leave this bounded operation detached from the caller.
       void evaluateBeforeDeadline(cleanupEvaluate, `(function() {
-        var state = globalThis[${key}];
-        if (state) clearTimeout(state.timer);
-        delete globalThis[${key}];
+        var root = this;
+        var state = root[${key}];
+        if (state) root.clearTimeout(state.timer);
+        delete root[${key}];
       })()`, { timeout: Math.min(1000, remaining), deadline }, timeout).catch(() => {});
     }
   }
