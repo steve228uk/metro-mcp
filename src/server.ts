@@ -160,6 +160,8 @@ export interface ReconnectController {
 
 interface ReconnectControllerOptions {
   connect: () => Promise<boolean>;
+  /** Verify that a successful attempt is still connected when it settles. */
+  isConnected?: () => boolean;
   isClosed: () => boolean;
   timers?: Pick<ReconnectWaitTimers, 'setTimeout' | 'clearTimeout'>;
   delays?: readonly number[];
@@ -231,11 +233,17 @@ export function createReconnectController(
     let ownedAttempt!: Promise<boolean>;
     ownedAttempt = rawAttempt.then(
       (connected) => {
+        // A CDP connection can open and emit `reconnected`, then close again
+        // before the owning connect operation settles. Treat that attempt as
+        // failed so its disconnected event cannot be lost behind
+        // activeAttempt ownership.
+        const settledConnected = connected &&
+          (options.isConnected?.() ?? true);
         // Clear active ownership before scheduling the next background retry;
         // schedule() must be able to claim the newly available slot.
         if (activeAttempt === ownedAttempt) activeAttempt = null;
-        if (!connected) schedule();
-        return connected;
+        if (!settledConnected) schedule();
+        return settledConnected;
       },
       (error) => {
         if (activeAttempt === ownedAttempt) activeAttempt = null;
@@ -1049,6 +1057,7 @@ export async function createMetroRuntime(
 
   reconnectController = createReconnectController({
     connect: performConnectToMetro,
+    isConnected: () => cdpSession.isConnected,
     isClosed: () => runtimeClosed,
     onSchedule: (delay, attempt) => {
       logger.info(`Reconnecting to Metro in ${delay}ms (attempt ${attempt})`);
