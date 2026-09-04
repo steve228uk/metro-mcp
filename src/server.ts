@@ -136,12 +136,117 @@ export interface ReconnectWaitTimers {
   clearTimeout(handle: ReturnType<typeof setTimeout>): void;
 }
 
+export interface ReconnectTimerState {
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+export interface ReconnectController {
+  schedule(): void;
+  connectNow(): Promise<boolean>;
+  cancelScheduled(): boolean;
+  isReconnecting(): boolean;
+  resetBackoff(): void;
+}
+
+interface ReconnectControllerOptions {
+  connect: () => Promise<boolean>;
+  isClosed: () => boolean;
+  timers?: Pick<ReconnectWaitTimers, 'setTimeout' | 'clearTimeout'>;
+  delays?: readonly number[];
+  maxBurstAttempts?: number;
+  backgroundDelay?: number;
+  onSchedule?: (delay: number, attempt: number) => void;
+}
+
 const reconnectWaitTimers: ReconnectWaitTimers = {
   setInterval,
   clearInterval,
   setTimeout,
   clearTimeout,
 };
+
+/**
+ * Cancel a background reconnect that has not started connecting yet.
+ *
+ * Keeping the timer separate from the active-attempt state lets an on-demand
+ * tool request take over a long backoff immediately. The null check also makes
+ * concurrent callers idempotent: only the first caller can claim the timer.
+ */
+export function cancelScheduledReconnect(
+  state: ReconnectTimerState,
+  timers: Pick<ReconnectWaitTimers, 'clearTimeout'> = reconnectWaitTimers,
+): boolean {
+  if (state.timer === null) return false;
+  timers.clearTimeout(state.timer);
+  state.timer = null;
+  return true;
+}
+
+/**
+ * Own reconnect scheduling independently of any caller waiting on an attempt.
+ * A deadline-bounded caller may stop awaiting connectNow(), but the runtime
+ * still observes the result and keeps background recovery alive.
+ */
+export function createReconnectController(
+  options: ReconnectControllerOptions,
+): ReconnectController {
+  const timers = options.timers ?? reconnectWaitTimers;
+  const delays = options.delays ?? [500, 1000, 2000, 4000, 8000, 16000];
+  const maxBurstAttempts = options.maxBurstAttempts ?? 15;
+  const backgroundDelay = options.backgroundDelay ?? 30000;
+  const timerState: ReconnectTimerState = { timer: null };
+  let attempts = 0;
+  let activeAttempt: Promise<boolean> | null = null;
+
+  const cancelScheduled = (): boolean =>
+    cancelScheduledReconnect(timerState, timers);
+
+  const schedule = (): void => {
+    if (options.isClosed() || timerState.timer !== null || activeAttempt) return;
+    const delay = attempts < maxBurstAttempts
+      ? delays[Math.min(attempts, delays.length - 1)]!
+      : backgroundDelay;
+    attempts++;
+    options.onSchedule?.(delay, attempts);
+    timerState.timer = timers.setTimeout(() => {
+      timerState.timer = null;
+      void connectNow().catch(() => {});
+    }, delay);
+  };
+
+  const connectNow = (): Promise<boolean> => {
+    cancelScheduled();
+    if (activeAttempt) return activeAttempt;
+    const rawAttempt = Promise.resolve().then(options.connect);
+    let ownedAttempt!: Promise<boolean>;
+    ownedAttempt = rawAttempt.then(
+      (connected) => {
+        // Clear active ownership before scheduling the next background retry;
+        // schedule() must be able to claim the newly available slot.
+        if (activeAttempt === ownedAttempt) activeAttempt = null;
+        if (!connected) schedule();
+        return connected;
+      },
+      (error) => {
+        if (activeAttempt === ownedAttempt) activeAttempt = null;
+        schedule();
+        throw error;
+      },
+    );
+    activeAttempt = ownedAttempt;
+    return ownedAttempt;
+  };
+
+  return {
+    schedule,
+    connectNow,
+    cancelScheduled,
+    isReconnecting: () => activeAttempt !== null,
+    resetBackoff: () => {
+      attempts = 0;
+    },
+  };
+}
 
 export function waitForReconnect(
   isReconnecting: () => boolean,
@@ -332,20 +437,16 @@ export async function createMetroRuntime(
   let activeDeviceName: string | null = null;
   let targetPin: MetroTargetPin | null = null;
 
-  // Server-side reconnect state — single source of truth for all reconnect logic.
-  // Start with a very short delay (500ms) to recover quickly from brief disconnects
-  // like hot reloads, then ramp up for longer outages.
-  const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000, 16000];
   const RECONNECT_STABLE_MS = 5000;
-  const MAX_BURST_ATTEMPTS = 15; // fast retries; after this, switch to slow background probe
-  let reconnectAttempts = 0;
-  let isReconnecting = false;
+  let reconnectController: ReconnectController | null = null;
   let runtimeGeneration = 0;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectStabilityTimer: ReturnType<typeof setTimeout> | null = null;
 
   const waitForCurrentReconnect = (deadline?: number): Promise<void> =>
-    waitForReconnect(() => isReconnecting, deadline);
+    waitForReconnect(
+      () => reconnectController?.isReconnecting() ?? false,
+      deadline,
+    );
 
   function clearReconnectStabilityTimer(): void {
     if (reconnectStabilityTimer) {
@@ -396,17 +497,13 @@ export async function createMetroRuntime(
   // Enable required CDP domains on every connection (initial and reconnect).
   cdpSession.on('reconnected', async () => {
     runtimeGeneration++;
-    isReconnecting = false;
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    reconnectController?.cancelScheduled();
     await enableCDPDomains();
     clearReconnectStabilityTimer();
     reconnectStabilityTimer = setTimeout(() => {
       reconnectStabilityTimer = null;
       if (!runtimeClosed && cdpSession.isConnected) {
-        reconnectAttempts = 0;
+        reconnectController?.resetBackoff();
         logger.debug('CDP connection stable; reset reconnect backoff');
       }
     }, RECONNECT_STABLE_MS);
@@ -461,14 +558,20 @@ export async function createMetroRuntime(
     const evalInApp = createAppEvaluator(cdpSession, {
       ensureConnected: async (deadline?: number) => {
         if (!cdpSession.isConnected) {
-          if (isReconnecting) {
+          if (reconnectController?.isReconnecting()) {
             // A reconnect is already in flight — wait for it rather than
             // starting another one.
             await waitForCurrentReconnect(deadline);
+          } else if (reconnectController?.cancelScheduled()) {
+            // A background retry may be waiting behind a long backoff. An
+            // on-demand tool request should claim that retry and connect now,
+            // rather than consuming its shorter deadline waiting for the timer.
+            const connected = await waitForConnectionUntil(
+              () => connectToMetro(),
+              deadline,
+            );
+            if (!connected) scheduleReconnect();
           } else {
-            // Reset the attempt counter so the background scheduler can resume
-            // after this tool-triggered reconnect, rather than staying capped.
-            reconnectAttempts = 0;
             const connected = await waitForConnectionUntil(
               () => cdpSession.waitForConnection(),
               deadline,
@@ -488,10 +591,9 @@ export async function createMetroRuntime(
         }
       },
       waitForReconnect: waitForCurrentReconnect,
-      isReconnecting: () => isReconnecting,
+      isReconnecting: () => reconnectController?.isReconnecting() ?? false,
       getGeneration: () => runtimeGeneration,
       reconnect: async () => {
-        reconnectAttempts = 0;
         await connectToMetro();
       },
     });
@@ -840,12 +942,7 @@ export async function createMetroRuntime(
 
   // Connect to Metro — always re-discovers targets to get a fresh webSocketDebuggerUrl.
   // Idempotent: concurrent callers wait for the in-flight attempt to finish.
-  async function connectToMetro(): Promise<boolean> {
-    if (isReconnecting) {
-      await waitForCurrentReconnect();
-      return cdpSession.isConnected;
-    }
-    isReconnecting = true;
+  async function performConnectToMetro(): Promise<boolean> {
     try {
       const proxyEnabled = config.proxy?.enabled !== false;
 
@@ -932,40 +1029,25 @@ export async function createMetroRuntime(
     } catch (err) {
       logger.warn('Could not connect to Metro:', err);
       return false;
-    } finally {
-      isReconnecting = false;
     }
+  }
+
+  reconnectController = createReconnectController({
+    connect: performConnectToMetro,
+    isClosed: () => runtimeClosed,
+    onSchedule: (delay, attempt) => {
+      logger.info(`Reconnecting to Metro in ${delay}ms (attempt ${attempt})`);
+    },
+  });
+
+  async function connectToMetro(): Promise<boolean> {
+    return reconnectController!.connectNow();
   }
 
   // Schedule a reconnect with exponential backoff, driven from server.ts so we always
   // re-fetch a fresh target URL from Metro's /json endpoint.
   function scheduleReconnect(): void {
-    if (runtimeClosed) return;
-    if (reconnectTimer !== null || isReconnecting) return; // already scheduled or in progress
-
-    // Use exponential backoff for the initial burst, then fall back to a slow
-    // background probe so the server keeps trying indefinitely (e.g. app started
-    // long after the MCP server).
-    const delay =
-      reconnectAttempts < MAX_BURST_ATTEMPTS
-        ? RECONNECT_DELAYS[
-            Math.min(reconnectAttempts, RECONNECT_DELAYS.length - 1)
-          ]
-        : 30000;
-    reconnectAttempts++;
-    logger.info(
-      `Reconnecting to Metro in ${delay}ms (attempt ${reconnectAttempts})`,
-    );
-
-    isReconnecting = true;
-    reconnectTimer = setTimeout(async () => {
-      reconnectTimer = null;
-      isReconnecting = false;
-      const success = await connectToMetro();
-      if (!success) {
-        scheduleReconnect();
-      }
-    }, delay);
+    reconnectController?.schedule();
   }
 
   // CDP proxy for Chrome DevTools coexistence — started lazily on first connect.
@@ -1094,10 +1176,7 @@ export async function createMetroRuntime(
   function closeRuntime(): Promise<void> {
     if (runtimeClosePromise) return runtimeClosePromise;
     runtimeClosed = true;
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
+    reconnectController?.cancelScheduled();
     clearReconnectStabilityTimer();
     process.off('SIGINT', handleSigint);
     process.off('SIGTERM', handleSigterm);
