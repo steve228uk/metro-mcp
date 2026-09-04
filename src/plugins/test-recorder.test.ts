@@ -14,6 +14,14 @@ type Runner = ((name: string, args?: Record<string, unknown>) => Promise<unknown
   resource: (uri: string) => Promise<string>;
 };
 
+interface TargetFixture {
+  appId: string;
+  platform: 'ios' | 'android';
+  id: string;
+  name: string;
+  opaque?: boolean;
+}
+
 function appWithDeepButton() {
   const app = vm.createContext({ setTimeout, clearTimeout });
   vm.runInContext(`
@@ -133,6 +141,7 @@ async function createHarness(
   plugins: PluginDefinition[],
   targetAppIdOrBeforeEval?:
     | string
+    | TargetFixture
     | ((expression: string, options?: EvalOptions) => void),
   evalInAppOverride?: (
     expression: string,
@@ -142,7 +151,17 @@ async function createHarness(
 ): Promise<Runner> {
   const tools = new Map<string, Tool>();
   const resources = new Map<string, () => Promise<string>>();
-  const targetAppId = typeof targetAppIdOrBeforeEval === 'string' ? targetAppIdOrBeforeEval : undefined;
+  const targetFixture: TargetFixture | undefined =
+    typeof targetAppIdOrBeforeEval === 'string'
+      ? {
+          appId: targetAppIdOrBeforeEval,
+          platform: 'ios',
+          id: 'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE',
+          name: 'iPhone QA',
+        }
+      : typeof targetAppIdOrBeforeEval === 'object'
+        ? targetAppIdOrBeforeEval
+        : undefined;
   const beforeEval = typeof targetAppIdOrBeforeEval === 'function' ? targetAppIdOrBeforeEval : undefined;
   const evaluateInApp = async (expression: string, options?: EvalOptions) => {
     beforeEval?.(expression, options);
@@ -152,7 +171,13 @@ async function createHarness(
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
-      getTarget: () => targetAppId ? ({ appId: targetAppId } as ReturnType<PluginContext['cdp']['getTarget']>) : null,
+      getTarget: () => targetFixture ? ({
+        appId: targetFixture.appId,
+        ...(targetFixture.opaque ? {} : {
+          deviceName: targetFixture.name,
+          reactNative: { logicalDeviceId: targetFixture.id },
+        }),
+      } as ReturnType<PluginContext['cdp']['getTarget']>) : null,
       send: async () => ({}),
     },
     events: { on: () => {}, off: () => {}, isConnected: () => true },
@@ -165,7 +190,29 @@ async function createHarness(
     config: {},
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
     metro: { host: 'localhost', port: 8081, fetch: async () => new Response() },
-    exec: async () => '', execFile: async () => Buffer.alloc(0),
+    exec: async () => '',
+    execFile: async (command) => {
+      if (command === 'xcrun') {
+        const devices = targetFixture?.platform === 'ios'
+          ? [{
+              name: targetFixture.name,
+              udid: targetFixture.id,
+              state: 'Booted',
+              isAvailable: true,
+            }]
+          : [];
+        return Buffer.from(JSON.stringify({
+          devices: { 'com.apple.CoreSimulator.SimRuntime.iOS-26-0': devices },
+        }));
+      }
+      if (command === 'adb') {
+        const device = targetFixture?.platform === 'android'
+          ? `${targetFixture.id}\tdevice model:${targetFixture.name.replace(/[^a-zA-Z0-9]/g, '_')}`
+          : '';
+        return Buffer.from(`List of devices attached\n${device}\n`);
+      }
+      return Buffer.alloc(0);
+    },
     format: {
       summarize: () => '', compact: (value: unknown) => JSON.stringify(value),
       truncate: (value: string) => value, structureOnly: (value: ComponentNode) => value,
@@ -820,6 +867,38 @@ describe('test recorder readiness', () => {
     expect(generated).toContain('"appium:noReset": true');
     expect(generated).not.toContain('com.example.app');
     expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('does not reuse a connected app ID for a different requested platform', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'emulator-5554',
+      name: 'Pixel QA',
+    });
+
+    await expect(call('generate_wdio_config', { platform: 'ios' }))
+      .resolves.toContain('discovery selected android');
+
+    const explicit = String(await call('generate_wdio_config', {
+      platform: 'ios',
+      bundleId: 'com.explicit.ios',
+    }));
+    expect(explicit).toContain('"appium:bundleId": "com.explicit.ios"');
+    expect(explicit).not.toContain('com.connected.android');
+  });
+
+  test('does not treat a sole-device fallback as proof of the app ID platform', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.opaque',
+      platform: 'ios',
+      id: 'AAAAAAAA-BBBB-CCCC-DDDD-FFFFFFFFFFFF',
+      name: 'Unrelated iPhone',
+      opaque: true,
+    });
+
+    await expect(call('generate_wdio_config', { platform: 'ios' }))
+      .resolves.toContain('could not be verified as the resolved ios device');
   });
 
   test('rejects an Appium config with no app path, bundle ID, or connected target', async () => {

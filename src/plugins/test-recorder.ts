@@ -4,7 +4,12 @@ import { readdir, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin } from '../plugin.js';
-import { getConnectedDeviceTarget } from '../utils/device-discovery.js';
+import {
+  getConnectedDeviceTarget,
+  resolveDevice,
+  type ConnectedDeviceTarget,
+  type ResolvedDevice,
+} from '../utils/device-discovery.js';
 import {
   FIBER_WALKER_JS,
   GET_ROUTE_FUNC_JS,
@@ -24,6 +29,22 @@ const CURRENT_ROUTE_JS = `
     return null;
   })()
 `;
+
+function targetIdentifiesResolvedDevice(
+  target: ConnectedDeviceTarget,
+  device: ResolvedDevice,
+): boolean {
+  const targetId = target.reactNative?.logicalDeviceId?.trim();
+  if (targetId && targetId.toLowerCase() === device.id.toLowerCase()) return true;
+
+  const targetName = target.deviceName?.trim();
+  if (!targetName || !device.name) return false;
+  if (device.platform === 'ios') return targetName === device.name;
+  const adbModelName = Buffer.from(targetName, 'utf8')
+    .toString('latin1')
+    .replace(/[^a-zA-Z0-9]/g, '_');
+  return adbModelName === device.name;
+}
 
 // ── JS injected into the app runtime to install the recorder instrumentation.
 // Instrumentation and capture are deliberately separate. The first phase wraps
@@ -860,9 +881,40 @@ export const testRecorderPlugin = definePlugin({
         if (platform === 'both' && (bundleId || appPath || udid || deviceName || platformVersion)) {
           return 'For platform "both", use separate iOS and Android app and device options so each Appium capability targets the correct app and device.';
         }
-        const connectedAppId = platform === 'both'
+        const connectedTarget = platform === 'both'
           ? undefined
-          : getConnectedDeviceTarget(ctx)?.appId;
+          : getConnectedDeviceTarget(ctx);
+        let connectedAppId: string | undefined;
+        if (
+          platform !== 'both' &&
+          !bundleId &&
+          !appPath &&
+          connectedTarget?.appId
+        ) {
+          let connectedDevice;
+          try {
+            connectedDevice = await resolveDevice(ctx, 'auto', connectedTarget);
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            return (
+              `Cannot verify which platform the connected Metro app uses: ${reason} ` +
+              'Provide bundleId or appPath explicitly.'
+            );
+          }
+          if (
+            !connectedDevice ||
+            connectedDevice.platform !== platform ||
+            !targetIdentifiesResolvedDevice(connectedTarget, connectedDevice)
+          ) {
+            const actual = connectedDevice?.platform ?? 'an unknown platform';
+            return (
+              `The connected Metro app could not be verified as the resolved ${platform} device ` +
+              `(discovery selected ${actual}), so its app ID cannot be reused. ` +
+              'Provide bundleId or appPath explicitly.'
+            );
+          }
+          connectedAppId = connectedTarget.appId;
+        }
         const resolvedBundleId = platform === 'both' ? undefined : (bundleId ?? connectedAppId);
         const hasIosAppTarget = Boolean(iosAppPath || iosBundleId);
         const hasAndroidAppTarget = Boolean(androidAppPath || androidPackageName);
