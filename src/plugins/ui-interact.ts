@@ -12,7 +12,11 @@ import {
   SWIPE_COORDS,
   buildFiberReadExpression,
 } from '../utils/fiber.js';
-import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
+import {
+  adbPrefix,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
 
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let idbAvailableCache: boolean | null = null;
@@ -36,7 +40,7 @@ export const uiInteractPlugin = definePlugin({
 
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
-      resolveDevice(ctx, platform, ctx.cdp.getTarget());
+      resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
 
     async function isIDBAvailable(): Promise<boolean> {
       if (idbAvailableCache !== null) return idbAvailableCache;
@@ -464,6 +468,7 @@ export const uiInteractPlugin = definePlugin({
               ${FIBER_ROOT_JS}
               var handlerName = ${JSON.stringify(button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText')};
               var target = null;
+              var targetInstance = null;
               var stack = [{ f: rootFiber, d: 0 }];
               while (stack.length && !target) {
                 var item = stack.pop();
@@ -496,7 +501,10 @@ export const uiInteractPlugin = definePlugin({
                 // inputs have no current value to preserve; let the native
                 // backend deliver the key event instead.
                 if (name === 'TextInput' && focused && typeof props.value === 'string' &&
-                  typeof props[handlerName] === 'function') target = fiber;
+                  typeof props[handlerName] === 'function') {
+                  target = fiber;
+                  targetInstance = instance;
+                }
                 if (!target) {
                   if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
                   if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
@@ -505,7 +513,20 @@ export const uiInteractPlugin = definePlugin({
               if (!target) return false;
               var targetProps = target.memoizedProps || {};
               if (handlerName === 'onSubmitEditing') {
+                // Match React Native's Android TextInput submit behavior before
+                // invoking the controlled input's handler. A newline must be
+                // delivered as a native key event so the text is preserved;
+                // blurAndSubmit also blurs the native input after submission.
+                var submitBehavior = targetProps.submitBehavior;
+                if (typeof submitBehavior !== 'string') {
+                  if (targetProps.blurOnSubmit === true) submitBehavior = 'blurAndSubmit';
+                  else if (targetProps.blurOnSubmit === false) submitBehavior = 'newline';
+                  else submitBehavior = targetProps.multiline === true ? 'newline' : 'blurAndSubmit';
+                }
+                if (submitBehavior === 'newline') return false;
                 targetProps.onSubmitEditing({ nativeEvent: { text: targetProps.value } });
+                if (submitBehavior === 'blurAndSubmit' && targetInstance &&
+                  typeof targetInstance.blur === 'function') targetInstance.blur();
               } else {
                 var val = targetProps.value.slice(0, -1);
                 targetProps.onChangeText(val);

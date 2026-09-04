@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { definePlugin, type PluginContext } from '../plugin.js';
 import {
   adbPrefix,
+  getConnectedDeviceTarget,
   resolveDevice,
 } from '../utils/device-discovery.js';
 
@@ -90,7 +91,7 @@ export const deeplinkPlugin = definePlugin({
   async setup(ctx) {
     const resolveTarget = (
       platform: 'ios' | 'android' | 'auto',
-      connectedTarget = ctx.cdp.getTarget(),
+      connectedTarget = getConnectedDeviceTarget(ctx),
     ) => resolveDevice(ctx, platform, connectedTarget);
 
     ctx.registerTool('open_deeplink', {
@@ -124,7 +125,7 @@ export const deeplinkPlugin = definePlugin({
         bundleId: z.string().optional().describe('Bundle ID to check (auto-detected if not provided)'),
       }),
       handler: async ({ platform, bundleId }) => {
-        const targetInfo = ctx.cdp.getTarget();
+        const targetInfo = getConnectedDeviceTarget(ctx);
         const requestedBundleId = bundleId?.trim() ||
           (platform === 'auto' ? targetInfo?.appId?.trim() : undefined);
         if (!requestedBundleId) {
