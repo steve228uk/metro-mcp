@@ -298,6 +298,19 @@ describe('UI handler actions without native inventory', () => {
     expect(unicodeHarness.reactCalls).toEqual([{ type: 'change', value: 'AB' }]);
   });
 
+  test('defers controlled Android DELETE at the start caret to native input', async () => {
+    const harness = await createAppOnlyHarness(
+      { renderer: 'paper', value: 'abcd', selection: { start: 0, end: 0 } },
+      true,
+      'emulator-42',
+    );
+    const press = harness.tools.get('press_button')!;
+    expect(await press.handler(press.parameters.parse({ button: 'DELETE', platform: 'android' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(harness.reactCalls).toEqual([]);
+    expect(harness.execCommands).toEqual(['adb -s "emulator-42" shell input keyevent 67']);
+  });
+
   test('defers controlled DELETE to Android when selection is unavailable', async () => {
     const harness = await createAppOnlyHarness(
       { renderer: 'paper', value: 'abcd', selection: undefined },

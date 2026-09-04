@@ -605,10 +605,11 @@ export const uiInteractPlugin = definePlugin({
                     val.charCodeAt(end - 1) >= 0xd800 && val.charCodeAt(end - 1) <= 0xdbff &&
                     val.charCodeAt(end) >= 0xdc00 && val.charCodeAt(end) <= 0xdfff)) return false;
                 if (start === end) {
-                  if (start === 0) {
-                    targetProps.onChangeText(val);
-                    return true;
-                  }
+                  // There is no deletion to synthesize at the start of the
+                  // value. Let Android receive the key so the native input
+                  // keeps its actual caret semantics without a redundant
+                  // controlled-value callback.
+                  if (start === 0) return false;
                   start -= 1;
                   // Remove one complete Unicode code point. Hermes supports
                   // these primitive string operations, while String spread and
