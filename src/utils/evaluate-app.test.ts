@@ -198,7 +198,7 @@ describe('shared app evaluation policy', () => {
     await expect(evaluate('mutate()', { awaitPromise: true, timeout: 10 })).rejects.toThrow('timed out');
     await new Promise((resolve) => setTimeout(resolve, 60));
     expect(calls.filter((call) => call.method === 'Runtime.evaluate')).toHaveLength(0);
-    expect(calls).toHaveLength(1); // bounded late-completion group cleanup
+    expect(calls).toHaveLength(0); // no cleanup request remains within the deadline
   });
 
   test('does not replay a script after an ambiguous initial dispatch', async () => {
@@ -278,6 +278,81 @@ describe('shared app evaluation policy', () => {
     expect(state.state().reconnectCount).toBe(0);
     expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('executionCount'))).toHaveLength(1);
+  });
+
+  test('does not retry an app exception that uses the Bridge disconnect message', async () => {
+    const { transport, calls } = vmTransport();
+    const cdp = {
+      send: async (method: string, params?: Record<string, unknown>, options?: Record<string, unknown>): Promise<unknown> => {
+        const result = await transport.send(method, params, options);
+        if (method === 'Runtime.evaluate' &&
+            String(params?.expression).includes('__appExceptionMarker')) {
+          return { exceptionDetails: { text: 'Not connected to CDP target' } };
+        }
+        return result;
+      },
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(cdp, state);
+
+    await expect(evalInApp(
+      `globalThis.executionCount = (globalThis.executionCount || 0) + 1;
+       globalThis.__appExceptionMarker = true;
+       Promise.resolve(executionCount);`,
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('Not connected to CDP target');
+    expect(transport.context).toHaveProperty('executionCount', 1);
+    expect(state.state().reconnectCount).toBe(0);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('__appExceptionMarker'))).toHaveLength(1);
+  });
+
+  test('does not retry a remote settlement app exception that uses the Bridge disconnect message', async () => {
+    const { transport, calls } = vmTransport();
+    const cdp = {
+      send: async (method: string, params?: Record<string, unknown>, options?: Record<string, unknown>): Promise<unknown> => {
+        const result = await transport.send(method, params, options);
+        if (method === 'Runtime.callFunctionOn') {
+          return { exceptionDetails: { text: 'Not connected to CDP target' } };
+        }
+        return result;
+      },
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(cdp, state);
+
+    await expect(evalInApp(
+      'Promise.resolve(42)',
+      { awaitPromise: true, timeout: 1000 },
+    )).rejects.toThrow('Not connected to CDP target');
+    expect(state.state().reconnectCount).toBe(0);
+    expect(calls.filter((call) => call.method === 'Runtime.callFunctionOn')).toHaveLength(1);
+  });
+
+  test('honors an explicit absolute deadline across awaited stages', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    const deadline = Date.now() + 40;
+    const started = Date.now();
+
+    await expect(evalInApp(
+      'new Promise(() => {})',
+      { awaitPromise: true, timeout: 1000, deadline },
+    )).rejects.toThrow('timed out');
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test('keeps the requested timeout when an explicit deadline is later', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    const deadline = Date.now() + 200;
+    const started = Date.now();
+
+    await expect(evalInApp(
+      'new Promise(() => {})',
+      { awaitPromise: true, timeout: 40, deadline },
+    )).rejects.toThrow('timed out');
+    expect(Date.now() - started).toBeLessThan(150);
   });
 
   test('retries an exact pre-dispatch disconnect before awaited source execution', async () => {
@@ -567,7 +642,7 @@ describe('shared app evaluation policy', () => {
     await expect(evalInApp('new Promise(() => {})', { awaitPromise: true, timeout: 40 }))
       .rejects.toThrow('timed out');
     expect(Date.now() - started).toBeLessThan(500);
-    expect(calls).toHaveLength(2); // stalled setup plus bounded group cleanup
+    expect(calls).toHaveLength(1); // stalled setup; cleanup has no remaining budget
   });
 
   test('bounds a stalled mailbox poll and does not wait for cleanup', async () => {
@@ -585,7 +660,7 @@ describe('shared app evaluation policy', () => {
     await expect(evalInApp('Promise.resolve(1)', { awaitPromise: true, timeout: 40 }))
       .rejects.toThrow('timed out');
     expect(Date.now() - started).toBeLessThan(500);
-    expect(calls).toHaveLength(4); // setup, source, stalled poll, and bounded cleanup
+    expect(calls).toHaveLength(3); // setup, source, and stalled poll
   });
 
   test('does not reconnect after a mailbox poll rejects after the deadline', async () => {
@@ -651,9 +726,13 @@ describe('shared app evaluation policy', () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
     let groupReleaseStarted = false;
+    const deadline = Date.now() + 100;
     transport.send = async (method, params, options) => {
       if (method === 'Runtime.releaseObjectGroup') {
         groupReleaseStarted = true;
+        const timeoutMs = Number(options?.timeoutMs);
+        expect(timeoutMs).toBeLessThan(100);
+        expect(timeoutMs).toBeLessThanOrEqual(deadline - Date.now() + 2);
         return new Promise(() => {});
       }
       return originalSend(method, params, options);
@@ -662,8 +741,8 @@ describe('shared app evaluation policy', () => {
     const started = Date.now();
 
     await expect(evalInApp(
-      'new Promise(resolve => setTimeout(() => resolve(42), 10));',
-      { awaitPromise: true, timeout: 40 },
+      'new Promise(resolve => setTimeout(() => resolve(42), 70));',
+      { awaitPromise: true, timeout: 1000, deadline },
     )).resolves.toBe(42);
     expect(Date.now() - started).toBeLessThan(100);
     expect(groupReleaseStarted).toBe(true);
