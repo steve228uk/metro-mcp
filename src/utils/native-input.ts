@@ -447,6 +447,7 @@ export class NativeInputController {
   private cleanupPromise: Promise<void> | null = null;
   private closed = false;
   private actionQueue: Promise<void> = Promise.resolve();
+  private nextAndroidDumpId = 0;
   /** Track resources before connecting so shutdown can abort a pending handshake. */
   private readonly resources = new Set<SimViewResource>();
   private readonly simviewRequestTimeoutMs: number;
@@ -496,10 +497,10 @@ export class NativeInputController {
     return this.dispatchSimViewOrIdb(target, 'tap', { x, y });
   }
 
-  /** Locate a label through IDB's supported accessibility dump and tap its center. */
+  /** Locate a label through a native accessibility dump and tap its center. */
   async tapLabel(target: NativeInputTarget, label: string): Promise<NativeDispatchResult> {
-    if (this.closed) return result('none', 'unavailable', false, 'Native input controller is closed');
-    if (target.platform !== 'ios') return result('none', 'unsupported', false, 'Label lookup is only available through IDB on iOS');
+    if (this.closed) return result(target.platform === 'android' ? 'adb' : 'none', 'unavailable', false, 'Native input controller is closed');
+    if (target.platform === 'android') return this.androidTapLabel(target, label);
     const deadline = this.simviewDeadline();
     const providers = await this.providersFor(target, deadline);
     const simview = providers.find((candidate) => candidate.kind === 'simview' && candidate.available);
@@ -528,6 +529,69 @@ export class NativeInputController {
       // report as not-sent for callers deciding whether to retry or fall back.
       return result('idb', 'failed', false, error instanceof Error ? error.message : String(error), 'not-sent');
     }
+  }
+
+  private async androidTapLabel(
+    target: NativeInputTarget,
+    label: string,
+  ): Promise<NativeDispatchResult> {
+    const deadline = this.simviewDeadline();
+    const dumpPath = `/sdcard/metro-mcp-uidump-${process.pid}-${++this.nextAndroidDumpId}.xml`;
+    let dump: Buffer;
+    try {
+      await boundedExecFile(
+        this.options.runner,
+        'adb',
+        ['-s', target.id, 'shell', 'uiautomator', 'dump', dumpPath],
+        { maxBuffer: 64 * 1024 },
+        deadline,
+      );
+      dump = await boundedExecFile(
+        this.options.runner,
+        'adb',
+        ['-s', target.id, 'exec-out', 'cat', dumpPath],
+        { maxBuffer: 2 * 1024 * 1024 },
+        deadline,
+      );
+    } catch (error) {
+      return result(
+        'adb',
+        'failed',
+        false,
+        error instanceof Error ? error.message : String(error),
+        'not-sent',
+      );
+    } finally {
+      // The dump is no longer needed once the read completes. Start bounded
+      // cleanup without making an unrelated cleanup delay consume tap time.
+      void boundedExecFile(
+        this.options.runner,
+        'adb',
+        ['-s', target.id, 'shell', 'rm', '-f', dumpPath],
+        { maxBuffer: 16 * 1024 },
+        Date.now() + 500,
+      ).catch(() => {});
+    }
+
+    const match = findAndroidAccessibilityPoint(dump.toString('utf8'), label);
+    if (!match.point) {
+      return result(
+        'adb',
+        'failed',
+        false,
+        match.ambiguous ? `Element "${label}" is ambiguous` : `Element "${label}" was not found by uiautomator`,
+        'not-sent',
+      );
+    }
+    if (Date.now() >= deadline) {
+      return result('adb', 'failed', false, 'Android label lookup timed out before tap dispatch', 'not-sent');
+    }
+    return this.adb(
+      target,
+      ['shell', 'input', 'tap', String(match.point.x), String(match.point.y)],
+      `tap "${label}"`,
+      deadline,
+    );
   }
 
   /** Locate a label through semantic providers and long press its frame center. */
@@ -877,14 +941,19 @@ export class NativeInputController {
     return this.dispatchSimViewOrIdb(target, 'press_button', { button: selected });
   }
 
-  private async adb(target: NativeInputTarget, args: string[], description: string): Promise<NativeDispatchResult> {
+  private async adb(
+    target: NativeInputTarget,
+    args: string[],
+    description: string,
+    deadline = this.simviewDeadline(),
+  ): Promise<NativeDispatchResult> {
     try {
       await boundedExecFile(
         this.options.runner,
         'adb',
         ['-s', target.id, ...args],
         { maxBuffer: 64 * 1024 },
-        this.simviewDeadline(),
+        deadline,
       );
       return result('adb', 'handled', true, `${description} dispatched to ${target.id}`);
     } catch (error) {
@@ -1398,6 +1467,56 @@ function findAccessibilityPoint(raw: string, label: string): { point: { x: numbe
     stack.push(...Object.values(object));
   }
   return { point: points.length === 1 ? points[0] : null, ambiguous: points.length > 1 };
+}
+
+function findAndroidAccessibilityPoint(
+  raw: string,
+  label: string,
+): { point: { x: number; y: number } | null; ambiguous: boolean } {
+  const points: Array<{ x: number; y: number }> = [];
+  for (const match of raw.matchAll(/<node\b[^>]*>/gi)) {
+    const node = match[0];
+    const rawText = node.match(/\btext="([^"]*)"/i)?.[1];
+    const rawDescription = node.match(/\bcontent-desc="([^"]*)"/i)?.[1];
+    const text = rawText === undefined ? undefined : decodeXmlAttribute(rawText);
+    const description = rawDescription === undefined
+      ? undefined
+      : decodeXmlAttribute(rawDescription);
+    if (text !== label && description !== label) continue;
+    const bounds = node.match(/\bbounds="\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]"/i);
+    if (!bounds) continue;
+    const left = Number(bounds[1]);
+    const top = Number(bounds[2]);
+    const right = Number(bounds[3]);
+    const bottom = Number(bounds[4]);
+    if (![left, top, right, bottom].every(Number.isFinite)) continue;
+    points.push({
+      x: Math.round((left + right) / 2),
+      y: Math.round((top + bottom) / 2),
+    });
+  }
+  return { point: points.length === 1 ? points[0] : null, ambiguous: points.length > 1 };
+}
+
+function decodeXmlAttribute(value: string): string {
+  return value.replace(
+    /&(amp|lt|gt|quot|apos|#\d+|#x[\da-f]+);/gi,
+    (entity, code: string) => {
+      const named: Record<string, string> = {
+        amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+      };
+      const normalized = code.toLowerCase();
+      if (named[normalized] !== undefined) return named[normalized];
+      const numeric = normalized.startsWith('#x')
+        ? Number.parseInt(normalized.slice(2), 16)
+        : Number.parseInt(normalized.slice(1), 10);
+      try {
+        return Number.isInteger(numeric) ? String.fromCodePoint(numeric) : entity;
+      } catch {
+        return entity;
+      }
+    },
+  );
 }
 
 function simViewFrameCenter(value: unknown, width: number, height: number): { x: number; y: number } | null {

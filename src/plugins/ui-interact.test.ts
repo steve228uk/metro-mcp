@@ -100,6 +100,9 @@ async function createAppOnlyHarness(
             : 'emulator-42';
           return Buffer.from(`List of devices attached\n${androidId}\t${androidStatus} model:Pixel_8\n`);
         }
+        if (args[0] === '-s' && args[2] === 'exec-out' && args[3] === 'cat') {
+          return Buffer.from('<node text="Save" content-desc="" bounds="[0,0][100,100]"/>');
+        }
         return Buffer.from('');
       }
       if (nativeAvailable && command === 'idb') {
@@ -241,6 +244,21 @@ describe('UI handler actions without native inventory', () => {
       expect(result).toContain('status=handled');
     }
     expect(harness.reactCalls).toEqual([]);
+  });
+
+  test('routes Android label fallback through bounded native input', async () => {
+    const harness = await createAppOnlyHarness('unhandled', true, {}, 'emulator-42');
+    const tap = harness.tools.get('tap_element')!;
+    const response = await tap.handler(tap.parameters.parse({
+      label: 'Save',
+      platform: 'android',
+    }) as Record<string, unknown>);
+    expect(response).toContain('backend=adb');
+    expect(response).toContain('dispatch=submitted');
+    expect(harness.execFileCalls).toContainEqual({
+      command: 'adb',
+      args: ['-s', 'emulator-42', 'shell', 'input', 'tap', '50', '50'],
+    });
   });
 
   test('invokes focused controlled Paper and Fabric key handlers with exact payloads', async () => {

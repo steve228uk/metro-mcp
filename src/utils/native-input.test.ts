@@ -416,6 +416,59 @@ describe('native input providers', () => {
     expect(timeout).toBeLessThanOrEqual(20);
   });
 
+  test('bounds Android label lookup before dispatch and preserves uncertain tap failures', async () => {
+    const target = { platform: 'android' as const, id: 'emulator-5556' };
+
+    const stalledLookup = fakeRunner();
+    const lookupBase = stalledLookup.execFile;
+    stalledLookup.execFile = async (command, args, options) => {
+      if (command === 'adb' && args.includes('uiautomator')) return new Promise<never>(() => {});
+      return lookupBase(command, args, options);
+    };
+    const lookupController = new NativeInputController({
+      runner: stalledLookup,
+      simviewRequestTimeoutMs: 20,
+    });
+    await expect(lookupController.tapLabel(target, 'Continue')).resolves.toMatchObject({
+      backend: 'adb', status: 'failed', dispatched: false, dispatch: 'not-sent',
+    });
+    expect(stalledLookup.calls.some(({ args }) => args.includes('input'))).toBe(false);
+
+    const stalledTap = fakeRunner();
+    const tapBase = stalledTap.execFile;
+    stalledTap.execFile = async (command, args, options) => {
+      if (command === 'adb' && args[2] === 'exec-out') {
+        return Buffer.from('<node text="Continue" bounds="[10,20][90,60]"/>');
+      }
+      if (command === 'adb' && args.includes('input')) return new Promise<never>(() => {});
+      return tapBase(command, args, options);
+    };
+    const tapController = new NativeInputController({
+      runner: stalledTap,
+      simviewRequestTimeoutMs: 20,
+    });
+    await expect(tapController.tapLabel(target, 'Continue')).resolves.toMatchObject({
+      backend: 'adb', status: 'failed', dispatched: false, dispatch: 'unknown',
+    });
+
+    const escapedLabel = fakeRunner();
+    const escapedBase = escapedLabel.execFile;
+    escapedLabel.execFile = async (command, args, options) => {
+      if (command === 'adb' && args[2] === 'exec-out') {
+        return Buffer.from('<node content-desc="R&amp;D &#x1F680;" bounds="[10,20][90,60]"/>');
+      }
+      return escapedBase(command, args, options);
+    };
+    const escapedController = new NativeInputController({ runner: escapedLabel });
+    await expect(escapedController.tapLabel(target, 'R&D 🚀')).resolves.toMatchObject({
+      backend: 'adb', status: 'handled', dispatched: true, dispatch: 'submitted',
+    });
+    expect(escapedLabel.calls).toContainEqual({
+      command: 'adb',
+      args: ['-s', target.id, 'shell', 'input', 'tap', '50', '40'],
+    });
+  });
+
   test('discovers IDB ui key as a provider capability', async () => {
     const runner = fakeRunner();
     const baseExecFile = runner.execFile;

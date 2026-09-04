@@ -1,4 +1,3 @@
-import { readFile } from 'fs/promises';
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import {
@@ -12,7 +11,6 @@ import {
   buildFiberReadExpression,
 } from '../utils/fiber.js';
 import {
-  adbPrefix,
   discoverAndroidDevices,
   discoverBootedSimulators,
   getConnectedDeviceTarget,
@@ -165,34 +163,6 @@ export const uiInteractPlugin = definePlugin({
 
         const target = prepared ? prepared.target : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
-
-        // ── Android fallback: adb uiautomator ───────────────────────────────
-        if (target.platform === 'android') {
-          const tmpFile = '/tmp/metro-mcp-uidump.xml';
-          let content = '';
-          try {
-            await ctx.exec(
-              `${adbPrefix(target.id)} shell uiautomator dump /sdcard/uidump.xml && ${adbPrefix(target.id)} pull /sdcard/uidump.xml ${tmpFile} 2>/dev/null`
-            );
-            content = await readFile(tmpFile, 'utf8');
-          } finally {
-            await ctx.exec(`rm -f ${tmpFile}`).catch(() => {});
-          }
-          try {
-            const esc = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const bounds = `"\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`;
-            const match =
-              content.match(new RegExp(`text="${esc}"[^>]*bounds=${bounds}`, 'i')) ||
-              content.match(new RegExp(`content-desc="${esc}"[^>]*bounds=${bounds}`, 'i'));
-            if (match) {
-              const cx = Math.round((parseInt(match[1]) + parseInt(match[3])) / 2);
-              const cy = Math.round((parseInt(match[2]) + parseInt(match[4])) / 2);
-              await ctx.exec(`${adbPrefix(target.id)} shell input tap ${cx} ${cy}`);
-              return `Tapped "${label}" at (${cx}, ${cy})`;
-            }
-          } catch {}
-          return `Element "${label}" not found.`;
-        }
 
         const dispatch = await nativeInput.tapLabel(target, label);
         return nativeResult(`Tapped "${label}"`, dispatch);
