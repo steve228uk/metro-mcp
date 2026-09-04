@@ -223,16 +223,27 @@ export async function resolveDevice(
   const ios = iosResult.status === 'fulfilled'
     ? findIosId(iosResult.value, connectedId)
     : undefined;
+  // Keep an exact Android ID match even when adb reports it as offline or
+  // unauthorized. The entry is still proof that the connected Metro target
+  // belongs to Android, so it must prevent a fallback to another device or a
+  // booted iOS simulator. Dispatch callers continue to use authorizedAndroid
+  // below and therefore never send commands to this unavailable entry.
   const android = androidResult.status === 'fulfilled'
-    ? androidResult.value
-        .filter((device) => device.status === 'device')
-        .find((device) => device.id === connectedId)
+    ? androidResult.value.find((device) => device.id === connectedId)
     : undefined;
   if (ios && android) {
     throw new Error(`Ambiguous connected device ID "${connectedId}" across iOS and Android.`);
   }
   if (ios) return toResolvedIos(ios);
-  if (android) return { platform: 'android', id: android.id, name: android.model };
+  if (android) {
+    if (android.status !== 'device') {
+      throw new Error(
+        `Connected Android device "${android.id}" is ${android.status}; ` +
+        'refusing to select another device.',
+      );
+    }
+    return { platform: 'android', id: android.id, name: android.model };
+  }
 
   // If one inventory failed, names and sole-device fallbacks are unsafe while
   // a Metro target is connected: the surviving inventory may describe an
