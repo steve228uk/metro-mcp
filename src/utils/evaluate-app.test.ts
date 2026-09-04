@@ -770,6 +770,18 @@ describe('shared app evaluation policy', () => {
       'globalThis.flag = false; let i = 0; L: while (i < 1) { i += 1; Promise.resolve("before"); try { if (flag) Promise.resolve("guarded"); else {} } finally { continue L; } }',
       { awaitPromise: true, timeout: 1000 },
     )).resolves.toBe('before');
+
+    const retainsFinalizerCompletionWhenCaught = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(retainsFinalizerCompletionWhenCaught(
+      'globalThis.flag = false; L: { Promise.resolve("before"); try { try {} finally { Promise.resolve("leak"); if (flag) break L; throw 0; } } catch {} }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('leak');
+
+    const inheritsGuardedCompletionThroughReplacedExit = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(inheritsGuardedCompletionThroughReplacedExit(
+      'if (true) { A: { B: try { Promise.resolve("guarded"); break A; } finally { break B; } } } else Promise.resolve("other")',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('guarded');
   });
 
   test('observes a completion expression before trailing declarations', async () => {
