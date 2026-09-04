@@ -213,9 +213,18 @@ export async function awaitAppResult(
         state.observing = true;
         try { fulfill(await value); } catch (error) { reject(error); }
       };
-      root.Object.defineProperty(root, ${key}, {
-        value: state, configurable: true
-      });
+      // Keep setup viable after the app replaces Object or defineProperty.
+      // With normal intrinsics, hide and protect the temporary mailbox as before.
+      var descriptor = {
+        value: state, configurable: true, enumerable: false, writable: false
+      };
+      try {
+        root.Reflect.defineProperty(root, ${key}, descriptor);
+      } catch (_) {}
+      if (root[${key}] !== state) {
+        try { root.Object.defineProperty(root, ${key}, descriptor); } catch (_) {}
+      }
+      if (root[${key}] !== state) root[${key}] = state;
       state.timer = root.setTimeout(function() {
         if (root[${key}] === state) delete root[${key}];
       }, ${mailboxLifetime});
@@ -264,7 +273,10 @@ export async function awaitAppResult(
       sourceCompletedByValue = true;
     }
 
-    if (completion.objectId) {
+    const runtimeGenerationChanged = mailboxGeneration !== undefined &&
+      options?.getRuntimeGeneration !== undefined &&
+      options.getRuntimeGeneration() !== mailboxGeneration;
+    if (completion.objectId && !runtimeGenerationChanged) {
       if (!options?.settleRemote) {
         throw new Error('App evaluation returned a remote object without settlement support');
       }
@@ -277,7 +289,7 @@ export async function awaitAppResult(
         deadline,
         timeout,
       );
-    } else {
+    } else if (!completion.objectId) {
       // Runtime.evaluate returns primitives by value when the source has no
       // remote object completion. They are already complete, so writing them
       // back through the mailbox would add an unnecessary request and poll.
@@ -285,6 +297,10 @@ export async function awaitAppResult(
       sourceCompletedByValue = true;
       return completion.value;
     }
+
+    // The source may have completed just before a reconnect changed the
+    // runtime generation. Its completion handle is now stale, but the
+    // source's mailbox observation is still the safe one-shot result.
 
     while (Date.now() < deadline) {
       const result = await evaluateBeforeDeadline(pollEvaluate, `(function() {

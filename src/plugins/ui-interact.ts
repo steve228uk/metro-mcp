@@ -18,11 +18,20 @@ import {
   discoverBootedSimulators,
   getConnectedDeviceTarget,
   resolveDevice,
+  snapshotConnectedDeviceTarget,
+  type ResolvedDevice,
 } from '../utils/device-discovery.js';
 import { isAppEvaluationError } from '../utils/evaluate-app.js';
 
 // Module-level caches — persist across tool handler calls for the lifetime of the server.
 let idbAvailableCache: boolean | null = null;
+
+interface PreparedTarget {
+  target: ResolvedDevice | null;
+  canUseReact: boolean;
+  isCurrent(): boolean;
+  isTargetCurrent(): boolean;
+}
 
 // A failed CDP request is ambiguous once Runtime.evaluate may have been
 // dispatched: retrying a native action could duplicate the app-side event.
@@ -49,16 +58,39 @@ export const uiInteractPlugin = definePlugin({
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
       resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
-    const prepareExplicitTarget = async (platform: 'ios' | 'android') => {
-      const connected = getConnectedDeviceTarget(ctx);
-      const logicalId = connected?.reactNative?.logicalDeviceId?.trim();
-      const target = await resolveDevice(ctx, platform, connected);
+    const prepareExplicitTarget = async (platform: 'ios' | 'android'): Promise<PreparedTarget> => {
+      const connectedSnapshot = snapshotConnectedDeviceTarget(getConnectedDeviceTarget(ctx));
+      const hasConnectedSnapshot = connectedSnapshot !== undefined;
+      const targetId = connectedSnapshot?.id?.trim();
+      const logicalId = connectedSnapshot?.reactNative?.logicalDeviceId?.trim();
+      const generation = ctx.getRuntimeGeneration?.();
+      const target = await resolveDevice(ctx, platform, connectedSnapshot);
       const sameId = (left: string, right: string, idPlatform: 'ios' | 'android') =>
         idPlatform === 'ios'
           ? left.toLowerCase() === right.toLowerCase()
           : left === right;
+      const isTargetCurrent = () => {
+        // An explicit platform request may legitimately have no CDP target
+        // yet. In that case inventory resolution is the native target source;
+        // there is no prior target to become stale.
+        if (!hasConnectedSnapshot) return true;
+        const current = getConnectedDeviceTarget(ctx);
+        if (!current) return false;
+        if (targetId && current.id?.trim() !== targetId) return false;
+        const currentLogicalId = current.reactNative?.logicalDeviceId?.trim();
+        if (logicalId && (!currentLogicalId || !sameId(currentLogicalId, logicalId, platform))) {
+          return false;
+        }
+        return true;
+      };
+      const isCurrent = () => {
+        if (!isTargetCurrent()) return false;
+        const currentGeneration = ctx.getRuntimeGeneration?.();
+        return generation === undefined || currentGeneration === undefined ||
+          currentGeneration === generation;
+      };
       if (!target || !logicalId || !sameId(target.id, logicalId, platform)) {
-        return { target, canUseReact: false };
+        return { target, canUseReact: false, isCurrent, isTargetCurrent };
       }
       const verifiedLogicalId = logicalId;
 
@@ -76,13 +108,20 @@ export const uiInteractPlugin = definePlugin({
           const opposite = await discoverBootedSimulators(ctx);
           oppositeHasId = opposite.some((device) => sameId(device.udid, verifiedLogicalId, 'ios'));
         }
-        return { target, canUseReact: !oppositeHasId };
+        return { target, canUseReact: !oppositeHasId, isCurrent, isTargetCurrent };
       } catch {
         // Without a successful opposite inventory, the ID's platform is not
         // proven. Keep the requested target for native fallback.
-        return { target, canUseReact: false };
+        return { target, canUseReact: false, isCurrent, isTargetCurrent };
       }
     };
+
+    const canUsePreparedReact = (prepared: PreparedTarget | undefined) =>
+      !prepared || (prepared.canUseReact && prepared.isCurrent());
+
+    const preparedNativeTarget = (
+      prepared: PreparedTarget,
+    ) => prepared.isTargetCurrent() ? prepared.target : null;
 
     async function isIDBAvailable(): Promise<boolean> {
       if (idbAvailableCache !== null) return idbAvailableCache;
@@ -182,7 +221,7 @@ export const uiInteractPlugin = definePlugin({
         const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsLabel = JSON.stringify(label);
         let evaluationError: unknown;
-        const tapped = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
+        const tapped = canUsePreparedReact(prepared) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             ${FIND_AND_INVOKE_JS}
@@ -197,7 +236,7 @@ export const uiInteractPlugin = definePlugin({
           return `Could not evaluate the connected app while tapping "${label}".`;
         }
 
-        const target = prepared ? prepared.target : await resolveTarget(platform);
+        const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const p = target.platform;
 
@@ -264,7 +303,7 @@ export const uiInteractPlugin = definePlugin({
         const jsText = JSON.stringify(text);
         const jsTestID = testID ? JSON.stringify(testID) : 'null';
         let evaluationError: unknown;
-        const typed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
+        const typed = canUsePreparedReact(prepared) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             var targetID = ${jsTestID};
@@ -305,7 +344,7 @@ export const uiInteractPlugin = definePlugin({
           return 'Could not evaluate the connected app while typing text.';
         }
 
-        const target = prepared ? prepared.target : await resolveTarget(platform);
+        const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const p = target.platform;
 
@@ -354,7 +393,7 @@ export const uiInteractPlugin = definePlugin({
         if (label && !hasCoordinates) {
           const jsLabel = JSON.stringify(label);
           let evaluationError: unknown;
-          const pressed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
+          const pressed = canUsePreparedReact(prepared) && await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
@@ -410,7 +449,7 @@ export const uiInteractPlugin = definePlugin({
         // ── CDP: find ScrollView and invoke scrollTo on its native node ────────
         const jsDir = JSON.stringify(direction);
         let evaluationError: unknown;
-        const scrolled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
+        const scrolled = canUsePreparedReact(prepared) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             var dir = ${jsDir};
@@ -462,7 +501,7 @@ export const uiInteractPlugin = definePlugin({
         }
 
         if (!result) {
-          const target = prepared ? prepared.target : await resolveTarget(platform);
+          const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
           const p = target.platform;
           // ── Native fallbacks (fixed midpoint coordinates) ───────────────────
@@ -480,7 +519,7 @@ export const uiInteractPlugin = definePlugin({
         }
 
         // ── Log to test recorder if a recording is active ─────────────────────
-        if (prepared?.canUseReact ?? true) await ctx.evalInApp(`
+        if (canUsePreparedReact(prepared)) await ctx.evalInApp(`
           (function() {
             if (!globalThis.__METRO_MCP_REC_ACTIVE__) return;
             ${GET_ROUTE_FUNC_JS}
@@ -515,7 +554,7 @@ export const uiInteractPlugin = definePlugin({
 
         if (button === 'ENTER' || button === 'DELETE') {
           let evaluationError: unknown;
-          const handled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
+          const handled = canUsePreparedReact(prepared) && await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               var handlerName = ${JSON.stringify(button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText')};
@@ -581,16 +620,43 @@ export const uiInteractPlugin = definePlugin({
                   typeof targetInstance.blur === 'function') targetInstance.blur();
               } else {
                 var val = targetProps.value;
-                var end = val.length;
-                var last = end > 0 ? val.charCodeAt(end - 1) : 0;
-                var previous = end > 1 ? val.charCodeAt(end - 2) : 0;
-                // Remove one complete Unicode code point. Hermes supports
-                // these primitive string operations, while String spread and
-                // Array.from are not available in every React Native runtime.
-                if (last >= 0xdc00 && last <= 0xdfff &&
-                  previous >= 0xd800 && previous <= 0xdbff) end -= 2;
-                else if (end > 0) end -= 1;
-                targetProps.onChangeText(val.slice(0, end));
+                // The native DELETE key acts at the current caret/selection,
+                // while a controlled value alone does not tell us where that
+                // caret is. Only synthesize the change when React has exposed
+                // a valid UTF-16 selection; otherwise return false so the
+                // platform backend can preserve the native selection.
+                var selection = targetProps.selection;
+                if (!selection || typeof selection !== 'object' ||
+                  typeof selection.start !== 'number' || typeof selection.end !== 'number' ||
+                  selection.start !== selection.start || selection.end !== selection.end ||
+                  selection.start % 1 !== 0 || selection.end % 1 !== 0 ||
+                  selection.start < 0 || selection.end < selection.start ||
+                  selection.end > val.length) return false;
+                var start = selection.start;
+                var end = selection.end;
+                // Never manufacture an invalid surrogate pair when a stale or
+                // malformed selection splits a code point. Native input can
+                // resolve the same selection safely.
+                if ((start > 0 && start < val.length &&
+                    val.charCodeAt(start - 1) >= 0xd800 && val.charCodeAt(start - 1) <= 0xdbff &&
+                    val.charCodeAt(start) >= 0xdc00 && val.charCodeAt(start) <= 0xdfff) ||
+                  (end > 0 && end < val.length &&
+                    val.charCodeAt(end - 1) >= 0xd800 && val.charCodeAt(end - 1) <= 0xdbff &&
+                    val.charCodeAt(end) >= 0xdc00 && val.charCodeAt(end) <= 0xdfff)) return false;
+                if (start === end) {
+                  // There is no deletion to synthesize at the start of the
+                  // value. Let Android receive the key so the native input
+                  // keeps its actual caret semantics without a redundant
+                  // controlled-value callback.
+                  if (start === 0) return false;
+                  start -= 1;
+                  // Remove one complete Unicode code point. Hermes supports
+                  // these primitive string operations, while String spread and
+                  // Array.from are not available in every React Native runtime.
+                  if (start > 0 && val.charCodeAt(start) >= 0xdc00 && val.charCodeAt(start) <= 0xdfff &&
+                    val.charCodeAt(start - 1) >= 0xd800 && val.charCodeAt(start - 1) <= 0xdbff) start -= 1;
+                }
+                targetProps.onChangeText(val.slice(0, start) + val.slice(end));
               }
               return true;
             })()
@@ -604,7 +670,7 @@ export const uiInteractPlugin = definePlugin({
           }
         }
 
-        const target = prepared ? prepared.target : await resolveTarget(platform);
+        const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const p = target.platform;
 

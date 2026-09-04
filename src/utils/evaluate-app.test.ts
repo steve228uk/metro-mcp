@@ -859,6 +859,57 @@ describe('shared app evaluation policy', () => {
     )).rejects.toThrow('poisoned rejection');
   });
 
+  test('keeps the awaited mailbox hidden and read-only with normal intrinsics', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp(`(function() {
+      var prefix = '__METRO_MCP_ASYNC_';
+      var key = Object.getOwnPropertyNames(this).find(name => name.startsWith(prefix));
+      var descriptor = Object.getOwnPropertyDescriptor(this, key);
+      var iterated = [];
+      for (var name in this) if (name.startsWith(prefix)) iterated.push(name);
+      return {
+        enumerable: descriptor.enumerable,
+        writable: descriptor.writable,
+        configurable: descriptor.configurable,
+        keys: Object.keys(this).filter(name => name.startsWith(prefix)),
+        iterated: iterated
+      };
+    })()`, { awaitPromise: true, timeout: 1000 })).resolves.toEqual({
+      enumerable: false, writable: false, configurable: true, keys: [], iterated: [],
+    });
+  });
+
+  test('creates a mailbox after an earlier evaluation mutates Object globals', async () => {
+    for (const mutation of [
+      'Object.defineProperty = null; 0;',
+      'Object = null; 0;',
+      'Object.defineProperty = function() {}; 0;',
+    ]) {
+      const { transport } = vmTransport();
+      const evalInApp = createAppEvaluator(transport, lifecycle());
+      await expect(evalInApp(mutation, { awaitPromise: true, timeout: 1000 }))
+        .resolves.toBe(0);
+      await expect(evalInApp(
+        'Promise.resolve(13);',
+        { awaitPromise: true, timeout: 1000 },
+      )).resolves.toBe(13);
+      await expect(evalInApp(`(function() {
+        var root = this;
+        var keys = Reflect.ownKeys(root).filter(name => typeof name === 'string' && name.startsWith('__METRO_MCP_ASYNC_'));
+        return {
+          found: keys.length > 0,
+          hidden: keys.every(function(key) {
+            var descriptor = Reflect.getOwnPropertyDescriptor(root, key);
+            return descriptor.enumerable === false && descriptor.writable === false;
+          })
+        };
+      })()`, { awaitPromise: true, timeout: 1000 })).resolves.toEqual({
+        found: true, hidden: true,
+      });
+    }
+  });
+
   test('keeps declaration-form scripts in the direct evaluation scope', async () => {
     const { transport } = vmTransport();
     const evalInApp = createAppEvaluator(transport, lifecycle());
@@ -1070,7 +1121,7 @@ describe('shared app evaluation policy', () => {
     let generation = 0;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(root')) {
+          String(params?.expression).includes("status: 'pending'")) {
         setupAttempts += 1;
       }
       if (method === 'Runtime.evaluate' &&
@@ -1102,7 +1153,7 @@ describe('shared app evaluation policy', () => {
     let setupAttempts = 0;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(root')) {
+          String(params?.expression).includes("status: 'pending'")) {
         setupAttempts += 1;
         if (setupAttempts === 1) throw new Error('WebSocket closed');
       }
@@ -1212,6 +1263,57 @@ describe('shared app evaluation policy', () => {
     expect(settlementAttempts).toBe(1);
   });
 
+  test('polls the mailbox when the runtime generation changes after source dispatch', async () => {
+    const { transport, calls } = vmTransport();
+    let generation = 1;
+    const originalSend = transport.send;
+    transport.send = async (method, params, options) => {
+      const result = await originalSend(method, params, options);
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('generationAfterSource')) {
+        generation += 1;
+      }
+      return result;
+    };
+    const base = lifecycle();
+    const evalInApp = createAppEvaluator(transport, {
+      ...base,
+      getGeneration: () => generation,
+    });
+
+    await expect(evalInApp(
+      'globalThis.generationAfterSourceExecutions = (globalThis.generationAfterSourceExecutions || 0) + 1; globalThis.generationAfterSource = new Promise(resolve => setTimeout(() => resolve(7), 10)); generationAfterSource;',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(7);
+    expect(transport.context).toHaveProperty('generationAfterSourceExecutions', 1);
+    expect(calls.filter((call) => call.method === 'Runtime.callFunctionOn')).toHaveLength(0);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('generationAfterSource'))).toHaveLength(1);
+  });
+
+  test('polls the mailbox after a stale completion handle error', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    let settlementAttempts = 0;
+    transport.send = async (method, params, options) => {
+      if (method === 'Runtime.callFunctionOn') {
+        settlementAttempts += 1;
+        await originalSend(method, params, options);
+        throw new Error('Could not find object with given id');
+      }
+      return originalSend(method, params, options);
+    };
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+
+    await expect(evalInApp(
+      'globalThis.staleSettlementExecutions = (globalThis.staleSettlementExecutions || 0) + 1; new Promise(resolve => setTimeout(() => resolve(8), 10));',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(8);
+    expect(transport.context).toHaveProperty('staleSettlementExecutions', 1);
+    expect(settlementAttempts).toBe(1);
+    expect(calls.filter((call) => call.method === 'Runtime.callFunctionOn')).toHaveLength(1);
+  });
+
   test('recreates the mailbox when generation changes after mailbox setup', async () => {
     const { transport, calls } = vmTransport();
     let generation = 0;
@@ -1242,7 +1344,7 @@ describe('shared app evaluation policy', () => {
     transport.send = async (method, params) => {
       const result = await originalSend(method, params);
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(root')) {
+          String(params?.expression).includes("status: 'pending'")) {
         generation += 1;
       }
       return result;
@@ -1270,7 +1372,7 @@ describe('shared app evaluation policy', () => {
     const originalSend = transport.send;
     transport.send = async (method, params) => {
       if (method === 'Runtime.evaluate' &&
-          String(params?.expression).includes('Object.defineProperty(root')) {
+          String(params?.expression).includes("status: 'pending'")) {
         mailboxSetups += 1;
       }
       return originalSend(method, params);
@@ -1396,7 +1498,7 @@ describe('shared app evaluation policy', () => {
       send: async (method: string, params?: Record<string, unknown>, options?: Record<string, unknown>) => {
         calls.push({ method, options });
         if (method === 'Runtime.evaluate' &&
-            String(params?.expression).includes('Object.defineProperty(root')) {
+            String(params?.expression).includes("status: 'pending'")) {
           return { result: { value: true } };
         }
         if (method === 'Runtime.evaluate') {

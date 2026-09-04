@@ -20,6 +20,7 @@ type AppEvaluation =
   | {
       renderer: 'paper' | 'fabric';
       value: string;
+      selection?: { start: number; end: number };
       submitBehavior?: 'newline' | 'submit' | 'blurAndSubmit';
       blurOnSubmit?: boolean;
       multiline?: boolean;
@@ -36,6 +37,7 @@ async function createAppOnlyHarness(
   sharedInventoryDeviceId = false,
   unavailablePlatform?: 'ios' | 'android',
   androidStatus: 'device' | 'offline' | 'unauthorized' = 'device',
+  targetChangeAfterInventory?: { id?: string; logicalId?: string; generation?: boolean },
 ) {
   const tools = new Map<string, Tool>();
   let nativeCalls = 0;
@@ -43,15 +45,18 @@ async function createAppOnlyHarness(
   const execCommands: string[] = [];
   const reactCalls: Array<{ type: 'submit' | 'change'; value: unknown }> = [];
   let blurCalls = 0;
+  let runtimeGeneration = 0;
+  let currentTarget = {
+    id: 'metro-target-a',
+    deviceName: 'Connected app',
+    ...(connectedLogicalDeviceId
+      ? { reactNative: { logicalDeviceId: connectedLogicalDeviceId } }
+      : {}),
+  } as Record<string, unknown>;
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
-      getTarget: () => ({
-        deviceName: 'Connected app',
-        ...(connectedLogicalDeviceId
-          ? { reactNative: { logicalDeviceId: connectedLogicalDeviceId } }
-          : {}),
-      } as never),
+      getTarget: () => currentTarget as never,
       send: async () => ({}),
     },
     events: { on: () => {}, off: () => {}, isConnected: () => true },
@@ -96,6 +101,16 @@ async function createAppOnlyHarness(
         const androidId = sharedInventoryDeviceId && connectedLogicalDeviceId
           ? connectedLogicalDeviceId
           : 'emulator-42';
+        if (targetChangeAfterInventory) {
+          currentTarget = {
+            ...currentTarget,
+            ...(targetChangeAfterInventory.id ? { id: targetChangeAfterInventory.id } : {}),
+            ...(targetChangeAfterInventory.logicalId
+              ? { reactNative: { logicalDeviceId: targetChangeAfterInventory.logicalId } }
+              : {}),
+          };
+          if (targetChangeAfterInventory.generation) runtimeGeneration++;
+        }
         return Buffer.from(`List of devices attached\n${androidId}\t${androidStatus} model:Connected_app\n`);
       }
       throw new Error('native inventory unavailable');
@@ -133,6 +148,13 @@ async function createAppOnlyHarness(
           type: { displayName: 'TextInput' },
           memoizedProps: {
             ...(controlled ? { value } : { defaultValue: value }),
+            ...(controlled
+              ? {
+                  selection: 'selection' in evaluation
+                    ? evaluation.selection
+                    : { start: value.length, end: value.length },
+                }
+              : {}),
             ...('submitBehavior' in evaluation && evaluation.submitBehavior !== undefined
               ? { submitBehavior: evaluation.submitBehavior } : {}),
             ...('blurOnSubmit' in evaluation && evaluation.blurOnSubmit !== undefined
@@ -160,6 +182,7 @@ async function createAppOnlyHarness(
       return true;
     },
     getActiveDeviceKey: () => null, getActiveDeviceName: () => null,
+    getRuntimeGeneration: () => runtimeGeneration,
     notifyResourceUpdated: () => {},
   };
   await uiInteractPlugin.setup(ctx);
@@ -243,12 +266,16 @@ describe('UI handler actions without native inventory', () => {
     }
   });
 
-  test('invokes controlled Paper and Fabric handlers with exact empty payloads', async () => {
+  test('invokes controlled Paper and Fabric submit handlers with exact empty payloads', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
-      const harness = await pressTextInputKeys({ renderer, value: '' });
+      const harness = await createAppOnlyHarness({ renderer, value: '' });
+      const press = harness.tools.get('press_button')!;
+      expect(await press.handler(press.parameters.parse({
+        button: 'ENTER',
+        platform: 'auto',
+      }) as Record<string, unknown>)).toBe('Pressed ENTER');
       expect(harness.reactCalls).toEqual([
         { type: 'submit', value: { nativeEvent: { text: '' } } },
-        { type: 'change', value: '' },
       ]);
       expect(harness.getNativeCalls()).toBe(0);
     }
@@ -262,6 +289,58 @@ describe('UI handler actions without native inventory', () => {
     expect(harness.reactCalls).toEqual([
       { type: 'change', value: 'A' },
     ]);
+  });
+
+  test('deletes at the controlled Android caret and selection', async () => {
+    const caretHarness = await createAppOnlyHarness({
+      renderer: 'paper', value: 'abcd', selection: { start: 2, end: 2 },
+    });
+    const press = caretHarness.tools.get('press_button')!;
+    const caret = await press.handler(press.parameters.parse({ button: 'DELETE' }) as Record<string, unknown>);
+    expect(caret).toBe('Pressed DELETE');
+    expect(caretHarness.reactCalls).toEqual([{ type: 'change', value: 'acd' }]);
+
+    const rangeHarness = await createAppOnlyHarness({
+      renderer: 'paper', value: 'abcd', selection: { start: 1, end: 3 },
+    });
+    const rangePress = rangeHarness.tools.get('press_button')!;
+    expect(await rangePress.handler(rangePress.parameters.parse({ button: 'DELETE' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(rangeHarness.reactCalls).toEqual([{ type: 'change', value: 'ad' }]);
+
+    const unicodeHarness = await createAppOnlyHarness({
+      renderer: 'paper', value: 'A😀B', selection: { start: 3, end: 3 },
+    });
+    const unicodePress = unicodeHarness.tools.get('press_button')!;
+    expect(await unicodePress.handler(unicodePress.parameters.parse({ button: 'DELETE' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(unicodeHarness.reactCalls).toEqual([{ type: 'change', value: 'AB' }]);
+  });
+
+  test('defers controlled Android DELETE at the start caret to native input', async () => {
+    const harness = await createAppOnlyHarness(
+      { renderer: 'paper', value: 'abcd', selection: { start: 0, end: 0 } },
+      true,
+      'emulator-42',
+    );
+    const press = harness.tools.get('press_button')!;
+    expect(await press.handler(press.parameters.parse({ button: 'DELETE', platform: 'android' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(harness.reactCalls).toEqual([]);
+    expect(harness.execCommands).toEqual(['adb -s "emulator-42" shell input keyevent 67']);
+  });
+
+  test('defers controlled DELETE to Android when selection is unavailable', async () => {
+    const harness = await createAppOnlyHarness(
+      { renderer: 'paper', value: 'abcd', selection: undefined },
+      true,
+      'emulator-42',
+    );
+    const press = harness.tools.get('press_button')!;
+    expect(await press.handler(press.parameters.parse({ button: 'DELETE', platform: 'android' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(harness.reactCalls).toEqual([]);
+    expect(harness.execCommands.at(-1)).toBe('adb -s "emulator-42" shell input keyevent 67');
   });
 
   test('matches Android blurAndSubmit semantics for controlled Paper and Fabric inputs', async () => {
@@ -485,6 +564,38 @@ describe('UI handler actions without native inventory', () => {
     expect(await tool.handler(tool.parameters.parse({ label: 'Save', platform: 'ios' }) as Record<string, unknown>))
       .toBe('Tapped "Save"');
     expect(harness.evaluations).toHaveLength(1);
+  });
+
+  test('revalidates the Metro target after native inventory before React dispatch', async () => {
+    const harness = await createAppOnlyHarness(
+      'success', true, 'SIMULATOR123', false, undefined, 'device',
+      { id: 'metro-target-b' },
+    );
+    const tool = harness.tools.get('tap_element')!;
+    const result = await tool.handler(tool.parameters.parse({
+      label: 'Save', platform: 'ios',
+    }) as Record<string, unknown>);
+
+    expect(result).toBe('No simulator/emulator detected.');
+    expect(harness.evaluations).toHaveLength(0);
+    expect(harness.execCommands).toHaveLength(0);
+  });
+
+  test('revalidates the runtime generation after native inventory before React dispatch', async () => {
+    const harness = await createAppOnlyHarness(
+      'success', true, 'SIMULATOR123', false, undefined, 'device',
+      { generation: true },
+    );
+    const tool = harness.tools.get('tap_element')!;
+    const result = await tool.handler(tool.parameters.parse({
+      label: 'Save', platform: 'ios',
+    }) as Record<string, unknown>);
+
+    // The native target remains the same, so its fallback is still safe even
+    // though the app runtime generation changed during inventory.
+    expect(result).toBe('Tapped "Save"');
+    expect(harness.evaluations).toHaveLength(0);
+    expect(harness.execCommands).toHaveLength(1);
   });
 
   test('requires the opposite inventory before explicit React-first handling', async () => {
