@@ -257,6 +257,79 @@ describe('shared app evaluation policy', () => {
     expect(state.state().reconnectCount).toBe(1);
   });
 
+  test('retries the server-level disconnected error before raw source dispatch', async () => {
+    const { transport, calls } = vmTransport();
+    let ensureAttempts = 0;
+    const state = lifecycle({
+      ensureConnected: async () => {
+        ensureAttempts += 1;
+        if (ensureAttempts === 1) {
+          throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+        }
+      },
+    });
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.serverLevelRetryCount = (globalThis.serverLevelRetryCount || 0) + 1; serverLevelRetryCount;',
+      { awaitPromise: false, timeout: 1000 },
+    )).resolves.toBe(1);
+    expect(ensureAttempts).toBe(2);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('serverLevelRetryCount'))).toHaveLength(1);
+  });
+
+  test('does not retry a dispatched mutation that reports the server guidance string', async () => {
+    const { transport, calls } = vmTransport();
+    const originalSend = transport.send;
+    const cdp = {
+      send: async (method: string, params?: Record<string, unknown>, options?: Record<string, unknown>): Promise<unknown> => {
+        const result = await originalSend(method, params, options);
+        if (method === 'Runtime.evaluate' && String(params?.expression).includes('__dispatchedServerError')) {
+          return {
+            exceptionDetails: {
+              text: 'Not connected to Metro. Use list_devices to check connection status.',
+            },
+          };
+        }
+        return result;
+      },
+    };
+    const state = lifecycle();
+    const evalInApp = createAppEvaluator(cdp, state);
+
+    await expect(evalInApp(
+      'globalThis.__dispatchedServerError = (globalThis.__dispatchedServerError || 0) + 1; __dispatchedServerError;',
+      { awaitPromise: false, timeout: 1000 },
+    )).rejects.toThrow('Not connected to Metro. Use list_devices to check connection status.');
+    expect(transport.context).toHaveProperty('__dispatchedServerError', 1);
+    expect(state.state().reconnectCount).toBe(0);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('__dispatchedServerError'))).toHaveLength(1);
+  });
+
+  test('does not dispatch after server-level recovery reaches the deadline', async () => {
+    const { transport, calls } = vmTransport();
+    let ensureAttempts = 0;
+    const evalInApp = createAppEvaluator(transport, lifecycle({
+      ensureConnected: async () => {
+        ensureAttempts += 1;
+        throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+      },
+      reconnect: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      },
+    }));
+
+    await expect(evalInApp('globalThis.mustNotDispatch = true;', {
+      awaitPromise: false,
+      timeout: 10,
+      deadline: Date.now() + 10,
+    })).rejects.toThrow('timed out');
+    expect(ensureAttempts).toBe(1);
+    expect(calls).toHaveLength(0);
+  });
+
   test('does not retry a duration-bearing evaluation timeout after dispatch', async () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
@@ -891,6 +964,43 @@ describe('shared app evaluation policy', () => {
     expect(transport.context).not.toHaveProperty('sourceMutation');
     expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('sourceMutation'))).toHaveLength(0);
+  });
+
+  test('recreates the mailbox after server-level recovery changes the runtime generation', async () => {
+    const { transport, calls } = vmTransport();
+    let generation = 1;
+    let ensureAttempts = 0;
+    let mailboxSetups = 0;
+    const originalSend = transport.send;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+        mailboxSetups += 1;
+      }
+      return originalSend(method, params);
+    };
+    const base = lifecycle({
+      ensureConnected: async () => {
+        ensureAttempts += 1;
+        if (ensureAttempts === 2) {
+          throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+        }
+      },
+      reconnect: async () => { generation = 2; },
+    });
+    const evalInApp = createAppEvaluator(transport, {
+      ...base,
+      getGeneration: () => generation,
+    });
+
+    await expect(evalInApp(
+      'globalThis.generationRecoverySource = (globalThis.generationRecoverySource || 0) + 1; Promise.resolve(generationRecoverySource);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(1);
+    expect(generation).toBe(2);
+    expect(mailboxSetups).toBe(2);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('generationRecoverySource'))).toHaveLength(1);
   });
 
   test('does not retry remote settlement after a deadline-bounded reconnect', async () => {
