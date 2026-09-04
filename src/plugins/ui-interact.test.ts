@@ -13,6 +13,8 @@ async function createAppOnlyHarness(
     | 'success'
     | 'failure'
     | 'pre-dispatch'
+    | 'timeout'
+    | 'ambiguous-timeout'
     | 'unhandled'
     | 'fabric-focused'
     | 'paper-focused'
@@ -104,6 +106,10 @@ async function createAppOnlyHarness(
       if (evaluation === 'failure') throw new Error('CDP disconnected');
       if (evaluation === 'pre-dispatch') {
         throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+      }
+      if (evaluation === 'timeout') throw new Error('App evaluation timed out');
+      if (evaluation === 'ambiguous-timeout') {
+        throw new Error('App evaluation timed out after 30ms');
       }
       if (evaluation === 'unhandled') return false;
       if (evaluation.endsWith('-focused') || evaluation.endsWith('-empty') || evaluation.endsWith('-uncontrolled')) {
@@ -364,6 +370,34 @@ describe('UI handler actions without native inventory', () => {
       expect(result).toContain('status=handled');
     }
     expect(harness.getNativeCalls()).toBeGreaterThan(0);
+  });
+
+  test('uses native fallback for the exact pre-dispatch evaluation timeout', async () => {
+    const harness = await createAppOnlyHarness('timeout', true);
+    const cases = [
+      ['tap_element', { label: 'Save', platform: 'ios' }, 'Tapped "Save"'],
+      ['type_text', { text: 'hello', platform: 'ios' }, 'Typed "hello"'],
+      ['long_press', { label: 'Save', x: 1, y: 2, platform: 'ios' }, 'Long pressed at (1, 2) for 1000ms'],
+      ['swipe', { direction: 'up', platform: 'ios' }, 'Swiped up'],
+      ['press_button', { button: 'ENTER', platform: 'ios' }, 'Pressed ENTER'],
+    ] as const;
+    for (const [name, args, expected] of cases) {
+      const tool = harness.tools.get(name)!;
+      const result = await tool.handler(tool.parameters.parse(args) as Record<string, unknown>);
+      expect(result).toContain(expected);
+      expect(result).toContain('status=handled');
+    }
+    expect(harness.getNativeCalls()).toBeGreaterThan(0);
+  });
+
+  test('does not use native fallback for a timed out evaluation with an ambiguous dispatch', async () => {
+    const harness = await createAppOnlyHarness('ambiguous-timeout', true);
+    const tool = harness.tools.get('tap_element')!;
+    await expect(tool.handler(tool.parameters.parse({
+      label: 'Save',
+      platform: 'ios',
+    }) as Record<string, unknown>)).rejects.toThrow('App evaluation timed out after 30ms');
+    expect(harness.getNativeCalls()).toBe(0);
   });
 
   test('uses native fallback for a label-only long press after a pre-dispatch failure', async () => {
