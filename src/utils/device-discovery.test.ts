@@ -104,6 +104,32 @@ describe('device discovery', () => {
     ]);
   });
 
+  test('bounds both auto-discovery subprocesses before using a ready inventory', async () => {
+    const timeouts: Array<{ command: string; timeout: number | undefined }> = [];
+    const runner: DeviceDiscoveryRunner = {
+      execFile(command, _args, options) {
+        timeouts.push({ command, timeout: options?.timeout });
+        if (command === 'xcrun') {
+          return Promise.resolve(Buffer.from(iosInventory([
+            { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
+          ])));
+        }
+        return new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('adb inventory timed out')), options?.timeout ?? 1000);
+        });
+      },
+    };
+
+    await expect(resolveDevice(runner, 'auto', undefined, 10)).resolves.toMatchObject({
+      platform: 'ios',
+      id: 'IOS-16',
+    });
+    expect(timeouts).toEqual([
+      { command: 'xcrun', timeout: 10 },
+      { command: 'adb', timeout: 10 },
+    ]);
+  });
+
   test('auto selection uses the sole authorized Android device when iOS is unavailable', async () => {
     const runner = runnerFor({
       ios: [],
