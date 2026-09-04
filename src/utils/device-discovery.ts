@@ -45,9 +45,11 @@ export interface DeviceDiscoveryRunner {
   execFile(
     command: string,
     args: string[],
-    options?: { maxBuffer?: number },
+    options?: { maxBuffer?: number; timeout?: number },
   ): Promise<Buffer | string>;
 }
+
+const DEVICE_DISCOVERY_TIMEOUT_MS = 5_000;
 
 export interface ConnectedDeviceTarget {
   appId?: string;
@@ -128,6 +130,7 @@ export function parseBootedSimulators(output: string): BootedSimulator[] {
 
 export async function discoverBootedSimulators(
   runner: DeviceDiscoveryRunner,
+  timeout = DEVICE_DISCOVERY_TIMEOUT_MS,
 ): Promise<BootedSimulator[]> {
   const output = await runner.execFile('xcrun', [
     'simctl',
@@ -135,7 +138,7 @@ export async function discoverBootedSimulators(
     'devices',
     'booted',
     '--json',
-  ]);
+  ], { timeout });
   return parseBootedSimulators(outputText(output));
 }
 
@@ -158,8 +161,9 @@ export function parseAndroidDevices(output: string): AndroidDevice[] {
 
 export async function discoverAndroidDevices(
   runner: DeviceDiscoveryRunner,
+  timeout = DEVICE_DISCOVERY_TIMEOUT_MS,
 ): Promise<AndroidDevice[]> {
-  const output = await runner.execFile('adb', ['devices', '-l']);
+  const output = await runner.execFile('adb', ['devices', '-l'], { timeout });
   return parseAndroidDevices(outputText(output));
 }
 
@@ -176,9 +180,10 @@ export async function resolveDevice(
   runner: DeviceDiscoveryRunner,
   platform: 'ios' | 'android' | 'auto',
   target?: ConnectedDeviceTarget | null,
+  discoveryTimeout = DEVICE_DISCOVERY_TIMEOUT_MS,
 ): Promise<ResolvedDevice | null> {
   if (platform === 'android') {
-    const devices = await discoverAndroidDevices(runner);
+    const devices = await discoverAndroidDevices(runner, discoveryTimeout);
     const connectedId = targetId(target);
     // Inspect the complete ADB inventory before dropping unavailable entries.
     // An offline or unauthorized exact match proves which Android target Metro
@@ -212,7 +217,7 @@ export async function resolveDevice(
   }
 
   if (platform === 'ios') {
-    const devices = await discoverBootedSimulators(runner);
+    const devices = await discoverBootedSimulators(runner, discoveryTimeout);
     // A target's name is not platform-qualified. A concrete simulator UDID
     // match is positive evidence that the connected target is iOS.
     const platformTarget = findIosId(devices, targetId(target)) ? target : undefined;
@@ -220,8 +225,8 @@ export async function resolveDevice(
   }
 
   const [iosResult, androidResult] = await Promise.allSettled([
-    discoverBootedSimulators(runner),
-    discoverAndroidDevices(runner),
+    discoverBootedSimulators(runner, discoveryTimeout),
+    discoverAndroidDevices(runner, discoveryTimeout),
   ]);
   // A connected target is stronger evidence than runtime ordering. This
   // matters when an Android app is connected while an unrelated iOS

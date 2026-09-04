@@ -394,7 +394,7 @@ describe('shared app evaluation policy', () => {
       call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('immediate rejection'));
     expect(sourceCall?.params.awaitPromise).toBe(false);
-    expect(String(sourceCall?.params.expression)).toContain('PromiseCtor.prototype.then.call');
+    expect(String(sourceCall?.params.expression)).toContain('promiseThen.call');
     expect(calls.filter((call) =>
       call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('immediate rejection'))).toHaveLength(1);
@@ -447,39 +447,49 @@ describe('shared app evaluation policy', () => {
     const { transport } = vmTransport();
     const evalInApp = createAppEvaluator(transport, lifecycle());
     await expect(evalInApp(
-      `globalThis.observedPromises = [];
-       const originalThen = Promise.prototype.then;
-       globalThis.originalThen = originalThen;
-       Promise.prototype.then = function(...args) {
-         if (this.marker) globalThis.observedPromises.push(this.marker);
-         return originalThen.apply(this, args);
+      `globalThis.observedThenables = [];
+       globalThis.markedThenable = function(value, marker) {
+         return { then: function(resolve) {
+           globalThis.observedThenables.push(marker);
+           resolve(value);
+         }};
        };
-       function marked(value, marker) { value.marker = marker; return value; }
        for (let index = 0; index < 2; index += 1) {
-         if (index === 0) marked(Promise.resolve('discarded loop value'), 'discarded');
-         else marked(Promise.resolve('final loop completion'), 'final');
+         if (index === 0) markedThenable('discarded loop value', 'discarded-loop');
+         else markedThenable('final loop completion', 'final');
        }`,
       { awaitPromise: true, timeout: 1000 },
     )).resolves.toBe('final loop completion');
-    expect(transport.context.observedPromises).toContain('final');
-    expect(transport.context.observedPromises).not.toContain('discarded');
+    expect(transport.context.observedThenables).toEqual(['final']);
     await expect(evalInApp(
-      `marked(Promise.resolve('discarded branch value'), 'discarded-branch');
-       if (false) Promise.resolve('untaken');`,
+      `markedThenable('discarded branch value', 'discarded-branch');
+       if (false) markedThenable('untaken', 'untaken');`,
       { awaitPromise: true, timeout: 1000 },
     )).resolves.toBeUndefined();
     await expect(evalInApp(
       `while (true) {
-         marked(Promise.resolve('discarded break value'), 'discarded-break');
+         markedThenable('discarded break value', 'discarded-break');
          if (true) break;
        }`,
       { awaitPromise: true, timeout: 1000 },
     )).resolves.toBeUndefined();
-    expect(transport.context.observedPromises).not.toContain('discarded-branch');
-    expect(transport.context.observedPromises).not.toContain('discarded-break');
-    await expect(evalInApp('Promise.prototype.then = globalThis.originalThen; void 0;', {
-      awaitPromise: false,
-    })).resolves.toBeUndefined();
+    expect(transport.context.observedThenables).toEqual(['final']);
+    await expect(evalInApp(
+      'let index = 0; while (index < 2) { index += 1; if (index === 1) Promise.resolve("first"); }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBeUndefined();
+    await expect(evalInApp(
+      "let switchIndex = 0; while (switchIndex++ < 2) { switch (switchIndex) { case 1: Promise.resolve('kept'); break; default: continue; } }",
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBeUndefined();
+    await expect(evalInApp(
+      "let mixedIndex = 0; while (mixedIndex++ < 2) { if (mixedIndex === 1) Promise.resolve('first'); if (false) Promise.resolve('never'); continue; }",
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBeUndefined();
+    await expect(evalInApp(
+      "let continueIndex = 0; while (continueIndex++ < 2) { Promise.resolve('kept'); continue; }",
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('kept');
   });
 
   test('uses the intrinsic global when the source shadows globalThis', async () => {
@@ -561,6 +571,21 @@ describe('shared app evaluation policy', () => {
     }
   });
 
+  test('leaves discarded prior values untransformed before empty catch or finally statements', async () => {
+    for (const source of [
+      "Promise.resolve('discarded'); try {} finally {}",
+      "Promise.resolve('discarded'); try {} catch {}",
+      "Promise.resolve('discarded'); try {} catch (error) {} finally {}",
+    ]) {
+      const { cdp, calls } = cdpHarness({ result: { value: undefined } });
+      await evaluateAppScriptCompletion(cdp, source, {
+        observePromiseRejection: true,
+        completionKey: 'empty-completion',
+      });
+      expect(calls[0]?.params?.expression).toBe(source);
+    }
+  });
+
   test('retains labeled break paths through finalizers and nested switches', async () => {
     const sources = [
       'const flag = true; L: { try { throw 1; } finally { if (flag) break L; } } Promise.reject(new Error("outer labeled completion rejection"));',
@@ -617,6 +642,8 @@ describe('shared app evaluation policy', () => {
     await expect(evaluate(
       'let i = 0; while (i < 1) { i += 1; if (true) continue; Promise.resolve("unreachable after continue"); }',
     )).resolves.toBeUndefined();
+    await expect(evaluate('1; L: { 2; if (false) break L; {} }'))
+      .resolves.toBeUndefined();
   });
 
   test('keeps guarded values only when a finally exit is not taken', async () => {
@@ -650,7 +677,7 @@ describe('shared app evaluation policy', () => {
     const sourceCall = calls.find((call) =>
       call.method === 'Runtime.evaluate' &&
       String(call.params.expression).includes('trailing declaration rejection'));
-    expect(String(sourceCall?.params.expression)).toContain('PromiseCtor.prototype.then.call');
+    expect(String(sourceCall?.params.expression)).toContain('promiseThen.call');
   });
 
   test('does not invoke a native Promise subclass then override during observation', async () => {
@@ -673,6 +700,28 @@ describe('shared app evaluation policy', () => {
     // The wrapper uses the intrinsic method; only SETTLE_REMOTE's single
     // assimilation invokes the subclass override.
     expect(transport.context).toHaveProperty('thenOverrideCalls', 1);
+  });
+
+  test('settles a Promise after the source clears the global Promise constructor', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp(
+      `const value = Promise.resolve(11);
+       globalThis.Promise = null;
+       value;`,
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(11);
+  });
+
+  test('settles a Promise after the source patches its Promise prototype', async () => {
+    const { transport } = vmTransport();
+    const evalInApp = createAppEvaluator(transport, lifecycle());
+    await expect(evalInApp(
+      `const value = Promise.resolve(12);
+       Promise.prototype.then = function() { throw new Error('patched then'); };
+       value;`,
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(12);
   });
 
   test('keeps declaration-form scripts in the direct evaluation scope', async () => {
@@ -802,7 +851,7 @@ describe('shared app evaluation policy', () => {
     })).resolves.toBe(6);
     expect(calls.some((call) =>
       call.method === 'Runtime.evaluate' &&
-      String(call.params.expression).includes('PromiseCtor.prototype.then.call'))).toBe(true);
+      String(call.params.expression).includes('promiseThen.call'))).toBe(true);
   });
 
   test('keeps anonymous and async/generator declarations direct', async () => {
