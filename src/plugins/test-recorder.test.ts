@@ -620,11 +620,17 @@ describe('test recorder readiness', () => {
       platform: 'both',
       bundleId: 'com.example.app',
       udid: 'shared-device',
-    })).resolves.toContain('use iosUdid/androidUdid');
+    })).resolves.toContain('use separate iOS and Android app and device options');
+
+    await expect(call('generate_wdio_config', {
+      platform: 'both',
+      iosBundleId: 'com.example.ios',
+    })).resolves.toContain('provide iosAppPath or iosBundleId and androidAppPath or androidPackageName');
 
     const generated = String(await call('generate_wdio_config', {
       platform: 'both',
-      bundleId: 'com.example.app',
+      iosBundleId: 'com.example.ios',
+      androidPackageName: 'com.example.android',
       iosUdid: 'ios-device',
       androidUdid: 'android-device',
       iosDeviceName: 'iPhone QA',
@@ -641,12 +647,33 @@ describe('test recorder readiness', () => {
     expect(iosCaps).toContain('"appium:udid": "ios-device"');
     expect(iosCaps).toContain('"appium:deviceName": "iPhone QA"');
     expect(iosCaps).toContain('"appium:platformVersion": "18.0"');
+    expect(iosCaps).toContain('"appium:bundleId": "com.example.ios"');
     expect(androidCaps).toContain('"appium:udid": "android-device"');
     expect(androidCaps).toContain('"appium:deviceName": "Pixel QA"');
     expect(androidCaps).toContain('"appium:platformVersion": "35"');
+    expect(androidCaps).toContain('"appium:appPackage": "com.example.android"');
     expect(iosCaps).not.toContain('android-device');
     expect(androidCaps).not.toContain('ios-device');
+    expect(iosCaps).not.toContain('com.example.android');
+    expect(androidCaps).not.toContain('com.example.ios');
     expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('keeps both-platform app paths in their matching capabilities', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
+    const generated = String(await call('generate_wdio_config', {
+      platform: 'both',
+      iosAppPath: '/tmp/Example.app',
+      androidAppPath: '/tmp/example.apk',
+    }));
+    const iosStart = generated.indexOf('"platformName": "iOS"');
+    const androidStart = generated.indexOf('"platformName": "Android"');
+    const iosCaps = generated.slice(iosStart, androidStart);
+    const androidCaps = generated.slice(androidStart);
+    expect(iosCaps).toContain('"appium:app": "/tmp/Example.app"');
+    expect(androidCaps).toContain('"appium:app": "/tmp/example.apk"');
+    expect(iosCaps).not.toContain('/tmp/example.apk');
+    expect(androidCaps).not.toContain('/tmp/Example.app');
   });
 
   test('uses the connected app ID when config arguments omit an app target', async () => {

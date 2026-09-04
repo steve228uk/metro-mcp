@@ -3,6 +3,7 @@ import { readdir, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin } from '../plugin.js';
+import { getConnectedDeviceTarget } from '../utils/device-discovery.js';
 import {
   FIBER_WALKER_JS,
   GET_ROUTE_FUNC_JS,
@@ -722,6 +723,10 @@ export const testRecorderPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'both']).default('ios'),
         bundleId: z.string().optional().describe('iOS bundle ID or Android app package'),
         appPath: z.string().optional().describe('Path to .app / .apk (leave empty to use a running simulator)'),
+        iosBundleId: z.string().optional().describe('iOS bundle ID when platform is both'),
+        androidPackageName: z.string().optional().describe('Android app package when platform is both'),
+        iosAppPath: z.string().optional().describe('Path to the iOS .app when platform is both'),
+        androidAppPath: z.string().optional().describe('Path to the Android .apk when platform is both'),
         udid: z.string().optional().describe('Optional device UDID / serial for a single-platform config'),
         deviceName: z.string().optional().describe('Optional Appium device name for a single-platform config'),
         platformVersion: z.string().optional().describe('Optional OS version for a single-platform config'),
@@ -738,6 +743,10 @@ export const testRecorderPlugin = definePlugin({
         platform,
         bundleId,
         appPath,
+        iosBundleId,
+        androidPackageName,
+        iosAppPath,
+        androidAppPath,
         udid,
         deviceName,
         platformVersion,
@@ -750,12 +759,19 @@ export const testRecorderPlugin = definePlugin({
         noReset,
         outputPath,
       }) => {
-        if (platform === 'both' && (udid || deviceName || platformVersion)) {
-          return 'For platform "both", use iosUdid/androidUdid, iosDeviceName/androidDeviceName, and iosPlatformVersion/androidPlatformVersion so each Appium capability targets the correct device.';
+        if (platform === 'both' && (bundleId || appPath || udid || deviceName || platformVersion)) {
+          return 'For platform "both", use separate iOS and Android app and device options so each Appium capability targets the correct app and device.';
         }
-        const connectedAppId = ctx.cdp.getTarget()?.appId;
-        const resolvedBundleId = bundleId ?? connectedAppId;
-        if (!appPath && !resolvedBundleId) {
+        const connectedAppId = platform === 'both'
+          ? undefined
+          : getConnectedDeviceTarget(ctx)?.appId;
+        const resolvedBundleId = platform === 'both' ? undefined : (bundleId ?? connectedAppId);
+        const hasIosAppTarget = Boolean(iosAppPath || iosBundleId);
+        const hasAndroidAppTarget = Boolean(androidAppPath || androidPackageName);
+        if (platform === 'both' && (!hasIosAppTarget || !hasAndroidAppTarget)) {
+          return 'For platform "both", provide iosAppPath or iosBundleId and androidAppPath or androidPackageName.';
+        }
+        if (platform !== 'both' && !appPath && !resolvedBundleId) {
           return 'Cannot generate a runnable Appium config without an app target. Provide bundleId, appPath, or connect to a Metro app with a bundle ID first.';
         }
         const lines: string[] = [];
@@ -764,8 +780,12 @@ export const testRecorderPlugin = definePlugin({
           const cap: string[] = [];
           cap.push(`      {`);
           pushCaps(cap, p, {
-            bundleId: resolvedBundleId,
-            appPath,
+            bundleId: platform === 'both'
+              ? (p === 'ios' ? iosBundleId : androidPackageName)
+              : resolvedBundleId,
+            appPath: platform === 'both'
+              ? (p === 'ios' ? iosAppPath : androidAppPath)
+              : appPath,
             udid: p === 'ios' ? (iosUdid ?? udid) : (androidUdid ?? udid),
             deviceName: p === 'ios' ? (iosDeviceName ?? deviceName) : (androidDeviceName ?? deviceName),
             platformVersion: p === 'ios' ? (iosPlatformVersion ?? platformVersion) : (androidPlatformVersion ?? platformVersion),
