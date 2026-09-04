@@ -101,6 +101,8 @@ async function sendRuntimeEvaluate(
 
 type StatementLike = {
   type: string;
+  start?: number | null;
+  end?: number | null;
   body?: unknown;
   expression?: ExpressionLike;
   [key: string]: unknown;
@@ -108,10 +110,12 @@ type StatementLike = {
 type ExpressionLike = { start: number | null; end: number | null };
 type CompletionPath = {
   expressions: ExpressionLike[];
+  clearRanges: Array<{ start: number; end: number; kind: 'break' | 'continue'; label: string | null }>;
   empty: boolean;
+  undefined: boolean;
   normal: boolean;
 };
-type ExitPath = CompletionPath & { label: string | null };
+type ExitPath = CompletionPath & { label: string | null; inherit: boolean };
 type Completion = CompletionPath & {
   breaks: ExitPath[];
   continues: ExitPath[];
@@ -119,7 +123,9 @@ type Completion = CompletionPath & {
 
 const emptyCompletion = (): Completion => ({
   expressions: [],
+  clearRanges: [],
   empty: true,
+  undefined: false,
   normal: true,
   breaks: [],
   continues: [],
@@ -127,16 +133,71 @@ const emptyCompletion = (): Completion => ({
 
 const abruptCompletion = (): Completion => ({
   expressions: [],
+  clearRanges: [],
   empty: false,
+  undefined: false,
   normal: false,
   breaks: [],
   continues: [],
 });
 
+const undefinedCompletion = (): Completion => ({
+  expressions: [],
+  clearRanges: [],
+  empty: false,
+  undefined: true,
+  normal: true,
+  breaks: [],
+  continues: [],
+});
+
+function normalizeControlCompletion(completion: Completion): Completion {
+  return {
+    ...completion,
+    empty: false,
+    undefined: completion.undefined || completion.empty,
+  };
+}
+
+function asFinallyCompletion(completion: Completion): Completion {
+  // A normal finalizer uses UpdateEmpty. Control statements such as an
+  // untaken if/loop therefore preserve the guarded completion in a finally
+  // clause, even though they produce undefined at script level.
+  return {
+    ...completion,
+    empty: completion.empty || completion.undefined,
+    undefined: false,
+  };
+}
+
+function applyFinallyCompletion(
+  guarded: Completion,
+  _finalizer: Completion,
+): CompletionPath {
+  // A normal finally completion is always discarded by TryStatement. The
+  // guarded completion is returned whether the finalizer's own completion is
+  // empty, undefined, or a value; only an abrupt finalizer replaces it.
+  return guarded;
+}
+
+function markNonInheritingExits(completion: Completion): Completion {
+  return {
+    ...completion,
+    breaks: completion.breaks.map((path) => ({ ...path, inherit: false })),
+    continues: completion.continues.map((path) => ({ ...path, inherit: false })),
+  };
+}
+
+function completionFromExit(path: ExitPath): CompletionPath {
+  return path.inherit ? { ...path, clearRanges: [] } : path;
+}
+
 function mergePaths(left: CompletionPath, right: CompletionPath): CompletionPath {
   return {
     expressions: [...left.expressions, ...right.expressions],
+    clearRanges: [...left.clearRanges, ...right.clearRanges],
     empty: left.empty || right.empty,
+    undefined: left.undefined || right.undefined,
     normal: left.normal || right.normal,
   };
 }
@@ -154,7 +215,7 @@ function consumeBreaks(completion: Completion, label: string | null = null): Com
   let normal: CompletionPath = completion;
   const remaining: ExitPath[] = [];
   for (const path of completion.breaks) {
-    if (path.label === label) normal = mergePaths(normal, path);
+    if (path.label === label) normal = mergePaths(normal, completionFromExit(path));
     else remaining.push(path);
   }
   return { ...normal, breaks: remaining, continues: completion.continues };
@@ -165,11 +226,11 @@ function consumeLoopExits(completion: Completion): Completion {
   const breaks: ExitPath[] = [];
   const continues: ExitPath[] = [];
   for (const path of completion.breaks) {
-    if (path.label === null) normal = mergePaths(normal, path);
+    if (path.label === null) normal = mergePaths(normal, completionFromExit(path));
     else breaks.push(path);
   }
   for (const path of completion.continues) {
-    if (path.label === null) normal = mergePaths(normal, path);
+    if (path.label === null) normal = mergePaths(normal, completionFromExit(path));
     else continues.push(path);
   }
   return { ...normal, breaks, continues };
@@ -180,7 +241,7 @@ function consumeLabelExits(completion: Completion, label: string): Completion {
   let normal: CompletionPath = afterBreaks;
   const continues: ExitPath[] = [];
   for (const path of afterBreaks.continues) {
-    if (path.label === label) normal = mergePaths(normal, path);
+    if (path.label === label) normal = mergePaths(normal, completionFromExit(path));
     else continues.push(path);
   }
   return { ...normal, breaks: afterBreaks.breaks, continues };
@@ -197,7 +258,9 @@ function completionForStatement(statement: StatementLike): Completion {
     case 'ExpressionStatement':
       return statement.expression ? {
         expressions: [statement.expression],
+        clearRanges: [],
         empty: false,
+        undefined: false,
         normal: true,
         breaks: [],
         continues: [],
@@ -210,8 +273,10 @@ function completionForStatement(statement: StatementLike): Completion {
       const consequent = completionForStatement(statement.consequent as StatementLike);
       const alternate = statement.alternate
         ? completionForStatement(statement.alternate as StatementLike)
-        : emptyCompletion();
-      return mergeCompletions(consequent, alternate);
+        : undefinedCompletion();
+      return normalizeControlCompletion(markNonInheritingExits(
+        mergeCompletions(consequent, alternate),
+      ));
     }
     case 'TryStatement': {
       const body = completionForStatement(statement.block as StatementLike);
@@ -219,16 +284,25 @@ function completionForStatement(statement: StatementLike): Completion {
         ? completionForStatement((statement.handler as { body: StatementLike }).body)
         : abruptCompletion();
       const guarded = mergeCompletions(body, handler);
-      if (!statement.finalizer) return guarded;
-      const finalizer = completionForStatement(statement.finalizer as StatementLike);
+      if (!statement.finalizer) return normalizeControlCompletion(guarded);
+      const finalizer = asFinallyCompletion(
+        completionForStatement(statement.finalizer as StatementLike),
+      );
       if (!finalizer.normal) return finalizer;
       // A normal `finally` completion is UpdateEmpty: its expression value is
       // discarded, while the prior try/catch completion is retained. This is
       // why `try { 1 } finally { 2 }` evaluates to 1 in a script.
+      const applied = applyFinallyCompletion(guarded, finalizer);
       return {
-        ...guarded,
-        breaks: [...guarded.breaks, ...finalizer.breaks],
-        continues: [...guarded.continues, ...finalizer.continues],
+        ...applied,
+        breaks: [
+          ...guarded.breaks,
+          ...finalizer.breaks.map((path) => ({ ...path, inherit: false })),
+        ],
+        continues: [
+          ...guarded.continues,
+          ...finalizer.continues.map((path) => ({ ...path, inherit: false })),
+        ],
       };
     }
     case 'LabeledStatement':
@@ -237,42 +311,61 @@ function completionForStatement(statement: StatementLike): Completion {
         (statement.label as { name: string } | null | undefined)?.name ?? '',
       );
     case 'WithStatement':
-      return completionForStatement(statement.body as StatementLike);
+      return normalizeControlCompletion(markNonInheritingExits(
+        completionForStatement(statement.body as StatementLike),
+      ));
     case 'SwitchStatement': {
       const cases = (statement.cases as Array<{ consequent: StatementLike[] }> | undefined) ?? [];
-      let completion = emptyCompletion();
+      let completion = undefinedCompletion();
       for (let index = 0; index < cases.length; index += 1) {
         const caseCompletion = completionForStatements(
           cases.slice(index).flatMap((entry) => entry.consequent),
         );
         completion = mergeCompletions(
           completion,
-          consumeBreaks(caseCompletion),
+          normalizeControlCompletion(consumeBreaks(caseCompletion)),
         );
       }
-      return completion;
+      return normalizeControlCompletion(completion);
     }
     case 'ForStatement':
     case 'ForInStatement':
     case 'ForOfStatement':
     case 'WhileStatement':
     case 'DoWhileStatement':
-      return mergeCompletions(
-        consumeLoopExits(completionForStatement(statement.body as StatementLike)),
-        emptyCompletion(),
+      const body = normalizeControlCompletion(
+        completionForStatement(statement.body as StatementLike),
       );
+      const loop = consumeLoopExits(body);
+      return statement.type === 'DoWhileStatement'
+        ? normalizeControlCompletion(loop)
+        : normalizeControlCompletion(mergeCompletions(loop, undefinedCompletion()));
     case 'ThrowStatement':
     case 'ReturnStatement':
       return abruptCompletion();
     case 'BreakStatement':
       return {
         ...abruptCompletion(),
-        breaks: [{ ...emptyCompletion(), label: (statement.label as { name: string } | null | undefined)?.name ?? null }],
+        breaks: [{ ...emptyCompletion(), label: (statement.label as { name: string } | null | undefined)?.name ?? null,
+          inherit: true,
+          clearRanges: [{
+            start: statement.start as number,
+            end: statement.end as number,
+            kind: 'break',
+            label: (statement.label as { name: string } | null | undefined)?.name ?? null,
+          }] }],
       };
     case 'ContinueStatement':
       return {
         ...abruptCompletion(),
-        continues: [{ ...emptyCompletion(), label: (statement.label as { name: string } | null | undefined)?.name ?? null }],
+        continues: [{ ...emptyCompletion(), label: (statement.label as { name: string } | null | undefined)?.name ?? null,
+          inherit: true,
+          clearRanges: [{
+            start: statement.start as number,
+            end: statement.end as number,
+            kind: 'continue',
+            label: (statement.label as { name: string } | null | undefined)?.name ?? null,
+          }] }],
       };
     default:
       return abruptCompletion();
@@ -285,11 +378,15 @@ function completionForStatements(statements: StatementLike[]): Completion {
     const next = completionForStatement(statement);
     const breaks: ExitPath[] = [
       ...completion.breaks,
-      ...next.breaks.map((path) => path.empty ? { ...completion, label: path.label } : path),
+      ...next.breaks.map((path) => path.empty && path.inherit
+        ? { ...completion, label: path.label, inherit: path.inherit, clearRanges: [...completion.clearRanges] }
+        : path),
     ];
     const continues: ExitPath[] = [
       ...completion.continues,
-      ...next.continues.map((path) => path.empty ? { ...completion, label: path.label } : path),
+      ...next.continues.map((path) => path.empty && path.inherit
+        ? { ...completion, label: path.label, inherit: path.inherit, clearRanges: [...completion.clearRanges] }
+        : path),
     ];
     if (!next.normal) {
       return { ...next, breaks, continues };
@@ -326,6 +423,10 @@ function promiseObservationExpression(expression: string, completionKey?: string
   if (!completionKey) return expression;
   const key = completionKey;
   const keyLiteral = JSON.stringify(key);
+  const clearCompletion = `(function(root) {
+    var state = root[${keyLiteral}];
+    if (state) state.completionValue = void 0;
+  })(this)`;
   const capture = (candidate: string): string => `(function(root, value) {
     var state = root[${keyLiteral}];
     if (state) state.completionValue = value;
@@ -333,11 +434,31 @@ function promiseObservationExpression(expression: string, completionKey?: string
   })(this, (\n    ${candidate}
   ))`;
   let transformed = expression;
-  for (const { start, end } of candidates
-    .map(({ start, end }) => ({ start: start as number, end: end as number }))
-    .sort((left, right) => right.start - left.start)) {
-    const candidate = expression.slice(start, end);
-    transformed = transformed.slice(0, start) + capture(candidate) + transformed.slice(end);
+  const clearRanges = completion.clearRanges.filter((range, index, all) =>
+    all.findIndex((other) =>
+      other.start === range.start &&
+      other.end === range.end &&
+      other.kind === range.kind &&
+      other.label === range.label,
+    ) === index,
+  );
+  const replacements = [
+    ...candidates.map(({ start, end }) => ({
+      start: start as number,
+      end: end as number,
+      replacement: capture(expression.slice(start as number, end as number)),
+    })),
+    ...clearRanges.map(({ start, end, kind, label }) => ({
+      start,
+      end,
+      // A plain block keeps an unlabeled break/continue targeted at its
+      // original enclosing switch or loop. An artificial loop here would
+      // capture that exit and change the caller's control flow.
+      replacement: `{ ${clearCompletion}; ${kind}${label ? ` ${label}` : ''}; }`,
+    })),
+  ].sort((left, right) => right.start - left.start);
+  for (const { start, end, replacement } of replacements) {
+    transformed = transformed.slice(0, start) + replacement + transformed.slice(end);
   }
   const directives = (ast.program.directives as Array<{
     end?: number | null;
@@ -346,12 +467,9 @@ function promiseObservationExpression(expression: string, completionKey?: string
   const directiveEnd = directives.length > 0
     ? directives[directives.length - 1]!.end as number
     : 0;
-  const initialValue = directives.length > 0
-    ? JSON.stringify(directives[directives.length - 1]!.value?.value)
-    : 'void 0';
   const setup = `;\n(function(root) {
     var state = root[${keyLiteral}];
-    if (state) state.completionValue = ${initialValue};
+    if (state) state.completionValue = void 0;
   })(this);\n`;
   transformed = transformed.slice(0, directiveEnd) + setup + transformed.slice(directiveEnd);
   const observe = `(function(root) {
@@ -523,7 +641,10 @@ export function createAppEvaluator(
     let sourceGeneration = options?.generation;
     const evaluateOnce = async (): Promise<AppEvaluationCompletion> => {
       const recovered = await ensureConnectedForDispatch(options);
-      if (recovered && options?.retryMailboxSetup) {
+      const generationChanged = sourceGeneration !== undefined &&
+        lifecycle.getGeneration &&
+        sourceGeneration !== lifecycle.getGeneration();
+      if ((recovered || generationChanged) && options?.retryMailboxSetup) {
         if (options.deadline === undefined) {
           throw new Error('App evaluation retry requires a deadline');
         }
@@ -532,11 +653,8 @@ export function createAppEvaluator(
           deadline: options.deadline,
         });
       }
-      if (
-        sourceGeneration !== undefined &&
-        lifecycle.getGeneration &&
-        sourceGeneration !== lifecycle.getGeneration()
-      ) {
+      if (sourceGeneration !== undefined && lifecycle.getGeneration &&
+          sourceGeneration !== lifecycle.getGeneration()) {
         throw new Error('App evaluation context changed before source dispatch');
       }
       const timeout = boundedRequestTimeout(options);
