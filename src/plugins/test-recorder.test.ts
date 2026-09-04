@@ -467,6 +467,54 @@ describe('test recorder readiness', () => {
     expect(await call('stop_test_recording')).toContain('1 swipe');
   });
 
+  test('repairs conflicting forwarded scroll states before readiness', async () => {
+    const app = appWithNaturalScroll();
+    let injected = false;
+    const call = await createHarness(app, [testRecorderPlugin], (expression) => {
+      if (injected || !expression.includes('handlerCount')) return;
+      injected = true;
+      vm.runInContext(`
+        var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+        var originalScrollCalls = 0;
+        var firstProps = {
+          scrollEnabled: true,
+          testID: 'conflicting-scroll',
+          onScrollBeginDrag: function() { originalScrollCalls++; },
+          onScrollEndDrag: function() { originalScrollCalls++; }
+        };
+        Object.freeze(firstProps);
+        var secondProps = {
+          scrollEnabled: true,
+          testID: 'conflicting-scroll',
+          onScrollBeginDrag: function() { originalScrollCalls++; },
+          onScrollEndDrag: function() { originalScrollCalls++; }
+        };
+        Object.freeze(secondProps);
+        var conflictingProps = {
+          scrollEnabled: true,
+          testID: 'conflicting-scroll',
+          onScrollBeginDrag: firstProps.onScrollBeginDrag,
+          onScrollEndDrag: secondProps.onScrollEndDrag
+        };
+        Object.freeze(conflictingProps);
+        Object.defineProperty(scrollRoot, 'memoizedProps', {
+          configurable: true,
+          get: function() { return conflictingProps; },
+          set: function() {}
+        });
+      `, app);
+    });
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var repairedProps = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current.memoizedProps;
+      repairedProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      repairedProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 swipe');
+    expect(vm.runInContext('__METRO_MCP_REC_EVENTS__', app)).toHaveLength(1);
+    expect(vm.runInContext('originalScrollCalls', app)).toBe(2);
+  });
+
   for (const forwardedHandler of ['onScrollEndDrag', 'onMomentumScrollEnd'] as const) {
     test(`shares scroll state when a forwarded ${forwardedHandler} gets a new begin callback`, async () => {
       const app = appWithNaturalScroll();
