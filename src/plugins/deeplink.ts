@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import {
   adbPrefix,
+  getConnectedDeviceTarget,
   resolveDevice,
 } from '../utils/device-discovery.js';
 
@@ -12,7 +13,7 @@ export const deeplinkPlugin = definePlugin({
 
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
-      resolveDevice(ctx, platform, ctx.cdp.getTarget());
+      resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
 
     ctx.registerTool('open_deeplink', {
       description: 'Open a URL or deep link on the connected iOS simulator or Android device.',

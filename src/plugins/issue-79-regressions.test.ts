@@ -15,6 +15,7 @@ function createContext(options: {
   evaluate?: unknown;
   ios?: string[];
   android?: string[];
+  connected?: boolean;
   target?: { deviceName: string; logicalDeviceId: string };
 }) {
   const tools = new Map<string, RegisteredTool>();
@@ -35,7 +36,7 @@ function createContext(options: {
 
   const ctx: PluginContext = {
     cdp: {
-      on: () => {}, off: () => {}, isConnected: true,
+      on: () => {}, off: () => {}, isConnected: options.connected ?? true,
       getTarget: () => target,
       send: async () => ({}),
     },
@@ -78,6 +79,26 @@ function createContext(options: {
 }
 
 describe('issue 79 device discovery regressions', () => {
+  test('filesystem resolves a replacement device when its disconnected target is stale', async () => {
+    const harness = createContext({
+      inventory: 'android',
+      connected: false,
+      target: { deviceName: 'Old emulator', logicalDeviceId: 'old-serial' },
+    });
+    await filesystemPlugin.setup(harness.ctx);
+    const tool = harness.tools.get('read_file')!;
+
+    await tool.handler(tool.parameters.parse({
+      path: '/data/data/com.example.app/files/state.json',
+      bundleId: 'com.example.app',
+      platform: 'auto',
+    }) as Record<string, unknown>);
+
+    expect(harness.execCalls).toEqual([
+      'adb -s "emulator-42" shell run-as com.example.app dd if="/data/data/com.example.app/files/state.json" bs=51200 count=1 2>/dev/null',
+    ]);
+  });
+
   test('keeps the explicit Android filesystem fallback available without ADB', async () => {
     const harness = createContext({
       inventory: 'missing',

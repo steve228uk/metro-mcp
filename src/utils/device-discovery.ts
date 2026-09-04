@@ -54,6 +54,17 @@ export interface ConnectedDeviceTarget {
   reactNative?: { logicalDeviceId?: string };
 }
 
+/**
+ * Return target metadata only while its CDP connection is current.
+ * metro-bridge retains the last target after disconnecting, so using that
+ * metadata during native discovery can reject or select a replacement device.
+ */
+export function getConnectedDeviceTarget(
+  ctx: { cdp: { isConnected: boolean; getTarget(): ConnectedDeviceTarget | null } },
+): ConnectedDeviceTarget | undefined {
+  return ctx.cdp.isConnected ? ctx.cdp.getTarget() ?? undefined : undefined;
+}
+
 function outputText(output: Buffer | string): string {
   return typeof output === 'string' ? output : output.toString('utf8');
 }
@@ -432,6 +443,6 @@ function findIosNames(
 export async function detectPlatform(
   ctx: PluginContext,
 ): Promise<'ios' | 'android' | null> {
-  const device = await resolveDevice(ctx, 'auto', ctx.cdp.getTarget());
+  const device = await resolveDevice(ctx, 'auto', getConnectedDeviceTarget(ctx));
   return device?.platform ?? null;
 }
