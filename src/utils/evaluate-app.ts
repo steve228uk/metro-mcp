@@ -139,9 +139,20 @@ const SETTLE_REMOTE_FUNCTION = `function(key) {
     state.value = state.unserializableValue === undefined ? value : undefined;
     state.status = 'fulfilled';
   }
+  function rejectionMessage(error) {
+    var message;
+    try {
+      if (error !== null && error !== undefined) message = error.message;
+    } catch (_) {}
+    if (message !== undefined && message !== null) {
+      try { return String(message); } catch (_) {}
+    }
+    try { return String(error); } catch (_) {}
+    return 'Promise rejected with an unstringifiable reason';
+  }
   function reject(error) {
     if (globalThis[key] !== state) return;
-    state.error = String(error && error.message || error);
+    state.error = rejectionMessage(error);
     state.status = 'rejected';
   }
   try {
@@ -250,7 +261,7 @@ export function createAppEvaluator(
       // transport and continue mailbox polling; a pre-dispatch loss remains
       // pending and is allowed to time out.
       await awaitPromiseBeforeDeadline(
-        recoverTransport(options.deadline),
+        recoverTransport(options.deadline, options.timeout),
         options.deadline,
         options.timeout ?? 10_000,
       );
@@ -272,11 +283,16 @@ export function createAppEvaluator(
     );
   };
 
-  async function recoverTransport(deadline?: number): Promise<void> {
+  async function recoverTransport(deadline?: number, timeout = 10_000): Promise<void> {
+    if (deadline !== undefined && Date.now() >= deadline) {
+      throw timeoutError(timeout);
+    }
     if (lifecycle.isReconnecting()) {
       await lifecycle.waitForReconnect(deadline);
     } else {
-      await lifecycle.reconnect();
+      const reconnect = lifecycle.reconnect();
+      if (deadline === undefined) await reconnect;
+      else await awaitPromiseBeforeDeadline(reconnect, deadline, timeout);
     }
   }
 
@@ -288,7 +304,10 @@ export function createAppEvaluator(
       return await rawEvaluate(expression, options);
     } catch (error) {
       if (!isTransportError(error)) throw error;
-      await recoverTransport(options?.deadline);
+      await recoverTransport(options?.deadline, options?.timeout);
+      if (options?.deadline !== undefined && Date.now() >= options.deadline) {
+        throw timeoutError(options.timeout ?? 10_000);
+      }
       // This expression is a mailbox read. The original caller source is
       // never passed here after Runtime.evaluate has been dispatched.
       return rawEvaluate(expression, options);
