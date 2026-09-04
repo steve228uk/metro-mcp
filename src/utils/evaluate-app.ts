@@ -54,6 +54,11 @@ function isDefinitivePreDispatchFailure(error: unknown): boolean {
   );
 }
 
+function isServerDisconnectedError(error: unknown): boolean {
+  return error instanceof Error &&
+    error.message === 'Not connected to Metro. Use list_devices to check connection status.';
+}
+
 function timeoutError(timeout: number): Error {
   return new Error(`App evaluation timed out after ${timeout}ms`);
 }
@@ -435,11 +440,23 @@ export function createAppEvaluator(
   cdp: Pick<CDPConnection, 'send'>,
   lifecycle: AppEvaluationLifecycle,
 ): (expression: string, options?: EvalOptions) => Promise<unknown> {
+  const ensureConnectedForDispatch = async (options?: EvalOptions): Promise<boolean> => {
+    try {
+      await lifecycle.ensureConnected(options?.deadline);
+      return false;
+    } catch (error) {
+      if (!isServerDisconnectedError(error)) throw error;
+      await recoverTransport(options?.deadline, options?.timeout);
+      await lifecycle.ensureConnected(options?.deadline);
+      return true;
+    }
+  };
+
   const rawEvaluateOnce = async (
     expression: string,
     options?: EvalOptions,
   ): Promise<unknown> => {
-    await lifecycle.ensureConnected(options?.deadline);
+    await ensureConnectedForDispatch(options);
     const timeout = boundedRequestTimeout(options);
     return evaluateAppScript(cdp, expression, { ...options, timeout });
   };
@@ -473,7 +490,16 @@ export function createAppEvaluator(
   ): Promise<AppEvaluationCompletion> => {
     let sourceGeneration = options?.generation;
     const evaluateOnce = async (): Promise<AppEvaluationCompletion> => {
-      await lifecycle.ensureConnected(options?.deadline);
+      const recovered = await ensureConnectedForDispatch(options);
+      if (recovered && options?.retryMailboxSetup) {
+        if (options.deadline === undefined) {
+          throw new Error('App evaluation retry requires a deadline');
+        }
+        sourceGeneration = await options.retryMailboxSetup({
+          timeout: options.timeout,
+          deadline: options.deadline,
+        });
+      }
       if (
         sourceGeneration !== undefined &&
         lifecycle.getGeneration &&
