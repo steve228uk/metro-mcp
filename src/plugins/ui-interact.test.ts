@@ -16,6 +16,9 @@ type AppEvaluation =
   | {
       renderer: 'paper' | 'fabric';
       value: string;
+      submitBehavior?: 'newline' | 'submit' | 'blurAndSubmit';
+      blurOnSubmit?: boolean;
+      multiline?: boolean;
     }
   | {
       renderer: 'paper' | 'fabric';
@@ -31,6 +34,7 @@ async function createAppOnlyHarness(
   const evaluations: string[] = [];
   const execCommands: string[] = [];
   const reactCalls: Array<{ type: 'submit' | 'change'; value: unknown }> = [];
+  let blurCalls = 0;
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
@@ -81,7 +85,7 @@ async function createAppOnlyHarness(
       }
       if (evaluation === 'unhandled') return false;
       if (typeof evaluation === 'object') {
-        const publicInstance = { isFocused: () => true };
+        const publicInstance = { isFocused: () => true, blur: () => { blurCalls++; } };
         const fabric = evaluation.renderer === 'fabric';
         const controlled = 'value' in evaluation;
         const value = controlled ? evaluation.value : evaluation.defaultValue;
@@ -94,6 +98,12 @@ async function createAppOnlyHarness(
           type: { displayName: 'TextInput' },
           memoizedProps: {
             ...(controlled ? { value } : { defaultValue: value }),
+            ...('submitBehavior' in evaluation && evaluation.submitBehavior !== undefined
+              ? { submitBehavior: evaluation.submitBehavior } : {}),
+            ...('blurOnSubmit' in evaluation && evaluation.blurOnSubmit !== undefined
+              ? { blurOnSubmit: evaluation.blurOnSubmit } : {}),
+            ...('multiline' in evaluation && evaluation.multiline !== undefined
+              ? { multiline: evaluation.multiline } : {}),
             onSubmitEditing: (event: unknown) => reactCalls.push({ type: 'submit', value: event }),
             onChangeText: (text: unknown) => reactCalls.push({ type: 'change', value: text }),
           },
@@ -118,7 +128,8 @@ async function createAppOnlyHarness(
     notifyResourceUpdated: () => {},
   };
   await uiInteractPlugin.setup(ctx);
-  return { tools, getNativeCalls: () => nativeCalls, evaluations, execCommands, reactCalls };
+  return { tools, getNativeCalls: () => nativeCalls, evaluations, execCommands, reactCalls,
+    getBlurCalls: () => blurCalls };
 }
 
 async function pressTextInputKeys(
@@ -206,6 +217,49 @@ describe('UI handler actions without native inventory', () => {
       ]);
       expect(harness.getNativeCalls()).toBe(0);
     }
+  });
+
+  test('matches Android blurAndSubmit semantics for controlled Paper and Fabric inputs', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await createAppOnlyHarness({ renderer, value: 'hello', submitBehavior: 'blurAndSubmit' });
+      const press = harness.tools.get('press_button')!;
+      expect(await press.handler(press.parameters.parse({ button: 'ENTER', platform: 'android' }) as Record<string, unknown>));
+      expect(harness.reactCalls).toEqual([
+        { type: 'submit', value: { nativeEvent: { text: 'hello' } } },
+      ]);
+      expect(harness.getBlurCalls()).toBe(1);
+      expect(harness.getNativeCalls()).toBe(0);
+    }
+  });
+
+  test('keeps Android newline and legacy blurOnSubmit=false inputs on native handling', async () => {
+    for (const evaluation of [
+      { renderer: 'paper' as const, value: 'hello', submitBehavior: 'newline' as const },
+      { renderer: 'fabric' as const, value: 'hello', blurOnSubmit: false },
+      { renderer: 'paper' as const, value: 'hello', multiline: true },
+    ]) {
+      const harness = await createAppOnlyHarness(evaluation, true);
+      const press = harness.tools.get('press_button')!;
+      expect(await press.handler(press.parameters.parse({ button: 'ENTER', platform: 'android' }) as Record<string, unknown>))
+        .toBe('Pressed ENTER');
+      expect(harness.reactCalls).toEqual([]);
+      expect(harness.getBlurCalls()).toBe(0);
+      expect(harness.execCommands).toEqual([
+        'adb -s "emulator-42" shell input keyevent 66',
+      ]);
+    }
+  });
+
+  test('blurs after submitting with legacy blurOnSubmit=true', async () => {
+    const harness = await createAppOnlyHarness({ renderer: 'paper', value: 'hello', blurOnSubmit: true });
+    const press = harness.tools.get('press_button')!;
+    expect(await press.handler(press.parameters.parse({ button: 'ENTER', platform: 'android' }) as Record<string, unknown>))
+      .toBe('Pressed ENTER');
+    expect(harness.reactCalls).toEqual([
+      { type: 'submit', value: { nativeEvent: { text: 'hello' } } },
+    ]);
+    expect(harness.getBlurCalls()).toBe(1);
+    expect(harness.getNativeCalls()).toBe(0);
   });
 
   test('leaves uncontrolled Paper and Fabric inputs for native handling', async () => {
