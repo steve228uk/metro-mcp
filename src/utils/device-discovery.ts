@@ -50,6 +50,7 @@ export interface DeviceDiscoveryRunner {
 }
 
 export interface ConnectedDeviceTarget {
+  appId?: string;
   deviceName?: string;
   reactNative?: { logicalDeviceId?: string };
 }
