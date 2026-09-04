@@ -169,6 +169,22 @@ function mergePaths(left: CompletionPath, right: CompletionPath): CompletionPath
   };
 }
 
+function inheritEmptyExit(prior: CompletionPath, path: ExitPath): ExitPath {
+  if (!path.empty || !path.inherit) return path;
+  return {
+    expressions: [...prior.expressions, ...path.expressions],
+    clearRanges: [...prior.clearRanges],
+    empty: prior.empty && path.empty,
+    normal: path.normal,
+    label: path.label,
+    inherit: path.inherit,
+  };
+}
+
+function inheritEmptyExits(prior: CompletionPath, paths: ExitPath[]): ExitPath[] {
+  return paths.map((path) => inheritEmptyExit(prior, path));
+}
+
 function mergeCompletions(left: Completion, right: Completion): Completion {
   const merged = mergePaths(left, right);
   return {
@@ -250,15 +266,23 @@ function completionForStatement(statement: StatementLike): Completion {
       const guarded = mergeCompletions(body, handler);
       if (!statement.finalizer) return guarded;
       const finalizer = completionForStatement(statement.finalizer as StatementLike);
-      if (!finalizer.normal) return finalizer;
+      const finalizerBreaks = inheritEmptyExits(guarded, finalizer.breaks);
+      const finalizerContinues = inheritEmptyExits(guarded, finalizer.continues);
+      if (!finalizer.normal) {
+        return {
+          ...finalizer,
+          breaks: finalizerBreaks,
+          continues: finalizerContinues,
+        };
+      }
       // A normal `finally` completion is UpdateEmpty: its expression value is
       // discarded, while the prior try/catch completion is retained. This is
       // why `try { 1 } finally { 2 }` evaluates to 1 in a script.
       const applied = applyFinallyCompletion(guarded, finalizer);
       return {
         ...applied,
-        breaks: [...guarded.breaks, ...finalizer.breaks],
-        continues: [...guarded.continues, ...finalizer.continues],
+        breaks: [...guarded.breaks, ...finalizerBreaks],
+        continues: [...guarded.continues, ...finalizerContinues],
       };
     }
     case 'LabeledStatement':
@@ -329,15 +353,11 @@ function completionForStatements(statements: StatementLike[]): Completion {
     const next = completionForStatement(statement);
     const breaks: ExitPath[] = [
       ...completion.breaks,
-      ...next.breaks.map((path) => path.empty && path.inherit
-        ? { ...completion, label: path.label, inherit: path.inherit, clearRanges: [...completion.clearRanges] }
-        : path),
+      ...inheritEmptyExits(completion, next.breaks),
     ];
     const continues: ExitPath[] = [
       ...completion.continues,
-      ...next.continues.map((path) => path.empty && path.inherit
-        ? { ...completion, label: path.label, inherit: path.inherit, clearRanges: [...completion.clearRanges] }
-        : path),
+      ...inheritEmptyExits(completion, next.continues),
     ];
     if (!next.normal) {
       return { ...next, breaks, continues };
