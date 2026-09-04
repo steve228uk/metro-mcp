@@ -312,7 +312,10 @@ export async function awaitAppResult(
     // Also expires inside the app if the MCP process or CDP connection is lost.
     const remaining = deadline - Date.now();
     if (remaining > 0) {
-      await evaluateBeforeDeadline(cleanupEvaluate, `(function() {
+      // Cleanup is best effort and must not delay delivery of a value that has
+      // already settled. The mailbox also has an in-app expiry for a lost
+      // host, so leave this bounded operation detached from the caller.
+      void evaluateBeforeDeadline(cleanupEvaluate, `(function() {
         var state = globalThis[${key}];
         if (state) clearTimeout(state.timer);
         delete globalThis[${key}];
