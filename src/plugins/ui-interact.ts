@@ -580,8 +580,17 @@ export const uiInteractPlugin = definePlugin({
                 if (submitBehavior === 'blurAndSubmit' && targetInstance &&
                   typeof targetInstance.blur === 'function') targetInstance.blur();
               } else {
-                var val = targetProps.value.slice(0, -1);
-                targetProps.onChangeText(val);
+                var val = targetProps.value;
+                var end = val.length;
+                var last = end > 0 ? val.charCodeAt(end - 1) : 0;
+                var previous = end > 1 ? val.charCodeAt(end - 2) : 0;
+                // Remove one complete Unicode code point. Hermes supports
+                // these primitive string operations, while String spread and
+                // Array.from are not available in every React Native runtime.
+                if (last >= 0xdc00 && last <= 0xdfff &&
+                  previous >= 0xd800 && previous <= 0xdbff) end -= 2;
+                else if (end > 0) end -= 1;
+                targetProps.onChangeText(val.slice(0, end));
               }
               return true;
             })()

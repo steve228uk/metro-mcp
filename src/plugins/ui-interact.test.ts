@@ -254,6 +254,16 @@ describe('UI handler actions without native inventory', () => {
     }
   });
 
+  test('deletes a complete non-BMP code point from controlled inputs', async () => {
+    const harness = await createAppOnlyHarness({ renderer: 'paper', value: 'A😀' });
+    const press = harness.tools.get('press_button')!;
+    expect(await press.handler(press.parameters.parse({ button: 'DELETE' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(harness.reactCalls).toEqual([
+      { type: 'change', value: 'A' },
+    ]);
+  });
+
   test('matches Android blurAndSubmit semantics for controlled Paper and Fabric inputs', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
       const harness = await createAppOnlyHarness({ renderer, value: 'hello', submitBehavior: 'blurAndSubmit' });
