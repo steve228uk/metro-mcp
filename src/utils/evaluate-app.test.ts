@@ -463,6 +463,20 @@ describe('shared app evaluation policy', () => {
     )).resolves.toBe('final loop completion');
     expect(transport.context.observedPromises).toContain('final');
     expect(transport.context.observedPromises).not.toContain('discarded');
+    await expect(evalInApp(
+      `marked(Promise.resolve('discarded branch value'), 'discarded-branch');
+       if (false) Promise.resolve('untaken');`,
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBeUndefined();
+    await expect(evalInApp(
+      `while (true) {
+         marked(Promise.resolve('discarded break value'), 'discarded-break');
+         if (true) break;
+       }`,
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBeUndefined();
+    expect(transport.context.observedPromises).not.toContain('discarded-branch');
+    expect(transport.context.observedPromises).not.toContain('discarded-break');
     await expect(evalInApp('Promise.prototype.then = globalThis.originalThen; void 0;', {
       awaitPromise: false,
     })).resolves.toBeUndefined();
@@ -498,7 +512,11 @@ describe('shared app evaluation policy', () => {
     await expect(evalInApp('"use strict"; if (false) Promise.resolve(9)', {
       awaitPromise: true,
       timeout: 1000,
-    })).resolves.toBe('use strict');
+    })).resolves.toBeUndefined();
+    await expect(evalInApp('"use strict"; while (false) Promise.resolve(9)', {
+      awaitPromise: true,
+      timeout: 1000,
+    })).resolves.toBeUndefined();
     await expect(evalInApp('Promise.resolve(9) // trailing line comment', {
       awaitPromise: true,
       timeout: 1000,
@@ -513,9 +531,6 @@ describe('shared app evaluation policy', () => {
       'try { Promise.reject(new Error("try completion rejection")); } finally {}',
       'try { Promise.reject(new Error("try/finally completion rejection")); } finally { Promise.resolve(1); }',
       'switch (1) { case 1: Promise.resolve(1); case 2: Promise.reject(new Error("switch completion rejection")); break; }',
-      'switch (1) { case 1: Promise.reject(new Error("conditional break completion rejection")); if (true) break; Promise.resolve(2); }',
-      'for (let index = 0; index < 1; index += 1) { Promise.reject(new Error("conditional continue completion rejection")); if (true) continue; Promise.resolve(2); }',
-      'const flag = true; L: for (let index = 0; index < 1; index += 1) { Promise.reject(new Error("labeled continue completion rejection")); if (flag) continue L; Promise.resolve(2); }',
     ];
     let unhandledRejections = 0;
     const onUnhandledRejection = () => { unhandledRejections += 1; };
@@ -549,7 +564,6 @@ describe('shared app evaluation policy', () => {
   test('retains labeled break paths through finalizers and nested switches', async () => {
     const sources = [
       'const flag = true; L: { try { throw 1; } finally { if (flag) break L; } } Promise.reject(new Error("outer labeled completion rejection"));',
-      'const flag = true; L: { switch (1) { case 1: Promise.reject(new Error("nested switch labeled break rejection")); if (flag) break L; Promise.resolve(2); } }',
     ];
     let unhandledRejections = 0;
     const onUnhandledRejection = () => { unhandledRejections += 1; };
@@ -569,24 +583,60 @@ describe('shared app evaluation policy', () => {
         timeout: 1000,
       })).rejects.toThrow('outer labeled completion rejection');
 
-      const second = vmTransport();
-      const secondSend = second.transport.send;
-      second.transport.send = async (method, params, options) => {
-        const result = await secondSend(method, params, options);
-        if (method === 'Runtime.evaluate' && String(params?.expression).includes('nested switch labeled break rejection')) {
-          await new Promise((resolve) => setTimeout(resolve, 30));
-        }
-        return result;
-      };
-      await expect(createAppEvaluator(second.transport, lifecycle())(sources[1]!, {
-        awaitPromise: true,
-        timeout: 1000,
-      })).rejects.toThrow('nested switch labeled break rejection');
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(unhandledRejections).toBe(0);
     } finally {
       process.off('unhandledRejection', onUnhandledRejection);
     }
+  });
+
+  test('matches native empty completions across untaken branches and exits', async () => {
+    const evaluate = (source: string) => createAppEvaluator(vmTransport().transport, lifecycle())(
+      source,
+      { awaitPromise: true, timeout: 1000 },
+    );
+
+    await expect(evaluate('Promise.resolve("discarded"); if (false) 2')).resolves.toBeUndefined();
+    await expect(evaluate('while (false) Promise.resolve("discarded")')).resolves.toBeUndefined();
+    await expect(evaluate('for (let i = 0; i < 0; i += 1) Promise.resolve("discarded")'))
+      .resolves.toBeUndefined();
+    await expect(evaluate('while (true) { Promise.resolve("direct"); break; }'))
+      .resolves.toBe('direct');
+    await expect(evaluate('while (true) { Promise.resolve("conditional"); if (true) break; }'))
+      .resolves.toBeUndefined();
+    await expect(evaluate(
+      'let i = 0; while (i < 2) { i += 1; if (i === 1) { Promise.resolve("discarded"); continue; } Promise.resolve("final"); }',
+    )).resolves.toBe('final');
+    await expect(evaluate('switch (1) { case 1: Promise.resolve("direct"); break; }'))
+      .resolves.toBe('direct');
+    await expect(evaluate('switch (1) { case 1: Promise.resolve("conditional"); if (true) break; }'))
+      .resolves.toBeUndefined();
+    await expect(evaluate(
+      'while (true) { if (true) break; Promise.resolve("unreachable after break"); }',
+    )).resolves.toBeUndefined();
+    await expect(evaluate(
+      'let i = 0; while (i < 1) { i += 1; if (true) continue; Promise.resolve("unreachable after continue"); }',
+    )).resolves.toBeUndefined();
+  });
+
+  test('keeps guarded values only when a finally exit is not taken', async () => {
+    const taken = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(taken(
+      'globalThis.flag = true; L: try { Promise.resolve("guarded"); } finally { if (flag) break L; }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBeUndefined();
+
+    const skipped = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(skipped(
+      'globalThis.flag = false; L: try { Promise.resolve("guarded"); } finally { if (flag) break L; }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('guarded');
+
+    const continued = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(continued(
+      'let i = 0; outer: while (i < 1) { i += 1; try { Promise.resolve("guarded"); } finally { if (i === 1) continue outer; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBeUndefined();
   });
 
   test('observes a completion expression before trailing declarations', async () => {
@@ -978,7 +1028,7 @@ describe('shared app evaluation policy', () => {
     expect(settlementAttempts).toBe(1);
   });
 
-  test('does not dispatch source when runtime generation changes after mailbox setup', async () => {
+  test('recreates the mailbox when generation changes after mailbox setup', async () => {
     const { transport, calls } = vmTransport();
     let generation = 0;
     const base = lifecycle();
@@ -995,10 +1045,10 @@ describe('shared app evaluation policy', () => {
     await expect(evalInApp(
       'globalThis.sourceMutation = true; Promise.resolve(1);',
       { awaitPromise: true, timeout: 1000 },
-    )).rejects.toThrow('context changed before source dispatch');
-    expect(transport.context).not.toHaveProperty('sourceMutation');
+    )).resolves.toBe(1);
+    expect(transport.context).toHaveProperty('sourceMutation', true);
     expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
-      String(call.params.expression).includes('sourceMutation'))).toHaveLength(0);
+      String(call.params.expression).includes('sourceMutation'))).toHaveLength(1);
   });
 
   test('rejects a generation change immediately after mailbox setup response', async () => {
