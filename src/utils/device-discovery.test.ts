@@ -283,6 +283,40 @@ describe('device discovery', () => {
     expect(device).toMatchObject({ platform: 'android', id: 'emulator-42' });
   });
 
+  test('does not fall back to an iOS simulator when the connected Android ID is unavailable', async () => {
+    for (const status of ['offline', 'unauthorized'] as const) {
+      const runner = runnerFor({
+        ios: [iosInventory([
+          { name: 'iPhone 16', udid: 'IOS-16', state: 'Booted' },
+        ])],
+        android: `List of devices attached\nconnected-android\t${status} model:Pixel_8\n`,
+      });
+
+      await expect(resolveDevice(runner, 'auto', {
+        deviceName: 'Pixel 8',
+        reactNative: { logicalDeviceId: 'connected-android' },
+      })).rejects.toThrow(
+        `Connected Android device "connected-android" is ${status}; refusing to select another device.`,
+      );
+    }
+  });
+
+  test('does not fall back to another authorized Android device when the connected ID is unavailable', async () => {
+    for (const status of ['offline', 'unauthorized'] as const) {
+      const runner = runnerFor({
+        ios: [iosInventory([])],
+        android: `List of devices attached\nconnected-android\t${status} model:Pixel_8\nother-android\tdevice model:Pixel_8\n`,
+      });
+
+      await expect(resolveDevice(runner, 'auto', {
+        deviceName: 'Pixel 8',
+        reactNative: { logicalDeviceId: 'connected-android' },
+      })).rejects.toThrow(
+        `Connected Android device "connected-android" is ${status}; refusing to select another device.`,
+      );
+    }
+  });
+
   test('uses a sole iOS simulator when Android discovery is successfully empty and the Metro ID is opaque', async () => {
     const runner = runnerFor({
       ios: [iosInventory([
