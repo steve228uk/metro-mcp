@@ -41,6 +41,27 @@ test('serializes nested BigInts without throwing', () => {
   });
 });
 
+test('serializes boxed BigInts without throwing', () => {
+  expect(normalizeToolResult(Object(4n))).toEqual({
+    content: [{ type: 'text', text: '4n' }],
+  });
+  expect(normalizeToolResult({ count: Object(5n) })).toEqual({
+    content: [{ type: 'text', text: '{"count":"5n"}' }],
+  });
+});
+
+test('does not treat a spoofed BigInt tag as a boxed BigInt', () => {
+  const result = {
+    [Symbol.toStringTag]: 'BigInt',
+    valueOf: () => {
+      throw new Error('must not be called');
+    },
+  };
+  expect(normalizeToolResult(result)).toEqual({
+    content: [{ type: 'text', text: '{}' }],
+  });
+});
+
 test('preserves existing JSON handling for non-BigInt primitives', () => {
   expect(normalizeToolResult({
     nan: Number.NaN,
