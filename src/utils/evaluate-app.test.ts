@@ -698,6 +698,36 @@ describe('shared app evaluation policy', () => {
       'let i = 0; outer: while (i < 1) { i += 1; try { Promise.resolve("guarded"); } finally { if (i === 1) continue outer; } }',
       { awaitPromise: true, timeout: 1000 },
     )).resolves.toBe('guarded');
+
+    const skippedAfterValue = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(skippedAfterValue(
+      'globalThis.flag = false; L: try { Promise.resolve("guarded"); } finally { Promise.resolve("discarded finalizer"); if (flag) break L; }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('guarded');
+
+    const takenAfterValue = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(takenAfterValue(
+      'globalThis.flag = true; L: try { Promise.resolve("guarded"); } finally { Promise.resolve("finalizer exit"); if (flag) break L; }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('finalizer exit');
+
+    const skippedContinueAfterValue = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(skippedContinueAfterValue(
+      'let i = 0; outer: while (i < 1) { i += 1; try { Promise.resolve("guarded"); } finally { Promise.resolve("discarded finalizer"); if (i > 1) continue outer; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('guarded');
+
+    const nested = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(nested(
+      'L: try { Promise.resolve("guarded"); } finally { try { Promise.resolve("discarded outer finalizer"); } finally { Promise.resolve("discarded inner finalizer"); if (false) break L; } }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('guarded');
+
+    const directive = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(directive(
+      'L: try { Promise.resolve("guarded"); } finally { "use strict"; Promise.resolve("discarded finalizer"); if (false) break L; }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe('guarded');
   });
 
   test('observes a completion expression before trailing declarations', async () => {
