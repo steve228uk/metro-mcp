@@ -308,7 +308,7 @@ function completionForStatements(statements: StatementLike[]): Completion {
   return completion;
 }
 
-function promiseObservationExpression(expression: string): string {
+function promiseObservationExpression(expression: string, completionKey?: string): string {
   let ast;
   try {
     ast = parse(expression, { sourceType: 'script' });
@@ -317,29 +317,59 @@ function promiseObservationExpression(expression: string): string {
   }
   const completion = completionForStatements(ast.program.body as StatementLike[]);
   if (!completion.normal || completion.expressions.length === 0) return expression;
-  const edits = completion.expressions
+  const candidates = completion.expressions
     .filter(({ start, end }) => start !== null && end !== null)
-    .map(({ start, end }) => ({ start: start as number, end: end as number }))
-    .filter((edit, index, all) =>
-      all.findIndex((candidate) => candidate.start === edit.start && candidate.end === edit.end) === index,
-    )
-    .sort((left, right) => right.start - left.start);
-  let transformed = expression;
-  for (const { start, end } of edits) {
-    const candidate = expression.slice(start, end);
-    const observer = `(function observePromise(value) {
-      try {
-        var PromiseCtor = globalThis.Promise;
-        if (PromiseCtor) {
-          PromiseCtor.prototype.then.call(value, function() {}, function() {});
-        }
-      } catch (_) {}
-      return value;
-    })((${candidate}
+    .filter((candidate, index, all) =>
+      all.findIndex((other) =>
+        other.start === candidate.start && other.end === candidate.end,
+      ) === index,
+    );
+  if (candidates.length === 0) return expression;
+  // Awaited evaluation always supplies the already-expiring mailbox key. If
+  // this low-level helper is called without one, leave the source untouched
+  // rather than creating state that cannot be cleaned up on an exception.
+  if (!completionKey) return expression;
+  const key = completionKey;
+  const keyLiteral = JSON.stringify(key);
+  const capture = (candidate: string): string => `(function(root, value) {
+    var state = root[${keyLiteral}];
+    if (state) state.completionValue = value;
+    return value;
+  })(this, (\n    ${candidate}
   ))`;
-    transformed = transformed.slice(0, start) + observer + transformed.slice(end);
+  let transformed = expression;
+  for (const { start, end } of candidates
+    .map(({ start, end }) => ({ start: start as number, end: end as number }))
+    .sort((left, right) => right.start - left.start)) {
+    const candidate = expression.slice(start, end);
+    transformed = transformed.slice(0, start) + capture(candidate) + transformed.slice(end);
   }
-  return transformed;
+  const directives = (ast.program.directives as Array<{
+    end?: number | null;
+    value?: { value?: unknown };
+  }> | undefined) ?? [];
+  const directiveEnd = directives.length > 0
+    ? directives[directives.length - 1]!.end as number
+    : 0;
+  const initialValue = directives.length > 0
+    ? JSON.stringify(directives[directives.length - 1]!.value?.value)
+    : 'void 0';
+  const setup = `;\n(function(root) {
+    var state = root[${keyLiteral}];
+    if (state) state.completionValue = ${initialValue};
+  })(this);\n`;
+  transformed = transformed.slice(0, directiveEnd) + setup + transformed.slice(directiveEnd);
+  const observe = `(function(root) {
+    var state = root[${keyLiteral}];
+    var value = state ? state.completionValue : void 0;
+    try {
+      var PromiseCtor = root && root.Promise;
+      if (PromiseCtor) PromiseCtor.prototype.then.call(value, function() {}, function() {});
+    } catch (_) {}
+    if (state) state.completionValue = void 0;
+    return value;
+  })(this)`;
+  return `${transformed}\n;\n${observe}`;
 }
 
 /**
@@ -372,11 +402,11 @@ export async function evaluateAppScript(
 export async function evaluateAppScriptCompletion(
   cdp: Pick<CDPConnection, 'send'>,
   expression: string,
-  options?: EvalOptions & { observePromiseRejection?: boolean },
+  options?: EvalOptions & { observePromiseRejection?: boolean; completionKey?: string },
 ): Promise<AppEvaluationCompletion> {
   const result = await sendRuntimeEvaluate(cdp, {
     expression: options?.observePromiseRejection
-      ? promiseObservationExpression(expression)
+      ? promiseObservationExpression(expression, options.completionKey)
       : expression,
     returnByValue: false,
     awaitPromise: false,
@@ -395,10 +425,11 @@ export async function evaluateAppScriptCompletion(
 }
 
 const SETTLE_REMOTE_FUNCTION = `function(key) {
-  var state = globalThis[key];
+  var root = (function() { return this; })();
+  var state = root[key];
   if (!state) return false;
   function fulfill(value) {
-    if (globalThis[key] !== state) return;
+    if (root[key] !== state) return;
     state.unserializableValue = undefined;
     if (typeof value === 'number') {
       if (value !== value) state.unserializableValue = 'NaN';
@@ -423,7 +454,7 @@ const SETTLE_REMOTE_FUNCTION = `function(key) {
     return 'Promise rejected with an unstringifiable reason';
   }
   function reject(error) {
-    if (globalThis[key] !== state) return;
+    if (root[key] !== state) return;
     state.error = rejectionMessage(error);
     state.status = 'rejected';
   }
@@ -431,7 +462,7 @@ const SETTLE_REMOTE_FUNCTION = `function(key) {
     // Assimilate arbitrary thenables exactly once. Calling this.then
     // directly would accept a second callback or a nested thenable as the
     // final value, unlike JavaScript Promise resolution.
-    Promise.resolve(this).then(fulfill, reject);
+    root.Promise.resolve(this).then(fulfill, reject);
   } catch (error) { reject(error); }
   return true;
 }`;
@@ -487,6 +518,7 @@ export function createAppEvaluator(
       timeout?: number;
       deadline?: number;
       objectGroup?: string;
+      completionKey?: string;
       generation?: number;
       retryMailboxSetup?: (
         options: { timeout?: number; deadline: number },
@@ -517,6 +549,7 @@ export function createAppEvaluator(
         timeout,
         objectGroup: options?.objectGroup,
         observePromiseRejection: true,
+        completionKey: options?.completionKey,
       });
     };
     try {
