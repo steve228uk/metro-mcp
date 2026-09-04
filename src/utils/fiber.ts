@@ -323,7 +323,7 @@ export const FIBER_WALKER_JS = `
     };
   }
 
-  function metroWalkFibers(options, visitor) {
+  function metroWalkFibers(options, visitor, initialNavigationState) {
     var requestedDepth = Number(options.maxDepth);
     var requestedNodes = Number(options.maxNodes);
     var maxDepth = Math.min(600, Math.max(
@@ -362,7 +362,9 @@ export const FIBER_WALKER_JS = `
     }
 
     var entries = [];
-    var navigationState = metroNavigationState();
+    var navigationState = initialNavigationState === undefined
+      ? metroNavigationState()
+      : initialNavigationState;
     while (stack.length) {
       if (state.scannedNodes >= maxNodes) {
         state.complete = false;

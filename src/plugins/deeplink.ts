@@ -1,5 +1,107 @@
 import { z } from 'zod';
-import { definePlugin } from '../plugin.js';
+import { definePlugin, type PluginContext } from '../plugin.js';
+import {
+  adbPrefix,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
+
+function outputText(output: Buffer | string): string {
+  return typeof output === 'string' ? output : output.toString('utf8');
+}
+
+// Package dumps can include the complete set of declared components and intent
+// filters. Keep enough headroom for large applications while retaining an
+// explicit child-process limit instead of relying on Node's default buffer.
+const ANDROID_PACKAGE_DUMP_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Validate a package name before passing it to `adb shell pm dump`.
+ *
+ * `execFile` protects the host process, but adb still reconstructs the
+ * arguments for the remote shell. Android application IDs therefore need a
+ * stricter check at this boundary.
+ */
+export function isValidAndroidApplicationId(value: string): boolean {
+  return /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(value);
+}
+
+function invalidAndroidApplicationId(value: string): string {
+  return `Invalid Android application ID ${JSON.stringify(value)}. Expected at least two dot-separated segments; each segment must start with an ASCII letter and contain only ASCII letters, digits, or underscores.`;
+}
+
+/**
+ * Extract the schemes declared in an iOS Info.plist JSON representation.
+ * Invalid entries are ignored because an app may declare URL types for other
+ * platforms or include optional plist values that are not strings.
+ */
+export function parseBundleUrlSchemes(plist: unknown): string[] {
+  if (!plist || typeof plist !== 'object' || Array.isArray(plist)) return [];
+  const urlTypes = (plist as Record<string, unknown>).CFBundleURLTypes;
+  if (!Array.isArray(urlTypes)) return [];
+
+  const schemes: string[] = [];
+  const seen = new Set<string>();
+  for (const urlType of urlTypes) {
+    if (!urlType || typeof urlType !== 'object' || Array.isArray(urlType)) continue;
+    const declared = (urlType as Record<string, unknown>).CFBundleURLSchemes;
+    if (!Array.isArray(declared)) continue;
+    for (const value of declared) {
+      if (typeof value !== 'string') continue;
+      const scheme = value.trim();
+      if (scheme && !seen.has(scheme)) {
+        seen.add(scheme);
+        schemes.push(scheme);
+      }
+    }
+  }
+  return schemes;
+}
+
+/** Keep Android's existing text response while avoiding a shell pipeline. */
+export function extractAndroidSchemeDump(output: string): string {
+  const lines = output.split(/\r?\n/);
+  const selected: string[] = [];
+  let contextEnd = -1;
+  for (let index = 0; index < lines.length; index += 1) {
+    if (/scheme/i.test(lines[index] ?? '')) contextEnd = index + 5;
+    if (index <= contextEnd) selected.push(lines[index]);
+  }
+  return selected.join('\n').trim();
+}
+
+async function readIosBundleSchemes(
+  ctx: PluginContext,
+  udid: string,
+  bundleId: string,
+): Promise<string[]> {
+  const appContainer = outputText(
+    await ctx.execFile('xcrun', [
+      'simctl',
+      'get_app_container',
+      udid,
+      bundleId,
+      'app',
+    ]),
+  ).trim();
+  if (!appContainer || appContainer.includes('\0')) {
+    throw new Error('simctl did not return an installed app container');
+  }
+
+  const plistPath = `${appContainer.replace(/\/+$/, '')}/Info.plist`;
+  const plistJson = outputText(
+    await ctx.execFile('plutil', ['-convert', 'json', '-o', '-', plistPath]),
+  );
+  let plist: unknown;
+  try {
+    plist = JSON.parse(plistJson);
+  } catch (error) {
+    throw new Error(
+      `Info.plist was not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return parseBundleUrlSchemes(plist);
+}
 
 export const deeplinkPlugin = definePlugin({
   name: 'deeplink',
@@ -7,17 +109,10 @@ export const deeplinkPlugin = definePlugin({
   description: 'Cross-platform deep link testing',
 
   async setup(ctx) {
-    async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      try {
-        await ctx.exec('xcrun simctl list booted 2>/dev/null | grep -q Booted');
-        return 'ios';
-      } catch {}
-      try {
-        const output = await ctx.exec('adb devices 2>/dev/null');
-        if (output.trim().split('\n').length > 1) return 'android';
-      } catch {}
-      return null;
-    }
+    const resolveTarget = (
+      platform: 'ios' | 'android' | 'auto',
+      connectedTarget = getConnectedDeviceTarget(ctx),
+    ) => resolveDevice(ctx, platform, connectedTarget);
 
     ctx.registerTool('open_deeplink', {
       description: 'Open a URL or deep link on the connected iOS simulator or Android device.',
@@ -27,14 +122,15 @@ export const deeplinkPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ url, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
+        const target = await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const p = target.platform;
 
         if (p === 'ios') {
-          await ctx.exec(`xcrun simctl openurl booted "${url}"`);
+          await ctx.exec(`xcrun simctl openurl "${target.id}" "${url}"`);
         } else {
           await ctx.exec(
-            `adb shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "${url}"`
+            `${adbPrefix(target.id)} shell am start -a android.intent.action.VIEW -c android.intent.category.BROWSABLE -d "${url}"`
           );
         }
         return `Opened "${url}" on ${p === 'ios' ? 'iOS simulator' : 'Android device'}.`;
@@ -42,43 +138,69 @@ export const deeplinkPlugin = definePlugin({
     });
 
     ctx.registerTool('list_url_schemes', {
-      description: 'List URL schemes registered by the app (attempts to detect from the running app).',
+      description: 'List URL schemes registered by an installed iOS app or Android package.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
+        platform: z.enum(['ios', 'android', 'auto']).default('auto').describe('Target platform'),
         bundleId: z.string().optional().describe('Bundle ID to check (auto-detected if not provided)'),
       }),
-      handler: async ({ bundleId }) => {
-        // Try to get URL schemes from the app via evaluate
-        try {
-          if (ctx.cdp.isConnected) {
-            const result = (await ctx.cdp.send('Runtime.evaluate', {
-              expression: `
-                (function() {
-                  try {
-                    var Linking = require('react-native').Linking;
-                    return { note: 'Use Linking.canOpenURL() to test specific schemes' };
-                  } catch(e) {
-                    return { error: e.message };
-                  }
-                })()
-              `,
-              returnByValue: true,
-            })) as Record<string, unknown>;
-            const val = (result.result as Record<string, unknown>).value;
-            if (val) return val;
-          }
-        } catch {}
+      handler: async ({ platform, bundleId }) => {
+        const targetInfo = getConnectedDeviceTarget(ctx);
+        const requestedBundleId = bundleId?.trim() ||
+          (platform === 'auto' ? targetInfo?.appId?.trim() : undefined);
+        if (!requestedBundleId) {
+          return platform === 'auto'
+            ? 'Bundle ID is required when no connected app target is available.'
+            : `Bundle ID is required when selecting the ${platform} platform explicitly.`;
+        }
 
-        // Fallback: check Info.plist on iOS
-        try {
-          const platform = await detectPlatform();
-          if (platform === 'android' && bundleId) {
-            const output = await ctx.exec(`adb shell pm dump "${bundleId}" | grep -A5 "scheme" 2>/dev/null`);
-            return output || 'No URL schemes found.';
-          }
-        } catch {}
+        // Validate explicit Android IDs before discovery so malformed input
+        // cannot cause even an adb inventory command to run.
+        if (platform === 'android' &&
+            (bundleId === undefined || !isValidAndroidApplicationId(bundleId))) {
+          return invalidAndroidApplicationId(bundleId ?? requestedBundleId);
+        }
 
-        return 'URL scheme detection requires a running app or bundle ID.';
+        // Keep device selection and the connected app ID tied to one target
+        // snapshot if Metro changes its active runtime during discovery.
+        const target = await resolveTarget(platform, targetInfo);
+        if (!target) return 'No simulator/emulator detected.';
+
+        if (target.platform === 'ios') {
+          try {
+            const schemes = await readIosBundleSchemes(
+              ctx,
+              target.id,
+              requestedBundleId,
+            );
+            return schemes.length > 0 ? schemes : 'No URL schemes found.';
+          } catch (error) {
+            return `Could not read URL schemes for "${requestedBundleId}": ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }
+
+        if (!isValidAndroidApplicationId(requestedBundleId)) {
+          return invalidAndroidApplicationId(requestedBundleId);
+        }
+
+        // Android has no Info.plist equivalent. Keep the established package
+        // dump response, but scope it to the resolved serial and filter it in
+        // memory rather than sending an interpolated shell pipeline.
+        try {
+          const output = outputText(
+            await ctx.execFile('adb', [
+              '-s',
+              target.id,
+              'shell',
+              'pm',
+              'dump',
+              requestedBundleId,
+            ], { maxBuffer: ANDROID_PACKAGE_DUMP_MAX_BYTES }),
+          );
+          return extractAndroidSchemeDump(output) || 'No URL schemes found.';
+        } catch (error) {
+          return `Could not read URL schemes for "${requestedBundleId}": ${error instanceof Error ? error.message : String(error)}`;
+        }
       },
     });
   },

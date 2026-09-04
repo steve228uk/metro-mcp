@@ -115,4 +115,16 @@ describe('project-root configuration', () => {
     expect(second.cwd).toBe(projectRoot);
     expect(getDaemonKey([], first)).toBe(getDaemonKey([], second));
   });
+
+  test('separates daemon identities when native input providers differ', () => {
+    const first = createDaemonIdentity([], {
+      projectRoot: '/tmp/project-a',
+      input: { nativeBackend: 'simview', simviewCommand: '/tmp/simview-a' },
+    });
+    const second = createDaemonIdentity([], {
+      projectRoot: '/tmp/project-a',
+      input: { nativeBackend: 'idb', idbCommand: '/tmp/idb' },
+    });
+    expect(getDaemonKey([], first)).not.toBe(getDaemonKey([], second));
+  });
 });

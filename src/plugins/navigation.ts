@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { buildNavigationHtml } from '../apps/navigation.js';
+import { readNavigationState, readFocusedRoute } from '../utils/navigation.js';
 
 export const navigationPlugin = definePlugin({
   name: 'navigation',
@@ -8,65 +9,6 @@ export const navigationPlugin = definePlugin({
   description: 'React Navigation / Expo Router state inspection',
 
   async setup(ctx) {
-    const GET_NAV_STATE_EXPR = `
-      (function() {
-        // Try client SDK first
-        var _b = globalThis.__METRO_BRIDGE__ || globalThis.__METRO_MCP__;
-        if (_b?.navigation?.getState) {
-          return _b.navigation.getState();
-        }
-
-        // Walk fiber tree to find NavigationContainer
-        var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-        if (!hook || !hook.getFiberRoots) return null;
-
-        var fiberRoots;
-        for (var i = 1; i <= 5; i++) {
-          fiberRoots = hook.getFiberRoots(i);
-          if (fiberRoots && fiberRoots.size > 0) break;
-        }
-        if (!fiberRoots || fiberRoots.size === 0) return null;
-
-        var rootFiber = Array.from(fiberRoots)[0].current;
-        var navState = null;
-
-        function findNavState(fiber) {
-          if (!fiber || navState) return;
-          var name = fiber.type?.displayName || fiber.type?.name || '';
-
-          // Look for NavigationContainer or its internals
-          if (name === 'NavigationContainer' || name === 'NavigationContainerInner' || name === 'BaseNavigationContainer') {
-            // The navigation state is stored in memoizedState
-            var state = fiber.memoizedState;
-            while (state) {
-              if (state.memoizedState && state.memoizedState.routes) {
-                navState = state.memoizedState;
-                return;
-              }
-              // Check queue for state updates
-              if (state.queue?.lastRenderedState?.routes) {
-                navState = state.queue.lastRenderedState;
-                return;
-              }
-              state = state.next;
-            }
-
-            // Also check props for state
-            if (fiber.memoizedProps?.state?.routes) {
-              navState = fiber.memoizedProps.state;
-              return;
-            }
-          }
-
-          findNavState(fiber.child);
-          if (!navState) findNavState(fiber.sibling);
-        }
-
-        findNavState(rootFiber);
-        return navState;
-      })()
-    `;
-
     ctx.registerAppResource('ui://metro/navigation', {
       name: 'Navigation Tree',
       description: 'Visual React Navigation / Expo Router route tree with active screen highlighted',
@@ -82,7 +24,7 @@ export const navigationPlugin = definePlugin({
         compact: z.boolean().default(false).describe('Return compact format'),
       }),
       handler: async ({ compact: isCompact }) => {
-        const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
+        const state = await readNavigationState(ctx.evalInApp);
         if (!state) {
           return 'Navigation state not found. Ensure your app uses React Navigation or Expo Router.';
         }
@@ -91,25 +33,12 @@ export const navigationPlugin = definePlugin({
       },
     });
 
-    function getFocusedRoute(s: Record<string, unknown>): Record<string, unknown> | null {
-      const routes = s.routes as Array<Record<string, unknown>>;
-      if (!routes) return null;
-      const idx = s.index !== undefined ? (s.index as number) : routes.length - 1;
-      const route = routes[idx];
-      if (route.state && typeof route.state === 'object') {
-        return getFocusedRoute(route.state as Record<string, unknown>);
-      }
-      return { name: route.name, params: route.params || {}, key: route.key };
-    }
-
     ctx.registerTool('get_current_route', {
       description: 'Get the currently focused route name and params.',
       annotations: { readOnlyHint: true },
       parameters: z.object({}),
       handler: async () => {
-        const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
-        if (!state || typeof state !== 'object') return 'No focused route found.';
-        const result = getFocusedRoute(state as Record<string, unknown>);
+        const result = await readFocusedRoute(ctx.evalInApp);
         if (!result) return 'No focused route found.';
         return result;
       },
@@ -120,7 +49,7 @@ export const navigationPlugin = definePlugin({
       annotations: { readOnlyHint: true },
       parameters: z.object({}),
       handler: async () => {
-        const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
+        const state = await readNavigationState(ctx.evalInApp);
         if (!state || typeof state !== 'object') return 'Navigation state not found.';
 
         const navState = state as Record<string, unknown>;
@@ -137,25 +66,35 @@ export const navigationPlugin = definePlugin({
     });
 
     ctx.registerTool('list_routes', {
-      description: 'List all registered route names in the app.',
+      description: 'List registered route names from available navigation state. Uninitialized nested navigators are not discoverable.',
       annotations: { readOnlyHint: true },
       parameters: z.object({}),
       handler: async () => {
-        const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
+        const state = await readNavigationState(ctx.evalInApp);
         if (!state || typeof state !== 'object') return 'Navigation state not found.';
 
         const routeNames = new Set<string>();
-        function collectRoutes(s: Record<string, unknown>) {
-          const routes = s.routes as Array<Record<string, unknown>>;
-          if (!routes) return;
-          for (const route of routes) {
-            routeNames.add(route.name as string);
-            if (route.state && typeof route.state === 'object') {
-              collectRoutes(route.state as Record<string, unknown>);
+        const pending: unknown[] = [state];
+        const seen = new Set<object>();
+        while (pending.length) {
+          const next = pending.pop();
+          if (!next || typeof next !== 'object' || seen.has(next)) continue;
+          seen.add(next);
+          const navigation = next as Record<string, unknown>;
+          if (Array.isArray(navigation.routeNames)) {
+            for (const name of navigation.routeNames) {
+              if (typeof name === 'string') routeNames.add(name);
+            }
+          }
+          if (!Array.isArray(navigation.routes)) continue;
+          for (const route of navigation.routes) {
+            if (!route || typeof route !== 'object') continue;
+            if (typeof route.name === 'string') routeNames.add(route.name);
+            if (route.state) {
+              pending.push(route.state);
             }
           }
         }
-        collectRoutes(state as Record<string, unknown>);
         return Array.from(routeNames).sort();
       },
     });
@@ -165,7 +104,7 @@ export const navigationPlugin = definePlugin({
       description: 'Current React Navigation / Expo Router state',
       handler: async () => {
         try {
-          const state = await ctx.evalInApp(GET_NAV_STATE_EXPR, { awaitPromise: true });
+          const state = await readNavigationState(ctx.evalInApp);
           return JSON.stringify(state, null, 2);
         } catch {
           return JSON.stringify({ error: 'Navigation state not available' });

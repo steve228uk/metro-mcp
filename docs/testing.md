@@ -17,11 +17,13 @@ metro-mcp can record real user interactions and generate production-ready automa
 
 ## How It Works
 
-When you call `start_test_recording`, metro-mcp injects a JavaScript interceptor into the app runtime via Chrome DevTools Protocol. The interceptor:
+When you call `start_test_recording`, metro-mcp injects a JavaScript interceptor into the app runtime via Chrome DevTools Protocol. Startup has a bounded readiness phase: existing mounted props are refreshed where React can schedule an update, and a complete fiber scan (up to depth 600 and 5,000 nodes) must confirm the handlers are wrapped before capture is enabled. If React cannot provide complete coverage, startup fails and removes its instrumentation rather than reporting a partial recording. The interceptor then:
 
 - **Wraps event handlers** on every React fiber: `onPress`, `onChangeText`, `onLongPress`, `onSubmitEditing`
 - **Patches scroll containers** to capture swipe direction via `onScrollBeginDrag`/`onScrollEndDrag`
 - **Hooks React's commit lifecycle** (`onCommitFiberRoot`) to automatically patch new fibers as screens mount after navigation
+
+The recorder and profiler can run together. Each one keeps the hook chain intact when the other starts or stops, and an old recorder session stops recording without allowing its wrappers to capture into a later session.
 
 Each interaction is recorded with the element's `testID`, `accessibilityLabel`, component name, current route, and timestamp. When you call `stop_test_recording`, the events are deduplicated (rapid-fire `onChangeText` keystrokes are collapsed to the final value) and stored for test generation.
 
@@ -33,7 +35,7 @@ This approach requires **zero app code changes** and works with Hermes on both i
 
 | Format | Framework | Generated file type |
 |--------|-----------|---------------------|
-| `appium` | WebdriverIO + Jest | `.test.ts` |
+| `appium` | WebdriverIO + Mocha | `.test.ts` |
 | `maestro` | Maestro | `.yaml` |
 | `detox` | Detox + Jest | `.test.js` |
 
@@ -81,7 +83,7 @@ For `generate_test_from_recording`, additional parameters:
 | `testName` | `"Recorded flow"` | Name for the describe/it block |
 | `platform` | `ios` | `ios`, `android`, or `both` (Appium only) |
 | `bundleId` | — | iOS bundle ID or Android app package |
-| `includeSetup` | `true` | Include driver setup/teardown boilerplate |
+| `includeSetup` | `true` | Include runner configuration comments in Appium output; WDIO always owns setup and teardown |
 
 ---
 
@@ -90,46 +92,36 @@ For `generate_test_from_recording`, additional parameters:
 ### Appium (WebdriverIO)
 
 ```typescript
-import { remote, Browser } from 'webdriverio';
+import { browser } from '@wdio/globals';
 
 describe('Guest checkout', () => {
-  let driver: Browser;
-
-  beforeAll(async () => {
-    driver = await remote({
-      capabilities: {
-        platformName: 'iOS',
-        'appium:automationName': 'XCUITest',
-        'appium:bundleId': 'com.example.app',
-      },
-    });
-  });
-
-  afterAll(async () => {
-    await driver.deleteSession();
-  });
-
   it('Guest checkout', async () => {
     // navigated to: WelcomeScreen
-    await driver.$('~startShoppingButton').waitForDisplayed({ timeout: 5000 });
+    await browser.$('~startShoppingButton').waitForDisplayed({ timeout: 5000 });
 
-    await driver.$('~startShoppingButton').click();
+    await browser.$('~startShoppingButton').click();
 
     // navigated to: ProductListScreen
-    await driver.$('~productCard').waitForDisplayed({ timeout: 5000 });
+    await browser.$('~productCard').waitForDisplayed({ timeout: 5000 });
 
-    await driver.$('~productCard').click();
-    await driver.$('~addToCartButton').click();
+    await browser.$('~productCard').click();
+    await browser.$('~addToCartButton').click();
 
     // navigated to: CartScreen
-    await driver.$('~checkoutButton').waitForDisplayed({ timeout: 5000 });
+    await browser.$('~checkoutButton').waitForDisplayed({ timeout: 5000 });
   });
 });
 ```
 
 Run with: `npx wdio run wdio.conf.ts`
 
-To generate the config file: `generate_wdio_config platform=ios bundleId=com.example.app`
+The runner owns the Appium session. Generate its configuration separately with `generate_wdio_config`; set `platform` to `ios`, `android`, or `both`. Single-platform configs accept `bundleId`, `appPath`, `udid`, `deviceName`, and `platformVersion`. For `both`, provide `iosBundleId` or `iosAppPath` and `androidPackageName` or `androidAppPath`, plus the matching per-platform device options. The generated spec uses WDIO's `browser` instance and does not create or tear down a second session. Swipes and long presses use W3C pointer actions, while submit events use `browser.keys`.
+
+The generated configuration defaults `noReset` to `true` to preserve installed app data. Appium may launch the target if it is not running. Return the app to the recording’s starting screen before replaying it. Set `noReset: false` only when the test should let Appium reset the app; that can clear onboarding or login state.
+
+The configuration requires an app target. For a single platform, the connected Metro app's ID is used when `bundleId` and `appPath` are omitted. A dual-platform config cannot infer both targets from one connected app, so its iOS and Android targets must be supplied separately.
+
+For TypeScript checking, include `node`, `@wdio/globals/types`, and `@wdio/mocha-framework` in your `tsconfig.json` compiler `types`. This loads WDIO's browser and Mocha types for both generated setup modes.
 
 ---
 

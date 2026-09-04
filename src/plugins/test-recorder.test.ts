@@ -1,0 +1,1032 @@
+import { describe, expect, test } from 'bun:test';
+import vm from 'node:vm';
+import type { z } from 'zod';
+import type { ComponentNode, EvalOptions, PluginContext, PluginDefinition } from '../plugin.js';
+import { profilerPlugin } from './profiler.js';
+import { testRecorderPlugin } from './test-recorder.js';
+
+interface Tool {
+  parameters: z.ZodType;
+  handler: (args: Record<string, unknown>) => Promise<unknown>;
+}
+
+type Runner = ((name: string, args?: Record<string, unknown>) => Promise<unknown>) & {
+  resource: (uri: string) => Promise<string>;
+};
+
+interface TargetFixture {
+  appId: string;
+  platform: 'ios' | 'android';
+  id: string;
+  name: string;
+  opaque?: boolean;
+  inventoryId?: string;
+  inventory?: {
+    ios?: Array<{ name: string; udid: string; state: string; isAvailable?: boolean }>;
+    android?: Array<{ id: string; status: string; model?: string }>;
+  };
+}
+
+function appWithDeepButton() {
+  const app = vm.createContext({ setTimeout, clearTimeout });
+  vm.runInContext(`
+    var handlerCalls = 0;
+    var leaf = {
+      type: { displayName: 'Button' },
+      memoizedProps: Object.freeze({
+        testID: 'deep-button',
+        onPress: function() { handlerCalls++; }
+      }),
+      stateNode: null,
+      child: null,
+      sibling: null,
+      return: null
+    };
+    leaf.stateNode = {
+      fiber: leaf,
+      forceUpdate: function() {
+        var next = {
+          testID: 'deep-button',
+          onPress: function() { handlerCalls++; }
+        };
+        this.fiber.pendingProps = next;
+        var target = this.fiber;
+        setTimeout(function() { target.memoizedProps = Object.freeze(target.pendingProps); }, 0);
+      }
+    };
+    var current = leaf;
+    for (var depth = 254; depth >= 0; depth--) {
+      var parent = {
+        type: { displayName: 'Provider' + depth },
+        memoizedProps: Object.freeze({}),
+        stateNode: null,
+        child: current,
+        sibling: null,
+        return: null
+      };
+      current.return = parent;
+      current = parent;
+    }
+    var root = current;
+    var renderer = { overrideProps: function(fiber) {
+      var next = {};
+      var props = fiber.memoizedProps || {};
+      for (var key in props) next[key] = props[key];
+      fiber.pendingProps = next;
+      var target = fiber;
+      setTimeout(function() { target.memoizedProps = Object.freeze(target.pendingProps); }, 0);
+    } };
+    var hook = {
+      getFiberRoots: function(id) { return id === 12 ? new Set([{ current: root }]) : new Set(); },
+      renderers: new Map([[12, renderer]]),
+      onCommitFiberRoot: function() {}
+    };
+    globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__ = hook;
+  `, app);
+  return app;
+}
+
+function appWithNaturalScroll() {
+  const app = appWithDeepButton();
+  vm.runInContext(`
+    var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+    scrollRoot.memoizedProps = Object.freeze({ scrollEnabled: true, testID: 'scroll-root' });
+  `, app);
+  return app;
+}
+
+function appWithMomentumOnlyScroll() {
+  const app = appWithDeepButton();
+  vm.runInContext(`
+    var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+    scrollRoot.memoizedProps = Object.freeze({
+      testID: 'momentum-only-scroll',
+      onMomentumScrollEnd: function() {}
+    });
+  `, app);
+  return app;
+}
+
+function appWithoutFiberRefresh() {
+  const app = appWithDeepButton();
+  vm.runInContext(`
+    var originalRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+    originalRoot.stateNode = { forceUpdate: function() {} };
+    var leafWithoutRefresh = originalRoot;
+    while (leafWithoutRefresh.child) leafWithoutRefresh = leafWithoutRefresh.child;
+    leafWithoutRefresh.stateNode = { forceUpdate: function() {} };
+    hook.renderers.get(12).overrideProps = null;
+  `, app);
+  return app;
+}
+
+function appWithNoopAncestorAndTargetRefresh() {
+  const app = appWithDeepButton();
+  vm.runInContext(`
+    var target = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+    while (target.child) target = target.child;
+    target.stateNode = null;
+    var ancestor = target.return;
+    while (ancestor && !ancestor.return) ancestor = ancestor.return;
+    ancestor.stateNode = { forceUpdate: function() {} };
+  `, app);
+  return app;
+}
+
+function appWithoutFiberRoots() {
+  const app = appWithDeepButton();
+  vm.runInContext(`
+    __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots = function() { return new Set(); };
+  `, app);
+  return app;
+}
+
+async function createHarness(
+  app: Record<string, unknown>,
+  plugins: PluginDefinition[],
+  targetAppIdOrBeforeEval?:
+    | string
+    | TargetFixture
+    | ((expression: string, options?: EvalOptions) => void),
+  evalInAppOverride?: (
+    expression: string,
+    options: EvalOptions | undefined,
+    evaluate: (expression: string, options?: EvalOptions) => Promise<unknown>,
+  ) => Promise<unknown>,
+): Promise<Runner> {
+  const tools = new Map<string, Tool>();
+  const resources = new Map<string, () => Promise<string>>();
+  const targetFixture: TargetFixture | undefined =
+    typeof targetAppIdOrBeforeEval === 'string'
+      ? {
+          appId: targetAppIdOrBeforeEval,
+          platform: 'ios',
+          id: 'AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE',
+          name: 'iPhone QA',
+        }
+      : typeof targetAppIdOrBeforeEval === 'object'
+        ? targetAppIdOrBeforeEval
+        : undefined;
+  const beforeEval = typeof targetAppIdOrBeforeEval === 'function' ? targetAppIdOrBeforeEval : undefined;
+  const evaluateInApp = async (expression: string, options?: EvalOptions) => {
+    beforeEval?.(expression, options);
+    const value = new vm.Script(expression).runInContext(app as vm.Context);
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  };
+  const ctx: PluginContext = {
+    cdp: {
+      on: () => {}, off: () => {}, isConnected: true,
+      getTarget: () => targetFixture ? ({
+        appId: targetFixture.appId,
+        ...(targetFixture.opaque ? {} : {
+          deviceName: targetFixture.name,
+          reactNative: { logicalDeviceId: targetFixture.id },
+        }),
+      } as ReturnType<PluginContext['cdp']['getTarget']>) : null,
+      send: async () => ({}),
+    },
+    events: { on: () => {}, off: () => {}, isConnected: () => true },
+    registerTool: (name, config) => tools.set(name, {
+      parameters: config.parameters,
+      handler: config.handler as Tool['handler'],
+    }),
+    registerResource: (uri, config) => resources.set(uri, config.handler),
+    registerAppResource: () => {}, registerPrompt: () => {},
+    config: {},
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    metro: { host: 'localhost', port: 8081, fetch: async () => new Response() },
+    exec: async () => '',
+    execFile: async (command) => {
+      if (command === 'xcrun') {
+        const devices = targetFixture?.platform === 'ios'
+          ? targetFixture.inventory?.ios ?? [{
+            name: targetFixture.name,
+            udid: targetFixture.inventoryId ?? targetFixture.id,
+            state: 'Booted',
+            isAvailable: true,
+          }]
+          : [];
+        return Buffer.from(JSON.stringify({
+          devices: { 'com.apple.CoreSimulator.SimRuntime.iOS-26-0': devices },
+        }));
+      }
+      if (command === 'adb') {
+        const devices = targetFixture?.platform === 'android'
+          ? targetFixture.inventory?.android ?? [{
+            id: targetFixture.inventoryId ?? targetFixture.id,
+            status: 'device',
+            model: targetFixture.name.replace(/[^a-zA-Z0-9]/g, '_'),
+          }]
+          : [];
+        const device = devices
+          .map((entry) => `${entry.id}\t${entry.status}${entry.model ? ` model:${entry.model}` : ''}`)
+          .join('\n');
+        return Buffer.from(`List of devices attached\n${device}\n`);
+      }
+      return Buffer.alloc(0);
+    },
+    format: {
+      summarize: () => '', compact: (value: unknown) => JSON.stringify(value),
+      truncate: (value: string) => value, structureOnly: (value: ComponentNode) => value,
+    },
+    evalInApp: evalInAppOverride
+      ? (expression, options) => evalInAppOverride(expression, options, evaluateInApp)
+      : evaluateInApp,
+    getActiveDeviceKey: () => 'device', getActiveDeviceName: () => 'Device',
+    notifyResourceUpdated: () => {},
+  };
+  for (const plugin of plugins) await plugin.setup(ctx);
+  const run = async (name: string, args: Record<string, unknown> = {}) => {
+    const tool = tools.get(name);
+    if (!tool) throw new Error(`missing tool ${name}`);
+    return tool.handler(tool.parameters.parse(args) as Record<string, unknown>);
+  };
+  run.resource = async (uri: string) => {
+    const resource = resources.get(uri);
+    if (!resource) throw new Error(`missing resource ${uri}`);
+    return resource();
+  };
+  return run;
+}
+
+describe('test recorder readiness', () => {
+  test('wraps frozen handlers in mounted inactive scenes before they become focused', async () => {
+    const app = appWithDeepButton();
+    vm.runInContext(`
+      var navigationState = { index: 0, routes: [{ key: 'a', name: 'A' }, { key: 'b', name: 'B' }] };
+      globalThis.__METRO_MCP_NAV_REF__ = { getRootState: function() { return navigationState; } };
+      var inactiveLeaf = { type: 'Button', memoizedProps: Object.freeze({ testID: 'inactive-button', onPress: function() { handlerCalls++; } }) };
+      var sceneB = { type: { name: 'SceneView' }, memoizedProps: { route: navigationState.routes[1] }, child: inactiveLeaf };
+      var sceneA = { type: { name: 'SceneView' }, memoizedProps: { route: navigationState.routes[0] }, child: root, sibling: sceneB };
+      var navRoot = { type: 'Navigator', memoizedProps: { state: navigationState }, child: sceneA };
+      hook.getFiberRoots = function(id) { return id === 12 ? new Set([{ current: navRoot }]) : new Set(); };
+    `, app);
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext('navigationState.index = 1; inactiveLeaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('handlerCalls', app)).toBe(1);
+  });
+
+  test('removes inactive recorder and profiler predecessors after an interleaved restart', async () => {
+    const app = appWithDeepButton();
+    const originalHook = vm.runInContext('hook.onCommitFiberRoot', app);
+    const call = await createHarness(app, [testRecorderPlugin, profilerPlugin]);
+    await call('start_test_recording');
+    await call('start_profiling');
+    await call('start_test_recording');
+    await call('stop_profiling');
+    await call('stop_test_recording');
+    expect(vm.runInContext('hook.onCommitFiberRoot', app)).toBe(originalHook);
+  });
+
+  test('does not let an older concurrent startup clean up the newer recorder', async () => {
+    const app = appWithDeepButton();
+    let releaseFirstReadiness!: () => void;
+    let firstReadinessEntered!: () => void;
+    const firstReadiness = new Promise<void>((resolve) => { firstReadinessEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseFirstReadiness = resolve; });
+    let readinessBlocked = false;
+    const call = await createHarness(app, [testRecorderPlugin], undefined, async (expression, options, evaluate) => {
+      if (!readinessBlocked && expression.includes('handlerCount')) {
+        readinessBlocked = true;
+        firstReadinessEntered();
+        await release;
+      }
+      return evaluate(expression, options);
+    });
+
+    const olderStartup = call('start_test_recording');
+    await firstReadiness;
+
+    expect(await call('start_test_recording')).toContain('Recording started');
+    releaseFirstReadiness();
+    expect(String(await olderStartup)).toContain('replaced by a newer startup');
+
+    vm.runInContext('leaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
+  });
+
+  test('does not let a stale pre-injection startup replace the newer recorder', async () => {
+    const app = appWithDeepButton();
+    let releaseOlderInjection!: () => void;
+    let olderInjectionEntered!: () => void;
+    const olderInjection = new Promise<void>((resolve) => { olderInjectionEntered = resolve; });
+    const release = new Promise<void>((resolve) => { releaseOlderInjection = resolve; });
+    let injectionBlocked = false;
+    const call = await createHarness(app, [testRecorderPlugin], undefined, async (expression, options, evaluate) => {
+      if (!injectionBlocked && expression.includes('var currentState = globalThis.__METRO_MCP_REC_STATE__')) {
+        injectionBlocked = true;
+        olderInjectionEntered();
+        await release;
+      }
+      return evaluate(expression, options);
+    });
+
+    const olderStartup = call('start_test_recording');
+    await olderInjection;
+
+    expect(await call('start_test_recording')).toContain('Recording started');
+    releaseOlderInjection();
+    expect(String(await olderStartup)).toContain('replaced by a newer startup');
+
+    vm.runInContext('leaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
+  });
+
+  test('bounds cyclic ancestor refresh searches and still instruments through the renderer', async () => {
+    const app = appWithDeepButton();
+    vm.runInContext('leaf.stateNode = null; leaf.return = leaf;', app);
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext('leaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+  });
+
+  test('restores instrumentation when the initial mounted-props scan throws', async () => {
+    const app = appWithDeepButton();
+    const originalFreeze = vm.runInContext('Object.freeze', app);
+    const originalCommit = vm.runInContext('hook.onCommitFiberRoot', app);
+    vm.runInContext(`Object.defineProperty(leaf, 'memoizedProps', { get: function() { throw new Error('props unavailable'); } })`, app);
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(String(await call('start_test_recording'))).toContain('Could not inject recording hooks');
+    expect(vm.runInContext('Object.freeze', app)).toBe(originalFreeze);
+    expect(vm.runInContext('hook.onCommitFiberRoot', app)).toBe(originalCommit);
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
+  });
+
+  test('refreshes frozen props through depth 255 before enabling capture', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    const started = await call('start_test_recording');
+    expect(String(started)).toContain('Recording started');
+
+    const event = await new vm.Script('globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current').runInContext(app as vm.Context);
+    let leaf = event as { child?: unknown };
+    while (leaf.child) leaf = leaf.child as { child?: unknown };
+    (leaf as { memoizedProps: { onPress: () => void } }).memoizedProps.onPress();
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('handlerCalls', app)).toBe(1);
+  });
+
+  test('bounds every startup evaluation by one deadline', async () => {
+    const app = appWithDeepButton();
+    const evaluations: Array<{ expression: string; options?: EvalOptions; remaining: number }> = [];
+    const call = await createHarness(app, [testRecorderPlugin], (expression, options) => {
+      if (options?.deadline !== undefined) {
+        evaluations.push({ expression, options, remaining: options.deadline - Date.now() });
+      }
+    });
+
+    expect(await call('start_test_recording')).toContain('Recording started');
+    expect(evaluations.length).toBeGreaterThanOrEqual(4);
+    const deadlines = new Set(evaluations.map(({ options }) => options?.deadline));
+    expect(deadlines.size).toBe(1);
+    for (const { options, remaining } of evaluations) {
+      expect(options?.timeout).toBeGreaterThan(0);
+      expect(options?.timeout).toBeLessThanOrEqual(6000);
+      // `evaluateStartup` and this observer read the clock separately.
+      expect((options?.timeout ?? 0) - remaining).toBeLessThanOrEqual(25);
+    }
+  });
+
+  test('uses target overrideProps when an ancestor forceUpdate is a no-op', async () => {
+    const app = appWithNoopAncestorAndTargetRefresh();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext('leaf.memoizedProps.onPress()', app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+  });
+
+  test('uses the most specific metadata when a forwarded handler is wrapped twice', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var receiver = { calls: 0 };
+      var forwarded = function(first, second) {
+        this.calls++;
+        if (first === 'throw') throw new Error('forwarded failure');
+        return [this, first, second];
+      };
+      var outerProps = { testID: 'outer-control', onPress: forwarded };
+      Object.freeze(outerProps);
+      var childProps = { testID: 'inner-control', onPress: outerProps.onPress };
+      Object.freeze(childProps);
+      leaf.memoizedProps = childProps;
+    `, app);
+    const result = vm.runInContext('leaf.memoizedProps.onPress.call(receiver, "first", "second")', app) as unknown[];
+    expect(result[0]).toBe(vm.runInContext('receiver', app));
+    expect(result.slice(1)).toEqual(['first', 'second']);
+    expect(vm.runInContext('receiver.calls', app)).toBe(1);
+    expect(() => vm.runInContext('leaf.memoizedProps.onPress.call(receiver, "throw")', app)).toThrow('forwarded failure');
+    expect(vm.runInContext('receiver.calls', app)).toBe(2);
+    const stopped = await call('stop_test_recording');
+    expect(stopped).toContain('2 taps');
+    const events = JSON.parse(await call.resource('metro://recording/status'));
+    expect(events.eventCount).toBe(2);
+    const raw = vm.runInContext('__METRO_MCP_REC_EVENTS__', app) as Array<{ testID?: string }>;
+    expect(raw).toHaveLength(2);
+    expect(raw[0].testID).toBe('inner-control');
+    expect(raw[1].testID).toBe('inner-control');
+  });
+
+  test('does not add a second wrapper when forwarded identifiers are unchanged', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var forwarded = function() { handlerCalls++; };
+      var outerProps = { testID: 'same-control', onPress: forwarded };
+      Object.freeze(outerProps);
+      var childProps = { testID: 'same-control', onPress: outerProps.onPress };
+      Object.freeze(childProps);
+      leaf.memoizedProps = childProps;
+      leaf.memoizedProps.onPress();
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 tap');
+    expect(vm.runInContext('handlerCalls', app)).toBe(1);
+    const raw = vm.runInContext('__METRO_MCP_REC_EVENTS__', app) as Array<{ testID?: string }>;
+    expect(raw).toHaveLength(1);
+    expect(raw[0].testID).toBe('same-control');
+  });
+
+  test('does not reuse a forwarded wrapper across handler kinds', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var forwarded = function() { handlerCalls++; };
+      var outerProps = { testID: 'same-control', onPress: forwarded };
+      Object.freeze(outerProps);
+      var childProps = { testID: 'same-control', onLongPress: outerProps.onPress };
+      Object.freeze(childProps);
+      leaf.memoizedProps = childProps;
+      leaf.memoizedProps.onLongPress();
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 long_press');
+    expect(vm.runInContext('handlerCalls', app)).toBe(1);
+    const raw = vm.runInContext('__METRO_MCP_REC_EVENTS__', app) as Array<{ type?: string }>;
+    expect(raw).toHaveLength(1);
+    expect(raw[0].type).toBe('long_press');
+  });
+
+  test('does not report readiness for a forwarded wrapper from another handler kind', async () => {
+    const app = appWithDeepButton();
+    let replacedBeforeReadiness = false;
+    const call = await createHarness(app, [testRecorderPlugin], (expression) => {
+      if (replacedBeforeReadiness || !expression.includes('handlerCount')) return;
+      replacedBeforeReadiness = true;
+      vm.runInContext(`
+        leaf.memoizedProps = {
+          testID: 'deep-button',
+          onLongPress: leaf.memoizedProps.onPress
+        };
+      `, app);
+    });
+    const realNow = Date.now;
+    let clockReads = 0;
+    Date.now = () => realNow() + (clockReads++ < 5 ? 0 : 7000);
+    let result: unknown;
+    try {
+      result = await call('start_test_recording');
+    } finally {
+      Date.now = realNow;
+    }
+    expect(replacedBeforeReadiness).toBe(true);
+    expect(String(result)).toContain('unwrapped handlers: onLongPress');
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
+  });
+
+  test('keeps recorder and profiler commit hooks chained in either stop order', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin, profilerPlugin]);
+    const originalHook = vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app);
+    await call('start_profiling');
+    const profilerHook = vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app);
+    await call('start_test_recording');
+    const recorderHook = vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app);
+    expect(recorderHook).not.toBe(profilerHook);
+    await call('stop_profiling');
+    expect(vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app)).toBe(recorderHook);
+    await call('stop_test_recording');
+    expect(vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app)).toBe(originalHook);
+
+    const reverseApp = appWithDeepButton();
+    const reverseCall = await createHarness(reverseApp, [testRecorderPlugin, profilerPlugin]);
+    const reverseOriginalHook = vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', reverseApp);
+    await reverseCall('start_test_recording');
+    const reverseRecorderHook = vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', reverseApp);
+    await reverseCall('start_profiling');
+    const reverseProfilerHook = vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', reverseApp);
+    await reverseCall('stop_test_recording');
+    expect(vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', reverseApp)).toBe(reverseProfilerHook);
+    await reverseCall('stop_profiling');
+    expect(vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', reverseApp)).toBe(reverseOriginalHook);
+  });
+
+  test('does not let a repeated session capture through stale wrappers', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    await call('start_test_recording');
+    await call('stop_test_recording');
+    await call('start_test_recording');
+    const event = await new vm.Script('globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current').runInContext(app as vm.Context);
+    let leaf = event as { child?: unknown };
+    while (leaf.child) leaf = leaf.child as { child?: unknown };
+    (leaf as { memoizedProps: { onPress: () => void } }).memoizedProps.onPress();
+    const stopped = await call('stop_test_recording');
+    expect(stopped).toContain('1 tap');
+  });
+
+  test('patches a natural scroll view with no pre-existing callbacks', async () => {
+    const app = appWithNaturalScroll();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var scrollProps = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current.memoizedProps;
+      scrollProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      scrollProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 swipe');
+  });
+
+  test('instruments a scroll view identified only by its momentum callback', async () => {
+    const app = appWithMomentumOnlyScroll();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var scrollProps = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current.memoizedProps;
+      scrollProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      scrollProps.onMomentumScrollEnd({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 swipe');
+  });
+
+  test('shares scroll state when a forwarded begin handler gets new end callbacks', async () => {
+    const app = appWithNaturalScroll();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+      var firstProps = {
+        scrollEnabled: true,
+        testID: 'forwarded-scroll',
+        onScrollBeginDrag: function() {},
+        onScrollEndDrag: function() {}
+      };
+      Object.freeze(firstProps);
+      scrollRoot.memoizedProps = firstProps;
+      var forwardedBegin = firstProps.onScrollBeginDrag;
+      var secondProps = {
+        scrollEnabled: true,
+        testID: 'forwarded-scroll',
+        onScrollBeginDrag: forwardedBegin,
+        onScrollEndDrag: function() {}
+      };
+      Object.freeze(secondProps);
+      scrollRoot.memoizedProps = secondProps;
+      secondProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      secondProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 swipe');
+  });
+
+  test('repairs conflicting forwarded scroll states before readiness', async () => {
+    const app = appWithNaturalScroll();
+    let injected = false;
+    const call = await createHarness(app, [testRecorderPlugin], (expression) => {
+      if (injected || !expression.includes('handlerCount')) return;
+      injected = true;
+      vm.runInContext(`
+        var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+        var originalScrollCalls = 0;
+        var firstProps = {
+          scrollEnabled: true,
+          testID: 'conflicting-scroll',
+          onScrollBeginDrag: function() { originalScrollCalls++; },
+          onScrollEndDrag: function() { originalScrollCalls++; }
+        };
+        Object.freeze(firstProps);
+        var secondProps = {
+          scrollEnabled: true,
+          testID: 'conflicting-scroll',
+          onScrollBeginDrag: function() { originalScrollCalls++; },
+          onScrollEndDrag: function() { originalScrollCalls++; }
+        };
+        Object.freeze(secondProps);
+        var conflictingProps = {
+          scrollEnabled: true,
+          testID: 'conflicting-scroll',
+          onScrollBeginDrag: firstProps.onScrollBeginDrag,
+          onScrollEndDrag: secondProps.onScrollEndDrag
+        };
+        Object.freeze(conflictingProps);
+        Object.defineProperty(scrollRoot, 'memoizedProps', {
+          configurable: true,
+          get: function() { return conflictingProps; },
+          set: function() {}
+        });
+      `, app);
+    });
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var repairedProps = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current.memoizedProps;
+      repairedProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      repairedProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 swipe');
+    expect(vm.runInContext('__METRO_MCP_REC_EVENTS__', app)).toHaveLength(1);
+    expect(vm.runInContext('originalScrollCalls', app)).toBe(2);
+  });
+
+  for (const forwardedHandler of ['onScrollEndDrag', 'onMomentumScrollEnd'] as const) {
+    test(`shares scroll state when a forwarded ${forwardedHandler} gets a new begin callback`, async () => {
+      const app = appWithNaturalScroll();
+      const call = await createHarness(app, [testRecorderPlugin]);
+      expect(await call('start_test_recording')).toContain('Recording started');
+      vm.runInContext(`
+        var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+        var firstProps = {
+          scrollEnabled: true,
+          testID: 'forwarded-scroll',
+          onScrollBeginDrag: function() {},
+          onScrollEndDrag: function() {},
+          onMomentumScrollEnd: function() {}
+        };
+        Object.freeze(firstProps);
+        var secondProps = {
+          scrollEnabled: true,
+          testID: 'forwarded-scroll',
+          onScrollBeginDrag: function() {},
+          ${forwardedHandler}: firstProps.${forwardedHandler}
+        };
+        Object.freeze(secondProps);
+        scrollRoot.memoizedProps = secondProps;
+        secondProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+        secondProps.${forwardedHandler}({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+      `, app);
+      expect(await call('stop_test_recording')).toContain('1 swipe');
+      const raw = vm.runInContext('__METRO_MCP_REC_EVENTS__', app) as Array<{ direction?: string }>;
+      expect(raw).toHaveLength(1);
+      expect(raw[0].direction).toBe('up');
+    });
+  }
+
+  test('does not reuse an unfinished scroll from a previous recording session', async () => {
+    const app = appWithNaturalScroll();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+      var scrollProps = {
+        scrollEnabled: true,
+        testID: 'restarted-scroll',
+        onScrollBeginDrag: function() {},
+        onScrollEndDrag: function() {}
+      };
+      Object.freeze(scrollProps);
+      scrollRoot.memoizedProps = scrollProps;
+      scrollProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('No interactions');
+
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(
+      `scrollRoot.memoizedProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });`,
+      app,
+    );
+    expect(await call('stop_test_recording')).toContain('No interactions');
+  });
+
+  test('exposes active status and annotations only after capture activates', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(JSON.parse(await call.resource('metro://recording/status'))).toMatchObject({ isRecording: false });
+    await call('start_test_recording');
+    expect(await call('add_recording_annotation', { note: 'checkpoint' })).toContain('Annotation added');
+    expect(JSON.parse(await call.resource('metro://recording/status'))).toMatchObject({ isRecording: true, eventCount: 1 });
+    await call('stop_test_recording');
+    expect(JSON.parse(await call.resource('metro://recording/status'))).toMatchObject({ isRecording: false });
+  });
+
+  test('does not extend the startup deadline when a commit does not produce wrapped props', async () => {
+    const app = appWithoutFiberRefresh();
+    const originalCommit = vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app);
+    const evaluations: Array<{ expression: string; options?: EvalOptions }> = [];
+    const call = await createHarness(app, [testRecorderPlugin], (expression, options) => {
+      evaluations.push({ expression, options });
+    });
+    const realNow = Date.now;
+    let clockReads = 0;
+    Date.now = () => realNow() + (clockReads++ < 5 ? 0 : 7000);
+    let result: unknown;
+    try {
+      result = await call('start_test_recording');
+    } finally {
+      Date.now = realNow;
+    }
+    expect(String(result)).toContain('coverage did not become ready');
+    expect(evaluations.filter(({ expression }) => expression.includes('handlerCount'))).toHaveLength(1);
+    expect(evaluations.every(({ options }) => (options?.timeout ?? 0) > 0)).toBe(true);
+    expect(vm.runInContext('__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot', app)).toBe(originalCommit);
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_ACTIVE__', app)).toBe(false);
+  });
+
+  test('fails honestly when fiber roots are unavailable', async () => {
+    const app = appWithoutFiberRoots();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    const realNow = Date.now;
+    let clockReads = 0;
+    Date.now = () => realNow() + (clockReads++ < 5 ? 0 : 7000);
+    let result: unknown;
+    try {
+      result = await call('start_test_recording');
+    } finally {
+      Date.now = realNow;
+    }
+    expect(String(result)).toContain('coverage did not become ready');
+    expect(vm.runInContext('globalThis.__METRO_MCP_REC_STATE__', app)).toBeUndefined();
+  });
+
+  test('generates WDIO runner specs for either setup mode without a second session', async () => {
+    const app = appWithDeepButton();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var rootForSpec = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+      var leafForSpec = rootForSpec;
+      while (leafForSpec.child) leafForSpec = leafForSpec.child;
+      leafForSpec.memoizedProps.onPress();
+    `, app);
+    await call('stop_test_recording');
+
+    for (const includeSetup of [true, false]) {
+      const generated = String(await call('generate_test_from_recording', {
+        format: 'appium',
+        platform: 'both',
+        bundleId: `com.example.${includeSetup ? 'one' : 'two'}`,
+        testName: `Flow ${includeSetup ? 'one' : 'two'} quoted`,
+        includeSetup,
+      }));
+      expect(generated).toContain(`import { browser } from '@wdio/globals';`);
+      expect(generated).not.toContain('remote(');
+      expect(generated).not.toContain('deleteSession');
+      expect(generated).not.toContain('beforeAll');
+      expect(generated).not.toContain('afterAll');
+      expect(generated).not.toContain('capabilities');
+      expect(generated).toContain('browser.$("~deep-button").click()');
+      expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+    }
+  });
+
+  test('generates configurable single-platform capabilities without fixed simulator values', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
+    const generated = String(await call('generate_wdio_config', {
+      platform: 'ios',
+      bundleId: "com.example.special'app",
+      appPath: '/tmp/My App.app',
+      udid: 'device-123',
+      deviceName: 'QA phone',
+      platformVersion: '26.5',
+      noReset: false,
+      outputPath: './e2e/wdio.conf.ts',
+    }));
+    expect(generated.match(/"appium:noReset": false/g)).toHaveLength(1);
+    expect(generated).toContain('"appium:udid": "device-123"');
+    expect(generated).toContain('"appium:deviceName": "QA phone"');
+    expect(generated).toContain('"appium:platformVersion": "26.5"');
+    expect(generated).toContain('"appium:app": "/tmp/My App.app"');
+    expect(generated).not.toContain('iPhone 16');
+    expect(generated).not.toContain('18.0');
+    expect(generated).not.toContain('emulator-5554');
+    expect(generated).toContain('config: WebdriverIO.Config');
+    expect(generated).not.toContain('autoCompileOpts');
+    expect(generated).not.toContain('appium: { command');
+    expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('requires per-platform device overrides for both-platform configs', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
+    await expect(call('generate_wdio_config', {
+      platform: 'both',
+      bundleId: 'com.example.app',
+      udid: 'shared-device',
+    })).resolves.toContain('use separate iOS and Android app and device options');
+
+    await expect(call('generate_wdio_config', {
+      platform: 'both',
+      iosBundleId: 'com.example.ios',
+    })).resolves.toContain('provide iosAppPath or iosBundleId and androidAppPath or androidPackageName');
+
+    const generated = String(await call('generate_wdio_config', {
+      platform: 'both',
+      iosBundleId: 'com.example.ios',
+      androidPackageName: 'com.example.android',
+      iosUdid: 'ios-device',
+      androidUdid: 'android-device',
+      iosDeviceName: 'iPhone QA',
+      androidDeviceName: 'Pixel QA',
+      iosPlatformVersion: '18.0',
+      androidPlatformVersion: '35',
+    }));
+    const iosStart = generated.indexOf('"platformName": "iOS"');
+    const androidStart = generated.indexOf('"platformName": "Android"');
+    expect(iosStart).toBeGreaterThanOrEqual(0);
+    expect(androidStart).toBeGreaterThan(iosStart);
+    const iosCaps = generated.slice(iosStart, androidStart);
+    const androidCaps = generated.slice(androidStart);
+    expect(iosCaps).toContain('"appium:udid": "ios-device"');
+    expect(iosCaps).toContain('"appium:deviceName": "iPhone QA"');
+    expect(iosCaps).toContain('"appium:platformVersion": "18.0"');
+    expect(iosCaps).toContain('"appium:bundleId": "com.example.ios"');
+    expect(androidCaps).toContain('"appium:udid": "android-device"');
+    expect(androidCaps).toContain('"appium:deviceName": "Pixel QA"');
+    expect(androidCaps).toContain('"appium:platformVersion": "35"');
+    expect(androidCaps).toContain('"appium:appPackage": "com.example.android"');
+    expect(iosCaps).not.toContain('android-device');
+    expect(androidCaps).not.toContain('ios-device');
+    expect(iosCaps).not.toContain('com.example.android');
+    expect(androidCaps).not.toContain('com.example.ios');
+    expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('keeps both-platform app paths in their matching capabilities', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
+    const generated = String(await call('generate_wdio_config', {
+      platform: 'both',
+      iosAppPath: '/tmp/Example.app',
+      androidAppPath: '/tmp/example.apk',
+    }));
+    const iosStart = generated.indexOf('"platformName": "iOS"');
+    const androidStart = generated.indexOf('"platformName": "Android"');
+    const iosCaps = generated.slice(iosStart, androidStart);
+    const androidCaps = generated.slice(androidStart);
+    expect(iosCaps).toContain('"appium:app": "/tmp/Example.app"');
+    expect(androidCaps).toContain('"appium:app": "/tmp/example.apk"');
+    expect(iosCaps).not.toContain('/tmp/example.apk');
+    expect(androidCaps).not.toContain('/tmp/Example.app');
+  });
+
+  test('uses the connected app ID when config arguments omit an app target', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], 'com.connected.app');
+    const generated = String(await call('generate_wdio_config', { platform: 'ios' }));
+    expect(generated).toContain('"appium:bundleId": "com.connected.app"');
+    expect(generated).toContain('"appium:udid": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"');
+    expect(generated).toContain('"appium:noReset": true');
+    expect(generated).not.toContain('com.example.app');
+    expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+
+  test('uses the verified connected Android serial when inferring the app target', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'emulator-5556',
+      name: 'Pixel QA',
+    });
+    const generated = String(await call('generate_wdio_config', { platform: 'android' }));
+    expect(generated).toContain('"appium:appPackage": "com.connected.android"');
+    expect(generated).toContain('"appium:udid": "emulator-5556"');
+  });
+
+  test('keeps an explicit device override over the verified connected device', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'emulator-5556',
+      name: 'Pixel QA',
+    });
+    const generated = String(await call('generate_wdio_config', {
+      platform: 'android',
+      udid: 'emulator-explicit',
+    }));
+    expect(generated).toContain('"appium:udid": "emulator-explicit"');
+    expect(generated).not.toContain('"appium:udid": "emulator-5556"');
+  });
+
+  test('uses the exact verified device when multiple simulators are booted', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.app',
+      platform: 'ios',
+      id: 'IOS-TARGET',
+      name: 'iPhone Target',
+      inventory: {
+        ios: [
+          { name: 'iPhone Other', udid: 'IOS-OTHER', state: 'Booted', isAvailable: true },
+          { name: 'iPhone Target', udid: 'IOS-TARGET', state: 'Booted', isAvailable: true },
+        ],
+      },
+    });
+    const generated = String(await call('generate_wdio_config', { platform: 'ios' }));
+    expect(generated).toContain('"appium:bundleId": "com.connected.app"');
+    expect(generated).toContain('"appium:udid": "IOS-TARGET"');
+    expect(generated).not.toContain('"appium:udid": "IOS-OTHER"');
+  });
+
+  test('does not reuse a connected app ID for a different requested platform', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'emulator-5554',
+      name: 'Pixel QA',
+    });
+
+    await expect(call('generate_wdio_config', { platform: 'ios' }))
+      .resolves.toContain('discovery selected android');
+
+    const explicit = String(await call('generate_wdio_config', {
+      platform: 'ios',
+      bundleId: 'com.explicit.ios',
+    }));
+    expect(explicit).toContain('"appium:bundleId": "com.explicit.ios"');
+    expect(explicit).not.toContain('com.connected.android');
+  });
+
+  test('compares Android target serials case-sensitively', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'SERIAL-ABC',
+      inventoryId: 'serial-abc',
+      name: 'Pixel QA',
+    });
+
+    await expect(call('generate_wdio_config', { platform: 'android' }))
+      .resolves.toContain('could not be verified as the resolved android device');
+  });
+
+  test('retains normalized Android name verification for opaque inspector IDs', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.android',
+      platform: 'android',
+      id: 'opaque-inspector-id',
+      inventoryId: 'emulator-5554',
+      name: 'Pixel QA',
+    });
+
+    await expect(call('generate_wdio_config', { platform: 'android' }))
+      .resolves.toContain('"appium:appPackage": "com.connected.android"');
+  });
+
+  test('does not treat a sole-device fallback as proof of the app ID platform', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin], {
+      appId: 'com.connected.opaque',
+      platform: 'ios',
+      id: 'AAAAAAAA-BBBB-CCCC-DDDD-FFFFFFFFFFFF',
+      name: 'Unrelated iPhone',
+      opaque: true,
+    });
+
+    await expect(call('generate_wdio_config', { platform: 'ios' }))
+      .resolves.toContain('could not be verified as the resolved ios device');
+  });
+
+  test('rejects an Appium config with no app path, bundle ID, or connected target', async () => {
+    const call = await createHarness(appWithDeepButton(), [testRecorderPlugin]);
+    await expect(call('generate_wdio_config', { platform: 'ios' })).resolves.toContain('without an app target');
+  });
+
+  test('generates W3C actions for recorded long presses and swipes', async () => {
+    const app = appWithDeepButton();
+    vm.runInContext(`
+      var actionRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+      var actionLeaf = actionRoot;
+      while (actionLeaf.child) actionLeaf = actionLeaf.child;
+      actionLeaf.stateNode = null;
+      actionLeaf.memoizedProps = Object.freeze({
+        testID: 'action-button',
+        onPress: function() {},
+        onLongPress: function() {},
+        onChangeText: function() {},
+        onSubmitEditing: function() {},
+        scrollEnabled: true,
+        onScrollBeginDrag: function() {},
+        onScrollEndDrag: function() {}
+      });
+    `, app);
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var actionProps = actionLeaf.memoizedProps;
+      actionProps.onLongPress();
+      actionProps.onChangeText('hello');
+      actionProps.onSubmitEditing();
+      actionProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      actionProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    await call('stop_test_recording');
+    const generated = String(await call('generate_test_from_recording', { format: 'appium' }));
+    expect(generated).toContain('await longPress(');
+    expect(generated).toContain('await swipe(');
+    expect(generated).toContain("await browser.keys(['Enter']);");
+    expect(generated).toContain('browser.performActions');
+    expect(generated).toContain('browser.releaseActions');
+    expect(generated).not.toContain('touchAction');
+    expect(() => new Bun.Transpiler({ loader: 'ts' }).transformSync(generated)).not.toThrow();
+  });
+});

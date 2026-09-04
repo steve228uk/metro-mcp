@@ -1,4 +1,3 @@
-import { readFile } from 'fs/promises';
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import {
@@ -9,51 +8,75 @@ import {
   GET_ROUTE_FUNC_JS,
   MAX_FIBER_DEPTH,
   MAX_FIBER_NODES,
-  SWIPE_COORDS,
   buildFiberReadExpression,
 } from '../utils/fiber.js';
+import {
+  discoverAndroidDevices,
+  discoverBootedSimulators,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
+import { NativeInputController, type NativeDispatchResult, type NativeInputConfig } from '../utils/native-input.js';
+import { isAppEvaluationError } from '../utils/evaluate-app.js';
 
-// Module-level caches — persist across tool handler calls for the lifetime of the server.
-let idbAvailableCache: boolean | null = null;
-let platformCache: { value: 'ios' | 'android' | null; ts: number } | null = null;
-const PLATFORM_TTL_MS = 5000;
+// Connection setup failures happen before Runtime.evaluate is dispatched, so
+// native input remains safe. Any other rejection may follow an app-side action
+// and must stop to avoid duplicate input.
+function isPreDispatchConnectionFailure(error: unknown): boolean {
+  if (isAppEvaluationError(error)) return false;
+  return error instanceof Error && (
+    error.message === 'Not connected to CDP target' ||
+    error.message ===
+      'Not connected to Metro. Use list_devices to check connection status.' ||
+    // ensureConnected raises this exact error before Runtime.evaluate is
+    // submitted. Duration-bearing timeout errors may follow dispatch and
+    // must not trigger a duplicate native action.
+    error.message === 'App evaluation timed out'
+  );
+}
 
 export const uiInteractPlugin = definePlugin({
   name: 'ui-interact',
 
-  description: 'UI automation via fiber tree, simctl, adb, and IDB',
+  description: 'UI automation via React handlers, SimView, IDB, and adb',
 
   async setup(ctx) {
-    async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      const now = Date.now();
-      if (platformCache && now - platformCache.ts < PLATFORM_TTL_MS) return platformCache.value;
-      const [iosResult, androidResult] = await Promise.allSettled([
-        ctx.exec('xcrun simctl list booted 2>/dev/null | grep -q Booted'),
-        ctx.exec('adb devices 2>/dev/null'),
-      ]);
-      let platform: 'ios' | 'android' | null = null;
-      if (iosResult.status === 'fulfilled') {
-        platform = 'ios';
-      } else if (androidResult.status === 'fulfilled') {
-        const output = (androidResult as PromiseFulfilledResult<string>).value;
-        if (output.trim().split('\n').length > 1) platform = 'android';
+    const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
+      resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
+    const nativeInput = new NativeInputController({
+      projectRoot: typeof ctx.config.projectRoot === 'string' ? ctx.config.projectRoot : undefined,
+      config: (ctx.config.input ?? {}) as NativeInputConfig,
+      runner: { execFile: ctx.execFile, exec: ctx.exec },
+      registerCleanup: ctx.registerCleanup,
+      logger: ctx.logger,
+    });
+    const nativeResult = (action: string, dispatch: NativeDispatchResult): string => {
+      const outcome = dispatch.status === 'handled' ? action : `${action} failed`;
+      return `${outcome} [backend=${dispatch.backend}, dispatch=${dispatch.dispatch}, dispatched=${dispatch.dispatched}, status=${dispatch.status}]${dispatch.message ? `: ${dispatch.message}` : ''}`;
+    };
+    const prepareExplicitTarget = async (platform: 'ios' | 'android') => {
+      const connected = getConnectedDeviceTarget(ctx);
+      const logicalId = connected?.reactNative?.logicalDeviceId?.trim();
+      const target = await resolveDevice(ctx, platform, connected);
+      const sameId = (left: string, right: string, idPlatform: 'ios' | 'android') =>
+        idPlatform === 'ios' ? left.toLowerCase() === right.toLowerCase() : left === right;
+      if (!target || !logicalId || !sameId(target.id, logicalId, platform)) {
+        return { target, canUseReact: false };
       }
-      platformCache = { value: platform, ts: now };
-      return platform;
-    }
-
-    async function isIDBAvailable(): Promise<boolean> {
-      if (idbAvailableCache !== null) return idbAvailableCache;
       try {
-        await ctx.exec('which idb 2>/dev/null');
-        idbAvailableCache = true;
+        let oppositeHasId = false;
+        if (platform === 'ios') {
+          const opposite = await discoverAndroidDevices(ctx);
+          oppositeHasId = opposite.some((device) => sameId(device.id, logicalId, 'android'));
+        } else {
+          const opposite = await discoverBootedSimulators(ctx);
+          oppositeHasId = opposite.some((device) => sameId(device.udid, logicalId, 'ios'));
+        }
+        return { target, canUseReact: !oppositeHasId };
       } catch {
-        idbAvailableCache = false;
+        return { target, canUseReact: false };
       }
-      return idbAvailableCache;
-    }
-
-    const IDB_INSTALL = 'Install IDB with: brew install idb-companion';
+    };
 
     ctx.registerTool('list_elements', {
       description:
@@ -104,7 +127,7 @@ export const uiInteractPlugin = definePlugin({
 
     ctx.registerTool('tap_element', {
       description:
-        'Tap an element by label, testID, or coordinates. Uses CDP fiber tree, then simctl/adb, then IDB.',
+        'Tap by label, testID, or logical device-point coordinates. Uses React handlers, then installed SimView or IDB on iOS and adb on Android. Coordinates use native input directly; native results identify the backend and dispatch state.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         label: z.string().optional().describe('Accessibility label, aria-label, or testID to tap'),
@@ -113,88 +136,42 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ label, x, y, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
-
         // ── Coordinate tap ──────────────────────────────────────────────────
         if (x !== undefined && y !== undefined) {
-          if (p === 'android') {
-            await ctx.exec(`adb shell input tap ${x} ${y}`);
-            return `Tapped at (${x}, ${y})`;
-          }
-          // iOS: simctl first (Xcode 14+), then IDB
-          try {
-            await ctx.exec(`xcrun simctl io booted tap ${x} ${y}`);
-            return `Tapped at (${x}, ${y})`;
-          } catch {}
-          if (!(await isIDBAvailable())) {
-            return `Coordinate tap failed. ${IDB_INSTALL}`;
-          }
-          await ctx.exec(`idb ui tap ${x} ${y} --udid booted`);
-          return `Tapped at (${x}, ${y})`;
+          const target = await resolveTarget(platform);
+          if (!target) return 'No simulator/emulator detected.';
+          const dispatch = await nativeInput.tap(target, x, y);
+          return nativeResult(`Tapped at (${x}, ${y})`, dispatch);
         }
 
         if (!label) return 'Provide a label/testID or x,y coordinates.';
 
         // ── Label/testID tap: CDP fiber tree (works on both platforms) ───────
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsLabel = JSON.stringify(label);
-        const tapped = await ctx.evalInApp(`
+        const tapped = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             ${FIND_AND_INVOKE_JS}
             return findAndInvoke(${jsLabel}, 'onPress');
           })()
-        `).catch(() => false);
+        `).catch((error) => {
+          if (!isPreDispatchConnectionFailure(error)) throw error;
+          return false;
+        });
         if (tapped) return `Tapped "${label}"`;
 
-        // ── Android fallback: adb uiautomator ───────────────────────────────
-        if (p === 'android') {
-          const tmpFile = '/tmp/metro-mcp-uidump.xml';
-          let content = '';
-          try {
-            await ctx.exec(
-              `adb shell uiautomator dump /sdcard/uidump.xml && adb pull /sdcard/uidump.xml ${tmpFile} 2>/dev/null`
-            );
-            content = await readFile(tmpFile, 'utf8');
-          } finally {
-            await ctx.exec(`rm -f ${tmpFile}`).catch(() => {});
-          }
-          try {
-            const esc = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const bounds = `"\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`;
-            const match =
-              content.match(new RegExp(`text="${esc}"[^>]*bounds=${bounds}`, 'i')) ||
-              content.match(new RegExp(`content-desc="${esc}"[^>]*bounds=${bounds}`, 'i'));
-            if (match) {
-              const cx = Math.round((parseInt(match[1]) + parseInt(match[3])) / 2);
-              const cy = Math.round((parseInt(match[2]) + parseInt(match[4])) / 2);
-              await ctx.exec(`adb shell input tap ${cx} ${cy}`);
-              return `Tapped "${label}" at (${cx}, ${cy})`;
-            }
-          } catch {}
-          return `Element "${label}" not found.`;
-        }
+        const target = prepared ? prepared.target : await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
 
-        // ── iOS fallback: IDB --by-label ─────────────────────────────────────
-        if (!(await isIDBAvailable())) {
-          return `Element "${label}" not found via fiber tree. ${IDB_INSTALL}`;
-        }
-        try {
-          await ctx.exec(`idb ui tap --by-label "${label}" --udid booted`);
-          return `Tapped "${label}"`;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : '';
-          if (msg.includes('117')) {
-            return `IDB exit 117: companion not running. Try: idb_companion --udid booted &`;
-          }
-          return `Element "${label}" not found.`;
-        }
+        const dispatch = await nativeInput.tapLabel(target, label);
+        return nativeResult(`Tapped "${label}"`, dispatch);
       },
     });
 
     ctx.registerTool('type_text', {
       description:
-        'Type text into an input field. Targets a specific input by testID/label, or the first visible TextInput. Uses CDP fiber tree, then adb/IDB.',
+        'Type text into an input field. Targets a specific input by testID/label, or the first visible TextInput. Uses the React handler first, then SimView or IDB on iOS and the selected ADB serial on Android.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         text: z.string().describe('Text to type'),
@@ -205,75 +182,45 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ text, testID, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
-
         // ── CDP: find TextInput and call onChangeText ─────────────────────────
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsText = JSON.stringify(text);
         const jsTestID = testID ? JSON.stringify(testID) : 'null';
-        const typed = await ctx.evalInApp(`
-          (function() {
-            ${FIBER_ROOT_JS}
-            var targetID = ${jsTestID};
-            var target = null;
-            var stack = [{ f: rootFiber, d: 0 }];
-            while (stack.length && !target) {
-              var item = stack.pop();
-              var fiber = item.f; var depth = item.d;
-              if (!fiber || depth > 200) continue;
-              var name = typeof fiber.type === 'string' ? fiber.type :
-                         (fiber.type && (fiber.type.displayName || fiber.type.name));
-              if (name === 'TextInput') {
-                var props = fiber.memoizedProps || {};
-                if (!targetID || props.testID === targetID || props.accessibilityLabel === targetID) {
-                  target = fiber;
-                }
-              }
-              if (!target) {
-                if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
-              }
-            }
-            if (!target) return false;
-            var props = target.memoizedProps || {};
-            if (props.onChangeText) { props.onChangeText(${jsText}); return true; }
-            if (props.onChange) {
-              props.onChange({ nativeEvent: { text: ${jsText}, target: 0, eventCount: 1 } });
-              return true;
-            }
-            return false;
-          })()
-        `).catch(() => false);
+        const typed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(buildFiberReadExpression(`
+          ${FIBER_ROOT_JS}
+          var targetID = ${jsTestID};
+          var target = null;
+          metroWalkFibers(FIBER_OPTIONS, function(fiber) {
+            if (target) return { prune: true };
+            if (metroFiberName(fiber) !== 'TextInput') return;
+            var props = fiber.memoizedProps || {};
+            if (!targetID || props.testID === targetID || props.accessibilityLabel === targetID) target = fiber;
+            return target ? { prune: true } : undefined;
+          });
+          if (!target) return false;
+          var props = target.memoizedProps || {};
+          if (props.onChangeText) { props.onChangeText(${jsText}); return true; }
+          if (props.onChange) {
+            props.onChange({ nativeEvent: { text: ${jsText}, target: 0, eventCount: 1 } });
+            return true;
+          }
+          return false;
+        `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES })).catch((error) => {
+          if (!isPreDispatchConnectionFailure(error)) throw error;
+          return false;
+        });
         if (typed) return `Typed "${text}"`;
 
-        // ── Android fallback: adb input text ─────────────────────────────────
-        if (p === 'android') {
-          // adb shell input text uses %s for spaces; other shell metacharacters need escaping.
-          const escaped = text
-            .replace(/\\/g, '\\\\')
-            .replace(/ /g, '%s')
-            .replace(/"/g, '\\"')
-            .replace(/&/g, '\\&')
-            .replace(/\|/g, '\\|')
-            .replace(/;/g, '\\;')
-            .replace(/\$/g, '\\$')
-            .replace(/`/g, '\\`');
-          await ctx.exec(`adb shell input text "${escaped}"`);
-          return `Typed "${text}"`;
-        }
-
-        // ── iOS fallback: IDB ─────────────────────────────────────────────────
-        if (!(await isIDBAvailable())) {
-          return `Could not find a TextInput via fiber tree. ${IDB_INSTALL}`;
-        }
-        await ctx.exec(`idb ui text "${text}" --udid booted`);
-        return `Typed "${text}"`;
+        const target = prepared ? prepared.target : await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+        const dispatch = await nativeInput.typeText(target, text);
+        return nativeResult(`Typed "${text}"`, dispatch);
       },
     });
 
     ctx.registerTool('long_press', {
       description:
-        'Long press an element by label/testID, or at coordinates. Uses CDP fiber tree, then adb/IDB.',
+        'Long press using a React handler by label/testID, then semantic native input through SimView or IDB when the handler is unavailable. Explicit coordinates use native input directly; native results identify the backend and dispatch state.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         label: z.string().optional().describe('Accessibility label or testID of the element to long press'),
@@ -283,58 +230,60 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ label, x, y, duration, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
-
         // ── CDP: find element by label/testID and call onLongPress ────────────
-        if (label) {
+        const hasCoordinates = x !== undefined && y !== undefined;
+        const prepared = label && !hasCoordinates && platform !== 'auto'
+          ? await prepareExplicitTarget(platform)
+          : undefined;
+        if (label && !hasCoordinates) {
           const jsLabel = JSON.stringify(label);
-          const pressed = await ctx.evalInApp(`
+          const pressed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
               return findAndInvoke(${jsLabel}, 'onLongPress');
             })()
-          `).catch(() => false);
+          `).catch((error) => {
+            if (!isPreDispatchConnectionFailure(error)) throw error;
+            return false;
+          });
           if (pressed) return `Long pressed "${label}"`;
         }
 
         // ── Coordinate fallbacks ──────────────────────────────────────────────
         if (x !== undefined && y !== undefined) {
-          if (p === 'android') {
-            await ctx.exec(`adb shell input swipe ${x} ${y} ${x} ${y} ${duration}`);
-            return `Long pressed at (${x}, ${y}) for ${duration}ms`;
-          }
-          if (!(await isIDBAvailable())) {
-            return `Coordinate long press requires IDB on iOS. ${IDB_INSTALL}`;
-          }
-          await ctx.exec(`idb ui long-press ${x} ${y} --duration ${duration / 1000} --udid booted`);
-          return `Long pressed at (${x}, ${y}) for ${duration}ms`;
+          const target = await resolveTarget(platform);
+          if (!target) return 'No simulator/emulator detected.';
+          const dispatch = await nativeInput.longPress(target, x, y, duration);
+          return nativeResult(`Long pressed at (${x}, ${y}) for ${duration}ms`, dispatch);
         }
 
-        return label
-          ? `Element "${label}" not found or has no onLongPress handler. Provide x,y coordinates as fallback.`
-          : 'Provide a label/testID or x,y coordinates.';
+        if (label) {
+          const target = prepared ? prepared.target : await resolveTarget(platform);
+          if (!target) return 'No simulator/emulator detected.';
+          const dispatch = await nativeInput.longPressLabel(target, label, duration);
+          return nativeResult(`Long pressed "${label}"`, dispatch);
+        }
+
+        return 'Provide a label/testID or x,y coordinates.';
       },
     });
 
     ctx.registerTool('swipe', {
       description:
-        'Swipe or scroll in a direction. Tries CDP ScrollView scrollTo, then adb/IDB.',
+        'Scroll through React, then use installed SimView or IDB on iOS and the selected ADB serial on Android. Native results identify the backend and dispatch state.',
       annotations: { destructiveHint: false },
       parameters: z.object({
         direction: z.enum(['up', 'down', 'left', 'right']).describe('Swipe direction'),
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ direction, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
-
         let result: string | null = null;
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
 
         // ── CDP: find ScrollView and invoke scrollTo on its native node ────────
         const jsDir = JSON.stringify(direction);
-        const scrolled = await ctx.evalInApp(`
+        const scrolled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             var dir = ${jsDir};
@@ -360,42 +309,37 @@ export const uiInteractPlugin = definePlugin({
             if (!hf || !hf.stateNode) return false;
             var node = hf.stateNode;
             var delta = 400;
-            try {
-              if (typeof node.scrollTo === 'function') {
-                node.scrollTo({
-                  x: dir === 'left' ? delta : dir === 'right' ? -delta : 0,
-                  y: dir === 'up' ? delta : dir === 'down' ? -delta : 0,
-                  animated: true,
-                });
-                return true;
-              }
-              if (typeof node.scrollToOffset === 'function') {
-                node.scrollToOffset({ offset: dir === 'up' ? delta : 0, animated: true });
-                return true;
-              }
-            } catch(e) {}
+            if (typeof node.scrollTo === 'function') {
+              node.scrollTo({
+                x: dir === 'left' ? delta : dir === 'right' ? -delta : 0,
+                y: dir === 'up' ? delta : dir === 'down' ? -delta : 0,
+                animated: true,
+              });
+              return true;
+            }
+            if (typeof node.scrollToOffset === 'function') {
+              node.scrollToOffset({ offset: dir === 'up' ? delta : 0, animated: true });
+              return true;
+            }
             return false;
           })()
-        `).catch(() => false);
+        `).catch((error) => {
+          if (!isPreDispatchConnectionFailure(error)) throw error;
+          return false;
+        });
         if (scrolled) result = `Swiped ${direction}`;
 
         if (!result) {
-          // ── Native fallbacks (fixed midpoint coordinates) ───────────────────
-          const [sx, sy, ex, ey] = SWIPE_COORDS[direction];
-
-          if (p === 'android') {
-            await ctx.exec(`adb shell input swipe ${sx} ${sy} ${ex} ${ey} 300`);
-            result = `Swiped ${direction}`;
-          } else if (!(await isIDBAvailable())) {
-            return `Swipe requires IDB on iOS. ${IDB_INSTALL}`;
-          } else {
-            await ctx.exec(`idb ui swipe ${sx} ${sy} ${ex} ${ey} --udid booted`);
-            result = `Swiped ${direction}`;
-          }
+          const target = prepared ? prepared.target : await resolveTarget(platform);
+          if (!target) return 'No simulator/emulator detected.';
+          // ── Native fallback using current device geometry ───────────────────
+          const dispatch = await nativeInput.swipeDirection(target, direction, 300);
+          result = nativeResult(`Swiped ${direction}`, dispatch);
+          if (dispatch.status !== 'handled') return result;
         }
 
         // ── Log to test recorder if a recording is active ─────────────────────
-        await ctx.evalInApp(`
+        if (prepared?.canUseReact ?? true) await ctx.evalInApp(`
           (function() {
             if (!globalThis.__METRO_MCP_REC_ACTIVE__) return;
             ${GET_ROUTE_FUNC_JS}
@@ -420,96 +364,119 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ button, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return 'No simulator/emulator detected.';
-
-        // ── Android: adb keycodes ─────────────────────────────────────────────
-        if (p === 'android') {
-          const keycodes: Record<string, number> = {
-            HOME: 3, BACK: 4, VOLUME_UP: 24, VOLUME_DOWN: 25,
-            POWER: 26, ENTER: 66, DELETE: 67,
-          };
-          await ctx.exec(`adb shell input keyevent ${keycodes[button]}`);
-          return `Pressed ${button}`;
-        }
-
-        // ── iOS HOME: simctl (no IDB needed) ──────────────────────────────────
-        if (button === 'HOME') {
-          try {
-            await ctx.exec(
-              'xcrun simctl spawn booted launchctl kickstart -k system/com.apple.SpringBoard 2>/dev/null'
-            );
-            return 'Pressed HOME';
-          } catch {}
-        }
-
-        // ── iOS ENTER/DELETE: CDP on focused TextInput ─────────────────────────
-        if (p === 'ios' && button === 'ENTER') {
-          const submitted = await ctx.evalInApp(`
-            (function() {
-              ${FIBER_ROOT_JS}
-              var target = null;
-              var stack = [{ f: rootFiber, d: 0 }];
-              while (stack.length && !target) {
-                var item = stack.pop();
-                var fiber = item.f; var depth = item.d;
-                if (!fiber || depth > 200) continue;
-                var name = typeof fiber.type === 'string' ? fiber.type :
-                           (fiber.type && (fiber.type.displayName || fiber.type.name));
-                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onSubmitEditing) {
-                  target = fiber;
-                }
-                if (!target) {
-                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
-                }
+        const prepared = (button === 'ENTER' || button === 'DELETE') && platform !== 'auto'
+          ? await prepareExplicitTarget(platform)
+          : undefined;
+        // ── ENTER/DELETE: bounded CDP handler on every platform ───────────────
+        if (button === 'ENTER' || button === 'DELETE') {
+          const handler = button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText';
+          const handled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(buildFiberReadExpression(`
+            var handled = false;
+            var nativeRequired = false;
+            metroWalkFibers(FIBER_OPTIONS, function(fiber) {
+              if (handled || nativeRequired || metroFiberName(fiber) !== 'TextInput') return;
+              var props = fiber.memoizedProps || {};
+              if (typeof props[${JSON.stringify(handler)}] !== 'function') return;
+              // Uncontrolled inputs keep their authoritative text natively;
+              // their props.value may be absent or stale, so a synthetic
+              // handler would submit or delete the wrong value.
+              if (typeof props.value !== 'string') return;
+              var current = fiber;
+              var focused = false;
+              var inspected = 0;
+              while (current && inspected++ < 32) {
+                var node = current.stateNode;
+                var instance = node && node.canonical && node.canonical.publicInstance ||
+                               node && node.publicInstance ||
+                               node && node.__internalInstanceHandle &&
+                                 node.__internalInstanceHandle.stateNode &&
+                                 node.__internalInstanceHandle.stateNode.canonical &&
+                                 node.__internalInstanceHandle.stateNode.canonical.publicInstance ||
+                               node;
+                try {
+                  if (instance && typeof instance.isFocused === 'function' && instance.isFocused() === true) {
+                    focused = true;
+                    break;
+                  }
+                } catch (e) {}
+                current = current.child;
               }
-              if (!target) return false;
-              target.memoizedProps.onSubmitEditing({ nativeEvent: { text: target.memoizedProps.value || '' } });
-              return true;
-            })()
-          `).catch(() => false);
-          if (submitted) return 'Pressed ENTER';
-        }
-
-        if (p === 'ios' && button === 'DELETE') {
-          const deleted = await ctx.evalInApp(`
-            (function() {
-              ${FIBER_ROOT_JS}
-              var target = null;
-              var stack = [{ f: rootFiber, d: 0 }];
-              while (stack.length && !target) {
-                var item = stack.pop();
-                var fiber = item.f; var depth = item.d;
-                if (!fiber || depth > 200) continue;
-                var name = typeof fiber.type === 'string' ? fiber.type :
-                           (fiber.type && (fiber.type.displayName || fiber.type.name));
-                if (name === 'TextInput' && fiber.memoizedProps && fiber.memoizedProps.onChangeText) {
-                  target = fiber;
+              if (!focused) return;
+              if (${JSON.stringify(button)} === 'ENTER') {
+                var submitBehavior = props.submitBehavior;
+                if (typeof submitBehavior !== 'string') {
+                  if (props.blurOnSubmit === true) submitBehavior = 'blurAndSubmit';
+                  else if (props.blurOnSubmit === false) submitBehavior = 'newline';
+                  else submitBehavior = props.multiline === true ? 'newline' : 'blurAndSubmit';
                 }
-                if (!target) {
-                  if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-                  if (fiber.child) stack.push({ f: fiber.child, d: depth + 1 });
+                if (submitBehavior === 'newline') {
+                  nativeRequired = true;
+                  return { prune: true };
                 }
+                props.onSubmitEditing({ nativeEvent: { text: props.value } });
+                if (submitBehavior === 'blurAndSubmit' && instance &&
+                  typeof instance.blur === 'function') instance.blur();
+              } else {
+                var value = props.value;
+                // A controlled value does not reveal the native caret. Only
+                // synthesize DELETE when React exposes a valid UTF-16
+                // selection; otherwise let the native provider preserve the
+                // current selection and key-event behavior.
+                var selection = props.selection;
+                if (!selection || typeof selection !== 'object' ||
+                  typeof selection.start !== 'number' || typeof selection.end !== 'number' ||
+                  selection.start !== selection.start || selection.end !== selection.end ||
+                  selection.start % 1 !== 0 || selection.end % 1 !== 0 ||
+                  selection.start < 0 || selection.end < selection.start ||
+                  selection.end > value.length) {
+                  nativeRequired = true;
+                  return { prune: true };
+                }
+                var start = selection.start;
+                var end = selection.end;
+                // A stale or malformed selection which splits a surrogate
+                // pair must be resolved by the native input.
+                if ((start > 0 && start < value.length &&
+                    value.charCodeAt(start - 1) >= 0xd800 && value.charCodeAt(start - 1) <= 0xdbff &&
+                    value.charCodeAt(start) >= 0xdc00 && value.charCodeAt(start) <= 0xdfff) ||
+                  (end > 0 && end < value.length &&
+                    value.charCodeAt(end - 1) >= 0xd800 && value.charCodeAt(end - 1) <= 0xdbff &&
+                    value.charCodeAt(end) >= 0xdc00 && value.charCodeAt(end) <= 0xdfff)) {
+                  nativeRequired = true;
+                  return { prune: true };
+                }
+                if (start === end) {
+                  if (start === 0) {
+                    nativeRequired = true;
+                    return { prune: true };
+                  }
+                  start -= 1;
+                  // Remove one complete Unicode code point. Hermes supports
+                  // these primitive operations on all supported RN versions.
+                  if (start > 0 &&
+                    value.charCodeAt(start) >= 0xdc00 && value.charCodeAt(start) <= 0xdfff &&
+                    value.charCodeAt(start - 1) >= 0xd800 && value.charCodeAt(start - 1) <= 0xdbff) {
+                    start -= 1;
+                  }
+                }
+                props.onChangeText(value.slice(0, start) + value.slice(end));
               }
-              if (!target) return false;
-              var val = (target.memoizedProps.value || '').slice(0, -1);
-              target.memoizedProps.onChangeText(val);
-              return true;
-            })()
-          `).catch(() => false);
-          if (deleted) return 'Pressed DELETE';
+              handled = true;
+              return { prune: true };
+            });
+            return handled && !nativeRequired;
+          `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES })).catch((error) => {
+            if (!isPreDispatchConnectionFailure(error)) throw error;
+            return false;
+          });
+          if (handled) return `Pressed ${button}`;
         }
 
-        // ── iOS fallback: IDB ─────────────────────────────────────────────────
-        if (!(await isIDBAvailable())) {
-          return `Button ${button} requires IDB on iOS. ${IDB_INSTALL}`;
-        }
-        const idbMap: Record<string, string> = {
-          HOME: 'HOME', VOLUME_UP: 'VOLUME_UP', VOLUME_DOWN: 'VOLUME_DOWN', POWER: 'LOCK', BACK: 'HOME',
-        };
-        await ctx.exec(`idb ui button ${idbMap[button] || button} --udid booted`);
-        return `Pressed ${button}`;
+        const target = prepared ? prepared.target : await resolveTarget(platform);
+        if (!target) return 'No simulator/emulator detected.';
+
+        const dispatch = await nativeInput.button(target, button);
+        return nativeResult(`Pressed ${button}`, dispatch);
       },
     });
   },

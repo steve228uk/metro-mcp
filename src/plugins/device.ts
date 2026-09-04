@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import { reloadApp } from '../utils/reload-app.js';
 import {
   scanMetroPorts,
   fetchTargets,
@@ -95,41 +96,12 @@ export const devicePlugin = definePlugin({
     });
 
     ctx.registerTool('reload_app', {
-      description: 'Reload the React Native app. Tries the Metro HTTP endpoint first, falls back to CDP evaluation.',
-      annotations: { idempotentHint: true },
-      parameters: z.object({}),
-      handler: async () => {
-        // Try Metro HTTP reload endpoint first (most reliable)
-        try {
-          const response = await ctx.metro.fetch('/reload');
-          if (response.ok) return 'App reloaded via Metro.';
-        } catch {
-          // Metro endpoint not available, try CDP fallback
-        }
-
-        // Fallback: evaluate DevSettings.reload() in the app
-        try {
-          const result = await ctx.evalInApp(
-            `(function() {
-              try {
-                var DevSettings = require('react-native/Libraries/Utilities/DevSettings');
-                if (DevSettings && DevSettings.reload) { DevSettings.reload(); return 'ok'; }
-              } catch(e) {}
-              try {
-                var NativeModules = require('react-native').NativeModules;
-                if (NativeModules.DevSettings) { NativeModules.DevSettings.reload(); return 'ok'; }
-              } catch(e) {}
-              return 'no reload method found';
-            })()`
-          );
-          if (result === 'no reload method found') {
-            return 'Could not find a reload method. The app may not support programmatic reload.';
-          }
-          return 'App reload triggered.';
-        } catch (err) {
-          return `Could not reload app: ${err instanceof Error ? err.message : String(err)}`;
-        }
-      },
+      description: 'Reload the connected app and verify a fresh runtime. Uses Page.reload, with a directed Metro message fallback only for a verified app/device peer.',
+      parameters: z.object({
+        timeout: z.number().int().min(100).max(60000).default(15000)
+          .describe('Maximum time in milliseconds to submit and verify the reload'),
+      }),
+      handler: async ({ timeout }) => reloadApp(ctx, timeout),
     });
 
     ctx.registerResource('metro://status', {

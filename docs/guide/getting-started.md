@@ -11,6 +11,23 @@ Works with **Expo**, **bare React Native**, and any project using **Metro + Herm
 - **Android**: Android SDK with `adb` on your PATH
 - **IDB** _(optional)_: Some iOS operations fall back to [IDB (idb-companion)](https://github.com/facebook/idb) — install with `brew install idb-companion`. Tools will tell you when IDB is needed.
 
+Native input providers can be selected in `metro-mcp.config.ts` without installing anything automatically:
+
+```ts
+export default {
+  input: {
+    nativeBackend: 'auto', // 'auto' | 'simview' | 'idb'
+    // Commands may include literal arguments; paths containing spaces may be quoted.
+    // simviewCommand: '/path/to/simview', // the `mcp` subcommand is added when omitted
+    // idbCommand: '/path/to/idb',
+  },
+};
+```
+
+On iOS, `auto` uses the packaged SimView MCP interface when available and falls back to supported IDB commands. Coordinates are logical screen points and are normalized against the selected device's current geometry.
+
+Provider discovery only runs read-only probes. IDB installations that do not implement `--version` are accepted when their help output advertises the supported UI commands.
+
 ## Installation
 
 ### Claude Code

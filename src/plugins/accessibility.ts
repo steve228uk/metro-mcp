@@ -1,6 +1,14 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
 import { escapeJsString } from '../utils/format.js';
+import {
+  buildFiberReadExpression,
+  DEFAULT_FIBER_MAX_DEPTH,
+  DEFAULT_FIBER_MAX_NODES,
+  MAX_FIBER_DEPTH,
+  MAX_FIBER_NODES,
+  type FiberTraversalMetadata,
+} from '../utils/fiber.js';
 
 interface AccessibilityIssue {
   component: string;
@@ -15,19 +23,7 @@ export const accessibilityPlugin = definePlugin({
   description: 'Accessibility auditing via fiber tree inspection',
 
   async setup(ctx) {
-    const AUDIT_EXPR = `
-      (function() {
-        var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-        if (!hook || !hook.getFiberRoots) return null;
-
-        var fiberRoots;
-        for (var i = 1; i <= 5; i++) {
-          fiberRoots = hook.getFiberRoots(i);
-          if (fiberRoots && fiberRoots.size > 0) break;
-        }
-        if (!fiberRoots || fiberRoots.size === 0) return null;
-
-        var rootFiber = Array.from(fiberRoots)[0].current;
+    const AUDIT_BODY = `
         var issues = [];
 
         var TOUCHABLE_TYPES = [
@@ -39,30 +35,35 @@ export const accessibilityPlugin = definePlugin({
 
         var INPUT_TYPES = ['TextInput', 'TextField'];
 
-        function auditFiber(fiber, depth) {
-          if (!fiber || depth > 50) return;
-
-          var name = fiber.type?.displayName || fiber.type?.name;
-          if (!name || typeof name !== 'string') {
-            auditFiber(fiber.child, depth + 1);
-            auditFiber(fiber.sibling, depth);
-            return;
+        var records = [];
+        var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber, context) {
+          var name = metroFiberName(fiber);
+          var record = {
+            name: name,
+            props: fiber.memoizedProps || {},
+            hasTextChild: false,
+            childrenComplete: !fiber.child
+          };
+          var parent = context.parentContext;
+          if (parent) {
+            if (name === 'Text' || name === 'RCTText') parent.hasTextChild = true;
+            if (!fiber.sibling) parent.childrenComplete = true;
           }
+          records.push(record);
+          return { childContext: record };
+        });
 
-          var props = fiber.memoizedProps || {};
+        for (var record of records) {
+          var name = record.name;
+          if (!name || typeof name !== 'string') continue;
+          var props = record.props;
 
           // Check touchable elements
           if (TOUCHABLE_TYPES.indexOf(name) >= 0 || props.onPress) {
             if (!props.accessibilityLabel && !props['aria-label']) {
-              // Check if it has text children
-              var hasTextChild = false;
-              var child = fiber.child;
-              while (child) {
-                var cn = child.type?.displayName || child.type?.name;
-                if (cn === 'Text' || cn === 'RCTText') { hasTextChild = true; break; }
-                child = child.sibling;
-              }
-              if (!hasTextChild) {
+              // Only report an absent text label when all immediate children
+              // were inspected by the bounded walker.
+              if (!record.hasTextChild && record.childrenComplete) {
                 issues.push({
                   component: name,
                   issue: 'Missing accessibilityLabel on interactive element',
@@ -129,37 +130,47 @@ export const accessibilityPlugin = definePlugin({
             }
           }
 
-          auditFiber(fiber.child, depth + 1);
-          auditFiber(fiber.sibling, depth);
         }
-
-        auditFiber(rootFiber, 0);
-        return issues;
-      })()
+        return { issues: issues, traversal: traversal };
     `;
 
     ctx.registerTool('audit_accessibility', {
       description:
-        'Run a full accessibility audit on the current screen. Checks for missing labels, roles, testIDs, alt text, and more.',
+        'Audit the current screen within bounded Fiber traversal limits. Checks labels, roles, testIDs, and alt text; returns issues, summary, and traversal coverage.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
         severity: z.enum(['all', 'error', 'warning', 'info']).default('all').describe('Filter by severity level'),
+        maxDepth: z.number().int().min(0).max(MAX_FIBER_DEPTH).default(DEFAULT_FIBER_MAX_DEPTH)
+          .describe('Maximum Fiber depth to inspect'),
+        maxNodes: z.number().int().min(1).max(MAX_FIBER_NODES).default(DEFAULT_FIBER_MAX_NODES)
+          .describe('Maximum Fibers to inspect'),
       }),
-      handler: async ({ severity }) => {
-        const issues = (await ctx.evalInApp(AUDIT_EXPR)) as AccessibilityIssue[] | null;
-        if (!issues) return 'Could not access component tree for audit.';
-        if (issues.length === 0) return 'No accessibility issues found!';
-
-        const filtered = severity === 'all' ? issues : issues.filter((i) => i.severity === severity);
-
-        const errorCount = issues.filter((i) => i.severity === 'error').length;
-        const warnCount = issues.filter((i) => i.severity === 'warning').length;
-        const infoCount = issues.filter((i) => i.severity === 'info').length;
-
-        return {
-          summary: `${issues.length} issues found: ${errorCount} errors, ${warnCount} warnings, ${infoCount} info`,
-          issues: filtered,
+      handler: async ({ severity, maxDepth, maxNodes }) => {
+        const result = (await ctx.evalInApp(buildFiberReadExpression(
+          AUDIT_BODY, { maxDepth, maxNodes },
+        ))) as { issues: AccessibilityIssue[]; traversal: FiberTraversalMetadata } | null;
+        const issues = result?.issues ?? [];
+        const traversal: FiberTraversalMetadata = result?.traversal ?? {
+          scope: 'all-scenes',
+          complete: false,
+          scannedNodes: 0,
+          depthReached: 0,
+          truncationReason: 'fiber-roots-unavailable',
         };
+        const filtered: AccessibilityIssue[] = [];
+        const counts = { error: 0, warning: 0, info: 0 };
+        for (const issue of issues) {
+          counts[issue.severity]++;
+          if (severity === 'all' || issue.severity === severity) filtered.push(issue);
+        }
+
+        let summary = `${issues.length} issues found: ${counts.error} errors, ${counts.warning} warnings, ${counts.info} info`;
+        if (!traversal.complete) {
+          summary = `Audit incomplete (${traversal.truncationReason}). ${summary}. Results cover only inspected components.`;
+        } else if (issues.length === 0) {
+          summary = 'No accessibility issues found!';
+        }
+        return { summary, issues: filtered, traversal };
       },
     });
 

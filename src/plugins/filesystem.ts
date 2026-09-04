@@ -1,5 +1,10 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
+import {
+  adbPrefix,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
 
 const MAX_BYTES_DEFAULT = 50 * 1024;  // 50 KB
 const MAX_BYTES_CAP     = 1024 * 1024; // 1 MB
@@ -17,27 +22,8 @@ export const filesystemPlugin = definePlugin({
     '(Documents, Library/Caches, temp). Supports iOS Simulator and Android.',
 
   async setup(ctx) {
-    // Cache the detected platform for the lifetime of this plugin session so
-    // tools with platform:'auto' don't re-run xcrun/adb on every call.
-    let detectedPlatform: 'ios' | 'android' | null | undefined;
-
-    async function detectPlatform(): Promise<'ios' | 'android' | null> {
-      if (detectedPlatform !== undefined) return detectedPlatform;
-      try {
-        const out = await ctx.exec('xcrun simctl list booted 2>/dev/null');
-        if (out.includes('Booted')) return (detectedPlatform = 'ios');
-      } catch {}
-      try {
-        const out = await ctx.exec('adb devices 2>/dev/null');
-        const connected = out
-          .trim()
-          .split('\n')
-          .slice(1)
-          .filter((l) => l.trim() && !l.startsWith('*'));
-        if (connected.length > 0) return (detectedPlatform = 'android');
-      } catch {}
-      return (detectedPlatform = null);
-    }
+    const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
+      resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
 
     function assertSafePath(p: string): void {
       if (p.split('/').includes('..')) {
@@ -45,9 +31,9 @@ export const filesystemPlugin = definePlugin({
       }
     }
 
-    async function getIosContainer(bundleId: string): Promise<string> {
+    async function getIosContainer(bundleId: string, udid?: string): Promise<string> {
       const out = await ctx.exec(
-        `xcrun simctl get_app_container booted "${bundleId}" data`
+        `xcrun simctl get_app_container "${udid ?? 'booted'}" "${bundleId}" data`
       );
       return out.trim();
     }
@@ -107,13 +93,26 @@ export const filesystemPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ bundleId, platform }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return { error: 'No simulator/emulator detected' };
+        let target: Awaited<ReturnType<typeof resolveTarget>> = null;
+        try {
+          target = await resolveTarget(platform);
+        } catch (error) {
+          // Directory discovery has an in-app fallback that works without a
+          // local device transport. Keep explicit iOS strict because its
+          // bundle container path must come from simctl; auto and Android may
+          // continue through the connected app.
+          if (platform === 'ios') throw error;
+          target = null;
+        }
+        if (!target && platform === 'ios') {
+          return { error: 'No simulator/emulator detected' };
+        }
 
-        if (p === 'ios') {
+        if (target?.platform === 'ios') {
+          if (!target) return { error: 'No simulator/emulator detected' };
           if (!bundleId) return { error: 'bundleId is required for iOS' };
           try {
-            const root = await getIosContainer(bundleId);
+            const root = await getIosContainer(bundleId, target.id);
             return {
               root,
               documents: `${root}/Documents`,
@@ -129,11 +128,12 @@ export const filesystemPlugin = definePlugin({
         }
 
         // Android — try adb first, fall back to evalInApp
-        if (bundleId) {
+        if (bundleId && target?.platform === 'android') {
           try {
-            const homeOut = await ctx.exec(
-              `adb shell ${runAs(bundleId)}sh -c 'echo $HOME' 2>/dev/null`
-            );
+            const homeOut = target
+              ? await ctx.exec(`${adbPrefix(target.id)} shell ${runAs(bundleId)}sh -c 'echo $HOME' 2>/dev/null`)
+              : '';
+            if (!homeOut) throw new Error('adb device unavailable');
             const home = homeOut.trim() || `/data/data/${bundleId}`;
             return {
               root:      home,
@@ -198,15 +198,16 @@ export const filesystemPlugin = definePlugin({
           .describe('Recursively list subdirectories (returns raw text)'),
       }),
       handler: async ({ path, bundleId, platform, recursive }) => {
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return { error: 'No simulator/emulator detected' };
+        const target = await resolveTarget(platform);
+        if (!target) return { error: 'No simulator/emulator detected' };
+        const p = target.platform;
 
         let targetPath = path;
         if (!targetPath) {
           if (!bundleId) return { error: 'Provide either path or bundleId' };
           targetPath =
             p === 'ios'
-              ? await getIosContainer(bundleId)
+              ? await getIosContainer(bundleId, target.id)
               : `/data/data/${bundleId}`;
         }
 
@@ -217,7 +218,7 @@ export const filesystemPlugin = definePlugin({
           const output =
             p === 'ios'
               ? await ctx.exec(`ls ${flags} "${targetPath}" 2>&1`)
-              : await ctx.exec(`adb shell ${runAs(bundleId)}ls ${flags} "${targetPath}" 2>&1`);
+              : await ctx.exec(`${adbPrefix(target.id)} shell ${runAs(bundleId)}ls ${flags} "${targetPath}" 2>&1`);
 
           if (recursive) return output;
           return parseLsOutput(output, targetPath);
@@ -253,8 +254,9 @@ export const filesystemPlugin = definePlugin({
       handler: async ({ path, bundleId, platform, encoding, maxBytes }) => {
         assertSafePath(path);
         const limit = Math.min(maxBytes, MAX_BYTES_CAP);
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return { error: 'No simulator/emulator detected' };
+        const target = await resolveTarget(platform);
+        if (!target) return { error: 'No simulator/emulator detected' };
+        const p = target.platform;
 
         try {
           let content: string;
@@ -270,8 +272,8 @@ export const filesystemPlugin = definePlugin({
             const ra = runAs(bundleId);
             content =
               encoding === 'base64'
-                ? await ctx.exec(`adb shell ${ra}sh -c 'dd if="${path}" bs=${limit} count=1 2>/dev/null | base64'`)
-                : await ctx.exec(`adb shell ${ra}dd if="${path}" bs=${limit} count=1 2>/dev/null`);
+                ? await ctx.exec(`${adbPrefix(target.id)} shell ${ra}sh -c 'dd if="${path}" bs=${limit} count=1 2>/dev/null | base64'`)
+                : await ctx.exec(`${adbPrefix(target.id)} shell ${ra}dd if="${path}" bs=${limit} count=1 2>/dev/null`);
           }
 
           const truncated = encoding === 'base64'
@@ -300,14 +302,15 @@ export const filesystemPlugin = definePlugin({
       }),
       handler: async ({ path, bundleId, platform }) => {
         assertSafePath(path);
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return { error: 'No simulator/emulator detected' };
+        const target = await resolveTarget(platform);
+        if (!target) return { error: 'No simulator/emulator detected' };
+        const p = target.platform;
 
         try {
           const output =
             p === 'ios'
               ? await ctx.exec(`ls -lad "${path}" 2>&1`)
-              : await ctx.exec(`adb shell ${runAs(bundleId)}ls -lad "${path}" 2>&1`);
+              : await ctx.exec(`${adbPrefix(target.id)} shell ${runAs(bundleId)}ls -lad "${path}" 2>&1`);
 
           const info = parseFileInfoLine(output, path);
           return info ?? output.trim();
@@ -340,14 +343,15 @@ export const filesystemPlugin = definePlugin({
           return { error: 'Deletion not confirmed. Pass confirm: true to proceed.' };
         }
         assertSafePath(path);
-        const p = platform === 'auto' ? await detectPlatform() : platform;
-        if (!p) return { error: 'No simulator/emulator detected' };
+        const target = await resolveTarget(platform);
+        if (!target) return { error: 'No simulator/emulator detected' };
+        const p = target.platform;
 
         try {
           if (p === 'ios') {
             await ctx.exec(`rm -f "${path}"`);
           } else {
-            await ctx.exec(`adb shell ${runAs(bundleId)}rm "${path}"`);
+            await ctx.exec(`${adbPrefix(target.id)} shell ${runAs(bundleId)}rm "${path}"`);
           }
           return { success: true, deleted: path };
         } catch (err) {

@@ -32,7 +32,11 @@ Jump to: [Console](#console) · [Network](#network) · [Errors](#errors) · [Eva
 - **`list_devices`** — List connected debuggable targets from Metro.
 - **`get_app_info`** — Bundle URL, platform, device name, VM type.
 - **`get_connection_status`** — CDP connection state and Metro status.
-- **`reload_app`** — Reload the app. Tries Metro's HTTP reload endpoint first, then falls back to `DevSettings.reload()` via CDP.
+- **`reload_app`** — Request `Page.reload` and verify that a unique runtime marker disappears
+  on the same app. Returns separate dispatch and verification status; a submitted command
+  alone does not mean the app restarted. If CDP explicitly lacks reload support, the Metro
+  message fallback is directed only to a peer whose app and device identity match. Ambiguous
+  responses never trigger a second reload. `timeout` defaults to 15000ms (maximum 60000ms).
 
 ## Environment
 
@@ -109,7 +113,14 @@ Browse and read files inside the app's private sandbox. Useful for inspecting SQ
 ## Deep Link
 
 - **`open_deeplink`** — Open a URL or deep link on the device.
-- **`list_url_schemes`** — List registered URL schemes.
+- **`list_url_schemes`** — List registered URL schemes. On iOS this reads
+  `CFBundleURLTypes` from the selected installed app's `Info.plist` using its
+  concrete simulator UDID. Provide `bundleId` to inspect a specific app, or
+  omit it to use the connected Metro target's app ID. Android uses the
+  package manager dump on the selected device serial for compatibility.
+  `platform` accepts `ios`, `android`, or the default `auto`; selecting an
+  explicit platform requires `bundleId` so an app ID from a connected target
+  on another platform is never reused.
 
 ## Permissions
 
@@ -123,18 +134,20 @@ Inspect and manage app permissions on iOS Simulator and Android Emulator without
 - **`grant_permission`** — Grant a permission to the app.
 - **`revoke_permission`** — Revoke a permission from the app.
 - **`reset_permissions`** — Reset one or all permissions to their default state. On iOS, omit `service` to reset everything. On Android, omit `service` to reset all runtime permissions (falls back to `pm clear` on older devices).
-- **`open_app_settings`** — Open the app's system settings page. On iOS, opens the Settings panel for the frontmost app. On Android, requires a bundle ID / package name.
+- **`open_app_settings`** — Open the connected app's system settings page via React Native
+  `Linking.openSettings()` and await completion. An optional bundle ID must match the connected
+  app. Reports unsupported capability when the app does not expose Linking through Metro.
 
 ## UI Interact
 
-All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB as a last resort. IDB is optional — tools will prompt you to install it when needed.
+UI actions try the connected app's React handlers first. Coordinate actions then use the installed SimView MCP provider on iOS, followed by supported IDB commands; Android actions use the selected ADB serial. Native results include the backend and whether dispatch was submitted, refused, or uncertain. Providers are optional and are detected with read-only probes.
 
 - **`list_elements`** — Get interactive elements from the React component tree (labels, testIDs, roles) with traversal completeness metadata. No IDB needed.
-- **`tap_element`** — Tap by label/testID (CDP fiber tree) or coordinates (simctl/adb → IDB fallback).
-- **`type_text`** — Type into a TextInput by testID/label or the first visible input (CDP → adb → IDB).
-- **`long_press`** — Long press by label/testID (CDP) or coordinates (adb → IDB).
-- **`swipe`** — Scroll/swipe in a direction (CDP ScrollView → adb → IDB).
-- **`press_button`** — Press HOME (simctl), BACK/ENTER/DELETE (CDP + adb), VOLUME/POWER (adb → IDB).
+- **`tap_element`** — Tap by label/testID through the React fiber tree, or send logical device-point coordinates directly through SimView/IDB on iOS or the selected ADB serial on Android.
+- **`type_text`** — Type into a TextInput by testID/label or the first visible input (bounded Fiber handler → SimView → IDB on iOS, or the selected ADB serial on Android). Native results include the provider and dispatch status.
+- **`long_press`** — Long press through a React handler by label/testID, or send logical device-point coordinates through the native provider.
+- **`swipe`** — Scroll through a React handler, or derive a directional native swipe from the current device geometry.
+- **`press_button`** — Invoke React text-input handlers for ENTER/DELETE before using a supported native button capability.
 
 ## Navigation
 
@@ -142,14 +155,24 @@ All tools use the CDP fiber tree first, falling back to `simctl`/`adb`, then IDB
 
 - **`get_navigation_state`** — Full React Navigation / Expo Router state.
 - **`get_current_route`** — Currently focused route name and params.
+- **`wait_for_navigation`** — Wait for a focused route by name (up to the supplied timeout). Uses
+  the same SDK, navigation ref, Expo state, and bounded Fiber discovery as `get_current_route`,
+  including nested navigators. It also succeeds when the requested route is already focused.
 - **`get_route_history`** — Navigation back stack.
-- **`list_routes`** — All registered route names.
+- **`list_routes`** — Sorted, deduplicated registered and mounted route names from all
+  available navigation state, including unvisited screens in `routeNames`. Nested navigators
+  that have not initialized their state cannot be discovered.
 
 ## Accessibility
 
 > No app changes needed.
 
-- **`audit_accessibility`** — Full screen audit for missing labels, roles, testIDs, alt text.
+- **`audit_accessibility`** — Audit the current screen for missing labels, roles, testIDs, and alt
+  text. Always returns `{ issues, summary, traversal }`, including clean results. `maxDepth`
+  defaults to 200 (maximum 600); `maxNodes` defaults to 1200 (maximum 5000). Check
+  `traversal.complete` before treating an empty issue list as a clean audit. Incomplete results
+  report their truncation reason; increase the limits to inspect deeper or wider trees. Severity
+  filters affect `issues`, while the summary counts all findings in the inspected portion.
 - **`check_element_accessibility`** — Deep check on a specific component.
 - **`get_accessibility_summary`** — Counts overview of accessibility coverage.
 
@@ -179,10 +202,10 @@ See the [profiling guide](profiling.md) for a full explanation of CDP CPU profil
 
 Records real user interactions via React fiber patching — no app code changes required. See the [testing guide](testing.md) for full details.
 
-- **`start_test_recording`** — Inject interaction interceptors into the running app. Captures taps, text entry, long presses, keyboard submits, and scroll/swipe gestures. Re-patches new fibers after each navigation so newly-loaded screens are always covered.
+- **`start_test_recording`** — Install interaction interceptors, refresh mounted props, and wait for complete bounded React fiber coverage before enabling capture. Captures taps, text entry, long presses, keyboard submits, and scroll/swipe gestures. Re-patches new fibers after each navigation so newly-loaded screens are always covered; startup fails and cleans up when the bounded scan cannot confirm coverage.
 - **`stop_test_recording`** — Stop recording and retrieve the captured event log. Deduplicates rapid-fire text input events (keeps the final value per field).
-- **`generate_test_from_recording`** — Convert the recording to a test file. Params: `format` (appium/maestro/detox), `testName`, `platform` (ios/android/both), `bundleId`, `includeSetup`.
-- **`generate_wdio_config`** — Generate a minimal `wdio.conf.ts` for Appium + React Native, including the install command for all required packages.
+- **`generate_test_from_recording`** — Convert the recording to a test file. Params: `format` (appium/maestro/detox), `testName`, `platform` (ios/android/both), `bundleId`, `includeSetup`. Appium output is a Mocha-compatible WDIO spec that uses the runner-owned `browser` session.
+- **`generate_wdio_config`** — Generate a minimal `wdio.conf.ts` for Appium + React Native, including the install command for all required packages. Optional `udid`, `deviceName`, and `platformVersion` values select a device without embedding fixed simulator defaults. For `platform: both`, use `iosBundleId` or `iosAppPath` and `androidPackageName` or `androidAppPath`, together with the matching per-platform device options. `noReset` defaults to `true` to preserve the installed app and its data during replay.
 
 ## Chrome DevTools
 

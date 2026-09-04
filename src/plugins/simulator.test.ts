@@ -16,6 +16,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { z } from 'zod';
+import type { MetroTarget } from 'metro-bridge';
 import type {
   ComponentNode,
   PluginContext,
@@ -48,6 +49,9 @@ async function createSimulatorHarness(
     execError?: Error;
     captureSize?: number;
     execFileCalls?: Array<{ command: string; args: string[] }>;
+    androidOutput?: string;
+    targetId?: string;
+    connected?: boolean;
   } = {},
 ) {
   const tools = new Map<string, RegisteredTool>();
@@ -59,13 +63,21 @@ async function createSimulatorHarness(
     });
   };
   const writeCapture = options.writeCapture ?? true;
+  const target: MetroTarget | null = options.targetId ? {
+    id: 'test-target',
+    title: 'Test app',
+    description: 'React Native',
+    type: 'node',
+    deviceName: 'Pixel_8',
+    reactNative: { logicalDeviceId: options.targetId },
+  } : null;
 
   const ctx: PluginContext = {
     cdp: {
       on: () => {},
       off: () => {},
-      isConnected: false,
-      getTarget: () => null,
+      isConnected: options.connected ?? false,
+      getTarget: () => target,
       send: async () => ({}),
     },
     events: {
@@ -92,6 +104,18 @@ async function createSimulatorHarness(
     exec: async () => '',
     execFile: async (command, args) => {
       options.execFileCalls?.push({ command, args });
+      if (command === 'xcrun' && args.slice(0, 4).join(' ') === 'simctl list devices booted') {
+        return Buffer.from(JSON.stringify({
+          devices: {
+            'com.apple.CoreSimulator.SimRuntime.iOS-18-0': [
+              { name: 'iPhone 16', udid: 'SIMULATOR-UDID', state: 'Booted' },
+            ],
+          },
+        }));
+      }
+      if (command === 'adb' && args.join(' ') === 'devices -l') {
+        return Buffer.from(options.androidOutput ?? 'List of devices attached\nemulator-5554\tdevice product:pixel_8 model:Pixel_8 device:husky\n');
+      }
       const path = command === 'xcrun' ? args.at(-1) : undefined;
       if (writeCapture && path) {
         createdFiles.add(path);
@@ -129,6 +153,19 @@ async function capture(
 }
 
 describe('take_screenshot', () => {
+  test('resolves a replacement sole simulator when the Metro target is stale', async () => {
+    const tool = await createSimulatorHarness({
+      targetId: 'stale-target-id',
+      androidOutput: 'List of devices attached\n',
+    });
+
+    const result = await capture(tool, { platform: 'auto' });
+
+    expect(result).toMatchObject({
+      structuredContent: { platform: 'ios' },
+    });
+  });
+
   test('uses direct executable arguments instead of shell path quoting', async () => {
     const execFileCalls: Array<{ command: string; args: string[] }> = [];
     const tool = await createSimulatorHarness({ execFileCalls });
@@ -136,17 +173,32 @@ describe('take_screenshot', () => {
     await capture(tool, { platform: 'ios' });
     await capture(tool, { platform: 'android' });
 
-    expect(execFileCalls[0].command).toBe('xcrun');
-    expect(execFileCalls[0].args.slice(0, -1)).toEqual([
+    expect(execFileCalls[1].command).toBe('xcrun');
+    expect(execFileCalls[1].args.slice(0, -1)).toEqual([
       'simctl',
       'io',
-      'booted',
+      'SIMULATOR-UDID',
       'screenshot',
     ]);
-    expect(execFileCalls[0].args.at(-1)?.startsWith(tmpdir())).toBe(true);
-    expect(execFileCalls[1]).toEqual({
+    expect(execFileCalls[1].args.at(-1)?.startsWith(tmpdir())).toBe(true);
+    expect(execFileCalls[3]).toEqual({
       command: 'adb',
-      args: ['exec-out', 'screencap', '-p'],
+      args: ['-s', 'emulator-5554', 'exec-out', 'screencap', '-p'],
+    });
+  });
+
+  test('scopes Android dispatch to the connected serial when several devices are authorized', async () => {
+    const execFileCalls: Array<{ command: string; args: string[] }> = [];
+    const tool = await createSimulatorHarness({
+      execFileCalls,
+      targetId: 'emulator-2',
+      connected: true,
+      androidOutput: 'List of devices attached\nemulator-1\tdevice model:Pixel_8\nemulator-2\tdevice model:Pixel_9\n',
+    });
+    await capture(tool, { platform: 'android' });
+    expect(execFileCalls.at(-1)).toEqual({
+      command: 'adb',
+      args: ['-s', 'emulator-2', 'exec-out', 'screencap', '-p'],
     });
   });
 

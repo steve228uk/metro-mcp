@@ -295,9 +295,14 @@ const DEVTOOLS_START_EXPR = `(function() {
   if (typeof hook.onCommitFiberRoot === 'undefined') return { error: 'no-hook-method' };
   var orig = hook.onCommitFiberRoot;
   var commits = [];
-  hook.onCommitFiberRoot = function(rendererID, root, priorityLevel) {
+  var profilerState = { active: true, commits: commits, orig: orig, wrapper: null, max: 500 };
+  var wrapper = function(rendererID, root, priorityLevel) {
+    if (!profilerState.active) {
+      if (orig) try { orig.call(this, rendererID, root, priorityLevel); } catch(e) {}
+      return;
+    }
     if (orig) try { orig.call(this, rendererID, root, priorityLevel); } catch(e) {}
-    if (commits.length >= MAX_COMMITS) return;
+    if (commits.length >= profilerState.max) return;
     var components = [];
     var stack = root && root.current ? [root.current] : [];
     var depth = 0;
@@ -320,8 +325,11 @@ const DEVTOOLS_START_EXPR = `(function() {
       commits.push({ timestamp: Date.now(), duration: (root && root.current && root.current.actualDuration) || 0, components: components });
     }
   };
-  var MAX_COMMITS = 500;
-  globalThis.__METRO_MCP_PROFILER__ = { commits: commits, orig: orig, max: MAX_COMMITS };
+  wrapper.__mcpProfilerState = profilerState;
+  wrapper.__mcpProfilerPrevious = orig;
+  profilerState.wrapper = wrapper;
+  hook.onCommitFiberRoot = wrapper;
+  globalThis.__METRO_MCP_PROFILER__ = profilerState;
   return { ok: true, method: 'commit-hook', count: 1 };
 })()`;
 
@@ -360,7 +368,24 @@ const DEVTOOLS_STOP_EXPR = `(function() {
   // Path 2: commit-hook patch
   var profiler = globalThis.__METRO_MCP_PROFILER__;
   if (!profiler) return null;
-  if (hook) hook.onCommitFiberRoot = profiler.orig;
+  profiler.active = false;
+  // Another plugin may have chained a newer commit hook on top of this one.
+  // Restore our predecessor only when this wrapper is still installed; leave
+  // the newer hook intact in the other case.
+  if (hook && hook.onCommitFiberRoot === profiler.wrapper) {
+    var predecessor = profiler.orig;
+    var seen = new Set();
+    while (predecessor) {
+      if (seen.has(predecessor) || seen.size >= 1000) { predecessor = undefined; break; }
+      seen.add(predecessor);
+      if (predecessor.__mcpRecState && !predecessor.__mcpRecState.active)
+        predecessor = predecessor.__mcpRecPrevious;
+      else if (predecessor.__mcpProfilerState && !predecessor.__mcpProfilerState.active)
+        predecessor = predecessor.__mcpProfilerPrevious;
+      else break;
+    }
+    hook.onCommitFiberRoot = predecessor;
+  }
   var data = profiler.commits.slice();
   globalThis.__METRO_MCP_PROFILER__ = undefined;
   return data;

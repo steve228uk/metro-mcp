@@ -6,7 +6,11 @@ import {
 } from '@modelcontextprotocol/client';
 import { InMemoryTransport } from '@modelcontextprotocol/server';
 import { loadConfig } from '../src/config.js';
-import { createMetroRuntime, startHttpServer } from '../src/server.js';
+import {
+  createMetroRuntime,
+  startHttpServer,
+  updateMetroEndpoint,
+} from '../src/server.js';
 
 const clients: Client[] = [];
 let server: Awaited<ReturnType<typeof startHttpServer>> | undefined;
@@ -33,6 +37,10 @@ async function startTestServer(plugins: string[] = []) {
 const nativeResultPlugin = resolve(
   import.meta.dir,
   'fixtures/native-result-plugin.ts',
+);
+const metroEndpointPlugin = resolve(
+  import.meta.dir,
+  'fixtures/metro-endpoint-plugin.ts',
 );
 
 async function expectNativeImageResult(modern: boolean): Promise<void> {
@@ -189,5 +197,32 @@ describe('direct stdio compatibility', () => {
 
   test('delivers legacy resource updates through resources/subscribe', async () => {
     await expectDirectStdioResourceUpdate(false);
+  });
+});
+
+describe('plugin Metro endpoint', () => {
+  test('tracks endpoint discovery after plugin setup and remains writable', async () => {
+    const config = await loadConfig(['--project-root', process.cwd()]);
+    config.metro.host = '127.0.0.1';
+    config.metro.port = 65535;
+    config.metro.autoDiscover = false;
+    config.proxy.enabled = false;
+    config.plugins = [metroEndpointPlugin];
+    server = await startHttpServer(config, ['--project-root', process.cwd()], {
+      port: 0,
+    });
+
+    // Discovery and secondary-proxy attachment update this config after plugin
+    // contexts are created. Both endpoint fields must move together.
+    updateMetroEndpoint(config, 'metro-primary.local', 8123);
+    const client = createClient(server.url, true);
+    await client.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+
+    const result = await client.callTool({
+      name: 'test_metro_endpoint',
+      arguments: {},
+    });
+    expect(JSON.parse(result.content[0]?.type === 'text' ? result.content[0].text : '{}'))
+      .toEqual({ host: 'metro-primary.local', port: 8123 });
   });
 });

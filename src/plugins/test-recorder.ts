@@ -1,9 +1,20 @@
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 import { readdir, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { definePlugin } from '../plugin.js';
-import { GET_ROUTE_FUNC_JS, SWIPE_COORDS } from '../utils/fiber.js';
+import {
+  getConnectedDeviceTarget,
+  resolveDevice,
+  type ConnectedDeviceTarget,
+  type ResolvedDevice,
+} from '../utils/device-discovery.js';
+import {
+  FIBER_WALKER_JS,
+  GET_ROUTE_FUNC_JS,
+  buildFiberReadExpression,
+} from '../utils/fiber.js';
 
 // ── Resolve current navigation route from the nav ref set by the navigation plugin.
 const CURRENT_ROUTE_JS = `
@@ -19,192 +30,456 @@ const CURRENT_ROUTE_JS = `
   })()
 `;
 
-// ── JS injected into the app runtime to intercept interactions.
-// React Native (Hermes, dev mode) calls Object.freeze(props) inside createElement
-// while props are still mutable. We intercept Object.freeze to wrap handlers at
-// that moment — no need to find React or mutate already-frozen memoizedProps.
-const START_RECORDING_JS = `
+function targetIdentifiesResolvedDevice(
+  target: ConnectedDeviceTarget,
+  device: ResolvedDevice,
+): boolean {
+  const targetId = target.reactNative?.logicalDeviceId?.trim();
+  if (targetId) {
+    if (device.platform === 'android') {
+      if (targetId === device.id) return true;
+      if (targetId.toLowerCase() === device.id.toLowerCase()) return false;
+    }
+    if (targetId.toLowerCase() === device.id.toLowerCase()) return true;
+  }
+
+  const targetName = target.deviceName?.trim();
+  if (!targetName || !device.name) return false;
+  if (device.platform === 'ios') return targetName === device.name;
+  const adbModelName = Buffer.from(targetName, 'utf8')
+    .toString('latin1')
+    .replace(/[^a-zA-Z0-9]/g, '_');
+  return adbModelName === device.name;
+}
+
+// ── JS injected into the app runtime to install the recorder instrumentation.
+// Instrumentation and capture are deliberately separate. The first phase wraps
+// future props, schedules refreshes for already-mounted props, and is followed
+// by a bounded readiness scan. Capture is enabled only after that scan succeeds,
+// so the first interaction after start_test_recording returns cannot be missed.
+const RECORDING_HANDLERS = [
+  'onPress', 'onLongPress', 'onChangeText', 'onSubmitEditing',
+  'onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd',
+];
+const SCROLLABLE_PROPS_JS = `
+  function isScrollable(props) {
+    return 'scrollEventThrottle' in props || 'extraScrollHeight' in props ||
+      'showsVerticalScrollIndicator' in props || 'showsHorizontalScrollIndicator' in props ||
+      'keyboardShouldPersistTaps' in props || 'keyboardDismissMode' in props ||
+      'scrollEnabled' in props || typeof props.onScrollBeginDrag === 'function' ||
+      typeof props.onScrollEndDrag === 'function' ||
+      typeof props.onMomentumScrollEnd === 'function';
+  }
+`;
+
+const RECORDER_METADATA_JS = `
+  function hasMetadata(fn, tid, lbl, kind) {
+    var metadata = fn && fn.__mcpRecMetadata;
+    return typeof fn === 'function' && fn.__mcpRecSession === state.sessionId &&
+      metadata && metadata.testID === tid && metadata.label === lbl && metadata.kind === kind;
+  }
+`;
+
+const START_RECORDING_JS = (sessionId: string, epoch: string, attemptOrder: number) => `
 (function() {
   var hook = globalThis.__REACT_DEVTOOLS_GLOBAL_HOOK__;
   if (!hook || !hook.getFiberRoots) return false;
 
-  globalThis.__METRO_MCP_REC_EVENTS__ = [];
-  globalThis.__METRO_MCP_REC_ACTIVE__ = true;
+  // Concurrent starts can be evaluated out of order. Once a later attempt
+  // from this server instance has installed a recorder, an older attempt must
+  // leave it intact rather than cleaning it up and taking ownership back.
+  var currentState = globalThis.__METRO_MCP_REC_STATE__;
+  if (currentState && currentState.epoch === ${JSON.stringify(epoch)} &&
+      Number(currentState.attemptOrder) > ${attemptOrder}) {
+    return { __mcpRecorderSession: ${JSON.stringify(RECORDER_SESSION_REPLACED)} };
+  }
+
+  // A previous session may have been interrupted by a disconnected CDP
+  // session. Clean it up when it is still the current installation.
+  if (typeof globalThis.__METRO_MCP_REC_CLEANUP__ === 'function') {
+    try { globalThis.__METRO_MCP_REC_CLEANUP__(); } catch (_) {}
+  }
+
+  var state = {
+    sessionId: ${JSON.stringify(sessionId)},
+    epoch: ${JSON.stringify(epoch)},
+    attemptOrder: ${attemptOrder},
+    capture: false,
+    active: true,
+    ready: false,
+    invocationDepth: 0,
+    events: []
+  };
+  globalThis.__METRO_MCP_REC_STATE__ = state;
+  globalThis.__METRO_MCP_REC_EVENTS__ = state.events;
 
   ${GET_ROUTE_FUNC_JS}
 
-  // ── Intercept Object.freeze: wrap event handlers before React freezes props ──
+  var HANDLERS = ${JSON.stringify(RECORDING_HANDLERS)};
+
+  function isWrapped(fn) {
+    return typeof fn === 'function' && fn.__mcpRecSession === state.sessionId;
+  }
+
+  ${RECORDER_METADATA_JS}
+
+  function record(event) {
+    if (state.capture && globalThis.__METRO_MCP_REC_STATE__ === state)
+      state.events.push(event);
+  }
+
+  function invokeOriginal(original, receiver, args, makeEvent) {
+    var outermost = state.invocationDepth === 0;
+    state.invocationDepth++;
+    try {
+      if (outermost && state.capture && globalThis.__METRO_MCP_REC_STATE__ === state) {
+        try { record(makeEvent(args)); } catch (_) {}
+      }
+      return original.apply(receiver, args);
+    } finally {
+      state.invocationDepth--;
+    }
+  }
+
+  function wrap(obj, name, tid, lbl, makeEvent) {
+    var original = obj[name];
+    if (typeof original !== 'function' || hasMetadata(original, tid, lbl, name)) return false;
+    var wrapped = function() {
+      return invokeOriginal(original, this, arguments, makeEvent);
+    };
+    try {
+      Object.defineProperty(wrapped, '__mcpRecSession', { value: state.sessionId });
+      Object.defineProperty(wrapped, '__mcpRecOriginal', { value: original });
+      Object.defineProperty(wrapped, '__mcpRecMetadata', { value: { testID: tid, label: lbl, kind: name } });
+      obj[name] = wrapped;
+      return obj[name] === wrapped;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  ${SCROLLABLE_PROPS_JS}
+
+  function wrapProps(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+    var tid = obj.testID || null;
+    var lbl = obj.accessibilityLabel || obj['aria-label'] || null;
+    var wrapped = false;
+    wrapped = wrap(obj, 'onPress', tid, lbl, function() {
+      return { type: 'tap', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() };
+    }) || wrapped;
+    wrapped = wrap(obj, 'onLongPress', tid, lbl, function() {
+      return { type: 'long_press', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() };
+    }) || wrapped;
+    wrapped = wrap(obj, 'onChangeText', tid, lbl, function(args) {
+      return { type: 'type', testID: tid, label: lbl, text: args[0], route: getRoute(), timestamp: Date.now() };
+    }) || wrapped;
+    wrapped = wrap(obj, 'onSubmitEditing', tid, lbl, function() {
+      return { type: 'submit', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() };
+    }) || wrapped;
+
+    if (isScrollable(obj)) {
+      var originalBegin = obj.onScrollBeginDrag;
+      var originalEnd = obj.onScrollEndDrag;
+      var originalMomentumEnd = obj.onMomentumScrollEnd;
+      // A forwarded scroll callback can already belong to a previous props
+      // object. Keep mutable gesture state with every wrapper so any existing
+      // begin, end, or momentum callback can share it with newly created peers.
+      function existingScrollState(fn) {
+        return fn && fn.__mcpRecSession === state.sessionId && fn.__mcpRecScrollState;
+      }
+      var scrollStates = [];
+      var existingStates = [originalBegin, originalEnd, originalMomentumEnd];
+      for (var stateIndex = 0; stateIndex < existingStates.length; stateIndex++) {
+        var existingState = existingScrollState(existingStates[stateIndex]);
+        if (existingState && scrollStates.indexOf(existingState) < 0) scrollStates.push(existingState);
+      }
+      var scrollStateConflict = scrollStates.length > 1;
+      var scrollStart = scrollStates[0] || { x: null, y: null };
+      function unwrapScrollHandler(fn) {
+        var seen = new Set();
+        while (fn && fn.__mcpRecSession === state.sessionId && fn.__mcpRecOriginal && !seen.has(fn)) {
+          seen.add(fn);
+          fn = fn.__mcpRecOriginal;
+        }
+        return fn;
+      }
+      if (scrollStateConflict) {
+        // Forwarded props can combine callbacks from separate renders. Rebuild
+        // the complete callback set around one state so begin/end cannot split
+        // a gesture between independent recorder sessions.
+        originalBegin = unwrapScrollHandler(originalBegin);
+        originalEnd = unwrapScrollHandler(originalEnd);
+        originalMomentumEnd = unwrapScrollHandler(originalMomentumEnd);
+      }
+      function tagScrollWrapper(fn, kind, original) {
+        Object.defineProperty(fn, '__mcpRecSession', { value: state.sessionId });
+        Object.defineProperty(fn, '__mcpRecOriginal', { value: original });
+        Object.defineProperty(fn, '__mcpRecMetadata', { value: { testID: tid, label: lbl, kind: kind } });
+        Object.defineProperty(fn, '__mcpRecScrollState', { value: scrollStart });
+      }
+      if (scrollStateConflict || !hasMetadata(originalBegin, tid, lbl, 'onScrollBeginDrag')) {
+        var begin = function(e) {
+          var outermost = state.invocationDepth === 0;
+          state.invocationDepth++;
+          try {
+            if (outermost) {
+              try {
+                scrollStart.x = e.nativeEvent.contentOffset.x;
+                scrollStart.y = e.nativeEvent.contentOffset.y;
+              } catch (_) { scrollStart.x = scrollStart.y = null; }
+            }
+            return originalBegin ? originalBegin.apply(this, arguments) : undefined;
+          } finally { state.invocationDepth--; }
+        };
+        try {
+          tagScrollWrapper(begin, 'onScrollBeginDrag', originalBegin);
+          obj.onScrollBeginDrag = begin;
+          wrapped = obj.onScrollBeginDrag === begin || wrapped;
+        } catch (_) {}
+      }
+      function emitSwipe(e) {
+        if (state.invocationDepth !== 1 || scrollStart.x === null || !state.capture || globalThis.__METRO_MCP_REC_STATE__ !== state) return;
+        try {
+          var dx = e.nativeEvent.contentOffset.x - scrollStart.x;
+          var dy = e.nativeEvent.contentOffset.y - scrollStart.y;
+          if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+            var direction = Math.abs(dx) > Math.abs(dy)
+              ? (dx > 0 ? 'left' : 'right')
+              : (dy > 0 ? 'up' : 'down');
+            var last = state.events[state.events.length - 1];
+            if (!(last && last.type === 'swipe' && Date.now() - last.timestamp < 100))
+              record({ type: 'swipe', direction: direction, testID: tid, route: getRoute(), timestamp: Date.now() });
+          }
+        } catch (_) {}
+        scrollStart.x = scrollStart.y = null;
+      }
+      if (scrollStateConflict || !hasMetadata(originalEnd, tid, lbl, 'onScrollEndDrag')) {
+        var end = function(e) {
+          state.invocationDepth++;
+          try { emitSwipe(e); return originalEnd ? originalEnd.apply(this, arguments) : undefined; }
+          finally { state.invocationDepth--; }
+        };
+        try {
+          tagScrollWrapper(end, 'onScrollEndDrag', originalEnd);
+          obj.onScrollEndDrag = end;
+          wrapped = obj.onScrollEndDrag === end || wrapped;
+        } catch (_) {}
+      }
+      if (scrollStateConflict || !hasMetadata(originalMomentumEnd, tid, lbl, 'onMomentumScrollEnd')) {
+        var momentum = function(e) {
+          state.invocationDepth++;
+          try { emitSwipe(e); return originalMomentumEnd ? originalMomentumEnd.apply(this, arguments) : undefined; }
+          finally { state.invocationDepth--; }
+        };
+        try {
+          tagScrollWrapper(momentum, 'onMomentumScrollEnd', originalMomentumEnd);
+          obj.onMomentumScrollEnd = momentum;
+          wrapped = obj.onMomentumScrollEnd === momentum || wrapped;
+        } catch (_) {}
+      }
+    }
+    return wrapped;
+  }
+
+  // React Native (Hermes, dev mode) freezes props while they are still
+  // mutable. Wrap handlers at that point, before the freeze is applied.
   var origFreeze = Object.freeze;
   Object.freeze = function(obj) {
-    if (globalThis.__METRO_MCP_REC_ACTIVE__ && obj && typeof obj === 'object' && !Array.isArray(obj) && !obj.__mcpRec) {
-      var tid = obj.testID || null;
-      var lbl = obj.accessibilityLabel || obj['aria-label'] || null;
-
-      var wrapped = false;
-      if (typeof obj.onPress === 'function') {
-        var op = obj.onPress;
-        obj.onPress = function(e) {
-          if (globalThis.__METRO_MCP_REC_ACTIVE__)
-            globalThis.__METRO_MCP_REC_EVENTS__.push({ type: 'tap', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() });
-          return op.call(this, e);
-        };
-        wrapped = true;
-      }
-      if (typeof obj.onLongPress === 'function') {
-        var olp = obj.onLongPress;
-        obj.onLongPress = function(e) {
-          if (globalThis.__METRO_MCP_REC_ACTIVE__)
-            globalThis.__METRO_MCP_REC_EVENTS__.push({ type: 'long_press', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() });
-          return olp.call(this, e);
-        };
-        wrapped = true;
-      }
-      if (typeof obj.onChangeText === 'function') {
-        var oct = obj.onChangeText;
-        obj.onChangeText = function(val) {
-          if (globalThis.__METRO_MCP_REC_ACTIVE__)
-            globalThis.__METRO_MCP_REC_EVENTS__.push({ type: 'type', testID: tid, label: lbl, text: val, route: getRoute(), timestamp: Date.now() });
-          return oct.call(this, val);
-        };
-        wrapped = true;
-      }
-      if (typeof obj.onSubmitEditing === 'function') {
-        var ose = obj.onSubmitEditing;
-        obj.onSubmitEditing = function(e) {
-          if (globalThis.__METRO_MCP_REC_ACTIVE__)
-            globalThis.__METRO_MCP_REC_EVENTS__.push({ type: 'submit', testID: tid, label: lbl, route: getRoute(), timestamp: Date.now() });
-          return ose.call(this, e);
-        };
-        wrapped = true;
-      }
-      // Detect scroll containers: check for ScrollView/KeyboardAwareScrollView-specific
-      // props. Using 'in' (not !== undefined) catches props explicitly set to undefined.
-      // obj is already confirmed to be a non-array object via the outer guard
-      var isScrollable =
-        'scrollEventThrottle'            in obj ||
-        'extraScrollHeight'              in obj ||
-        'showsVerticalScrollIndicator'   in obj ||
-        'showsHorizontalScrollIndicator' in obj ||
-        'keyboardShouldPersistTaps'      in obj ||
-        'keyboardDismissMode'            in obj ||
-        'scrollEnabled'                  in obj ||
-        typeof obj.onScrollBeginDrag === 'function' ||
-        typeof obj.onScrollEndDrag   === 'function';
-      if (isScrollable) {
-        var scrollStart = { x: null, y: null };
-        var origBegin       = obj.onScrollBeginDrag   || null;
-        var origEnd         = obj.onScrollEndDrag     || null;
-        var origMomentumEnd = obj.onMomentumScrollEnd || null;
-        obj.onScrollBeginDrag = function(e) {
-          scrollStart.x = e.nativeEvent.contentOffset.x;
-          scrollStart.y = e.nativeEvent.contentOffset.y;
-          if (origBegin) origBegin.call(this, e);
-        };
-        var emitSwipeIfMoved = function(e) {
-          if (scrollStart.x !== null && globalThis.__METRO_MCP_REC_ACTIVE__) {
-            var dx = e.nativeEvent.contentOffset.x - scrollStart.x;
-            var dy = e.nativeEvent.contentOffset.y - scrollStart.y;
-            if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
-              var dir = Math.abs(dx) > Math.abs(dy)
-                ? (dx > 0 ? 'left' : 'right')
-                : (dy > 0 ? 'up'   : 'down');
-              var evts = globalThis.__METRO_MCP_REC_EVENTS__;
-              var last = evts[evts.length - 1];
-              if (!(last && last.type === 'swipe' && Date.now() - last.timestamp < 100))
-                evts.push({ type: 'swipe', direction: dir, testID: tid, route: getRoute(), timestamp: Date.now() });
-            }
-            scrollStart.x = null;
-          }
-        };
-        obj.onScrollEndDrag = function(e) {
-          emitSwipeIfMoved(e);
-          if (origEnd) origEnd.call(this, e);
-        };
-        obj.onMomentumScrollEnd = function(e) {
-          emitSwipeIfMoved(e);
-          if (origMomentumEnd) origMomentumEnd.call(this, e);
-        };
-        wrapped = true;
-      }
-      if (wrapped) obj.__mcpRec = true;
-    }
+    if (globalThis.__METRO_MCP_REC_STATE__ === state) wrapProps(obj);
     return origFreeze.call(this, obj);
   };
 
-  // ── Force re-render of already-mounted scroll containers ────────────────────
-  // Object.freeze only fires on future renders. For scroll views mounted before
-  // recording started, we trigger a one-time re-render so our freeze interceptor
-  // can wrap their handlers.
-  (function() {
-    var renderer = null;
-    hook.renderers.forEach(function(r) { if (!renderer) renderer = r; });
-
-    function isScrollFiber(fiber) {
-      var cn = typeof fiber.type === 'string'
-        ? fiber.type
-        : (fiber.type && (fiber.type.displayName || fiber.type.name)) || '';
-      // String checks before regex — faster for the common case
-      if (cn === 'ScrollView' || cn === 'FlatList' || cn === 'SectionList' ||
-          cn === 'VirtualizedList' || cn === 'FlashList' || cn === 'BigList' ||
-          cn === 'RecyclerListView' || cn === 'MasonryFlashList') return true;
-      if (/ScrollView|List/i.test(cn)) return true;
-      var p = fiber.memoizedProps;
-      return !!(p && typeof p === 'object' && (
-        'scrollEventThrottle'            in p || 'extraScrollHeight'              in p ||
-        'showsVerticalScrollIndicator'   in p || 'showsHorizontalScrollIndicator' in p ||
-        'keyboardShouldPersistTaps'      in p || 'keyboardDismissMode'            in p ||
-        'scrollEnabled'                  in p ||
-        typeof p.onScrollBeginDrag === 'function' || typeof p.onScrollEndDrag === 'function'
-      ));
-    }
-
-    var stack = [];
-    for (var ri = 1; ri <= 5; ri++) {
-      var roots = hook.getFiberRoots(ri);
-      if (roots && roots.size > 0) {
-        Array.from(roots).forEach(function(r) { stack.push({ f: r.current, d: 0 }); });
-        break;
-      }
-    }
-    while (stack.length) {
-      var item = stack.pop(); var fiber = item.f; var depth = item.d;
-      if (!fiber || depth > 200) continue;
-      if (isScrollFiber(fiber) && fiber.memoizedProps && !fiber.memoizedProps.__mcpRec) {
-        // Class components: forceUpdate() is the cleanest approach
-        if (fiber.stateNode && typeof fiber.stateNode.forceUpdate === 'function') {
-          try { fiber.stateNode.forceUpdate(); } catch(e) {}
-        // Function components: use devtools overrideProps to schedule a re-render
-        } else if (renderer && renderer.overrideProps) {
-          try { renderer.overrideProps(fiber, ['__mcpInit'], 1); } catch(e) {}
-        }
-      }
-      if (fiber.sibling) stack.push({ f: fiber.sibling, d: depth });
-      if (fiber.child)   stack.push({ f: fiber.child,   d: depth + 1 });
-    }
-  })();
-
   // ── Track navigation events on every React commit ───────────────────────────
   var origCommit = hook.onCommitFiberRoot;
-  hook.onCommitFiberRoot = function(id, root) {
-    if (globalThis.__METRO_MCP_REC_ACTIVE__) {
+  var commitWrapper = function(id, root) {
+    if (state.capture && globalThis.__METRO_MCP_REC_STATE__ === state) {
       var route = getRoute();
-      var evts  = globalThis.__METRO_MCP_REC_EVENTS__;
+      var evts  = state.events;
       var last  = evts[evts.length - 1];
       if (route && (!last || last.type !== 'navigate' || last.route !== route))
         evts.push({ type: 'navigate', route: route, timestamp: Date.now() });
     }
     if (origCommit) origCommit.apply(this, arguments);
   };
+  commitWrapper.__mcpRecState = state;
+  commitWrapper.__mcpRecPrevious = origCommit;
+  hook.onCommitFiberRoot = commitWrapper;
 
   globalThis.__METRO_MCP_REC_CLEANUP__ = function() {
-    globalThis.__METRO_MCP_REC_ACTIVE__ = false;
-    hook.onCommitFiberRoot = origCommit;
-    Object.freeze = origFreeze;
-    delete globalThis.__METRO_MCP_REC_CLEANUP__;
+    state.capture = false;
+    state.active = false;
+    state.ready = false;
+    if (hook.onCommitFiberRoot === commitWrapper) {
+      var predecessor = origCommit;
+      var seen = new Set();
+      while (predecessor) {
+        if (seen.has(predecessor) || seen.size >= 1000) { predecessor = undefined; break; }
+        seen.add(predecessor);
+        if (predecessor.__mcpRecState && !predecessor.__mcpRecState.active)
+          predecessor = predecessor.__mcpRecPrevious;
+        else if (predecessor.__mcpProfilerState && !predecessor.__mcpProfilerState.active)
+          predecessor = predecessor.__mcpProfilerPrevious;
+        else break;
+      }
+      hook.onCommitFiberRoot = predecessor;
+    }
+    if (Object.freeze === freezeWrapper) Object.freeze = origFreeze;
+    if (globalThis.__METRO_MCP_REC_STATE__ === state) {
+      globalThis.__METRO_MCP_REC_ACTIVE__ = false;
+      delete globalThis.__METRO_MCP_REC_CLEANUP__;
+      delete globalThis.__METRO_MCP_REC_STATE__;
+    }
   };
-  return true;
+  var freezeWrapper = Object.freeze;
+  globalThis.__METRO_MCP_REC_CLEANUP__.origFreeze = origFreeze;
+
+  // Already-mounted memoizedProps are usually frozen. Ask React to render
+  // those fibers again so Object.freeze sees fresh mutable props. The shared
+  // bounded walker keeps this initialization finite even for pathological
+  // component trees.
+  ${FIBER_WALKER_JS}
+  // An explicit empty navigation state disables pruning: every mounted
+  // scene must be instrumented before it can later become focused.
+  metroWalkFibers({ maxDepth: 600, maxNodes: 5000 }, function(fiber) {
+    var props = fiber && fiber.memoizedProps;
+    if (!props || typeof props !== 'object') return;
+    var needsRefresh = false;
+    for (var i = 0; i < HANDLERS.length; i++) {
+      if (typeof props[HANDLERS[i]] === 'function' && !hasMetadata(props[HANDLERS[i]], props.testID || null, props.accessibilityLabel || props['aria-label'] || null, HANDLERS[i])) {
+        needsRefresh = true;
+        break;
+      }
+    }
+    if (isScrollable(props)) {
+      var scrollNames = ['onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'];
+      var scrollStates = [];
+      for (var scrollIndex = 0; scrollIndex < scrollNames.length; scrollIndex++) {
+        var scrollHandler = props[scrollNames[scrollIndex]];
+        if (scrollHandler && scrollHandler.__mcpRecScrollState &&
+            scrollStates.indexOf(scrollHandler.__mcpRecScrollState) < 0) {
+          scrollStates.push(scrollHandler.__mcpRecScrollState);
+        }
+        if (!isWrapped(scrollHandler)) { needsRefresh = true; break; }
+      }
+      if (scrollStates.length > 1) needsRefresh = true;
+    }
+    if (!needsRefresh) return;
+    var context = arguments[1] || {};
+    var renderer = context.renderer || null;
+    var refreshFiber = fiber;
+    var visitedAncestors = new Set();
+    while (refreshFiber && (!refreshFiber.stateNode || typeof refreshFiber.stateNode.forceUpdate !== 'function')) {
+      if (visitedAncestors.has(refreshFiber) || visitedAncestors.size >= 600) { refreshFiber = null; break; }
+      visitedAncestors.add(refreshFiber);
+      refreshFiber = refreshFiber.return;
+    }
+    if (renderer && typeof renderer.overrideProps === 'function') {
+      try {
+        renderer.overrideProps(fiber, ['__mcpRecRefresh'], state.sessionId);
+        // React DevTools schedules the update through pendingProps. Some
+        // renderers do not call Object.freeze again for this path, so patch
+        // the mutable pending copy as part of the same refresh operation.
+        if (fiber.pendingProps && typeof fiber.pendingProps === 'object') wrapProps(fiber.pendingProps);
+      } catch (_) {}
+    }
+    if (refreshFiber && refreshFiber.stateNode && typeof refreshFiber.stateNode.forceUpdate === 'function') {
+      try { refreshFiber.stateNode.forceUpdate(); } catch (_) {}
+    }
+  }, { routes: [] });
+
+  return state.sessionId;
 })()
 `;
+
+const RECORDING_READINESS_JS = buildFiberReadExpression(`
+  var state = globalThis.__METRO_MCP_REC_STATE__;
+  if (!state) return { ready: false, error: 'no-session' };
+  ${RECORDER_METADATA_JS}
+  var handlers = ${JSON.stringify(RECORDING_HANDLERS)};
+  var handlerCount = 0;
+  var unwrapped = [];
+  ${SCROLLABLE_PROPS_JS}
+  var traversal = metroWalkFibers(FIBER_OPTIONS, function(fiber) {
+    var props = fiber && fiber.memoizedProps;
+    if (!props || typeof props !== 'object') return;
+    for (var index = 0; index < handlers.length; index++) {
+      var name = handlers[index];
+      if (typeof props[name] !== 'function') continue;
+      handlerCount++;
+      var propTestID = props.testID || null;
+      var propLabel = props.accessibilityLabel || props['aria-label'] || null;
+      if (!hasMetadata(props[name], propTestID, propLabel, name))
+        unwrapped.push(name);
+    }
+    if (isScrollable(props)) {
+      var scrollHandlers = ['onScrollBeginDrag', 'onScrollEndDrag', 'onMomentumScrollEnd'];
+      var scrollStates = [];
+      for (var scrollIndex = 0; scrollIndex < scrollHandlers.length; scrollIndex++) {
+        var scrollName = scrollHandlers[scrollIndex];
+        var scrollTestID = props.testID || null;
+        var scrollLabel = props.accessibilityLabel || props['aria-label'] || null;
+        var scrollHandler = props[scrollName];
+        if (typeof scrollHandler === 'function' && scrollHandler.__mcpRecScrollState &&
+            scrollStates.indexOf(scrollHandler.__mcpRecScrollState) < 0) {
+          scrollStates.push(scrollHandler.__mcpRecScrollState);
+        }
+        if (typeof scrollHandler !== 'function' || !hasMetadata(scrollHandler, scrollTestID, scrollLabel, scrollName))
+          unwrapped.push(scrollName);
+      }
+      if (scrollStates.length > 1) unwrapped.push('scroll-state-conflict');
+    }
+  }, { routes: [] });
+  return {
+    ready: traversal.complete && unwrapped.length === 0,
+    handlerCount: handlerCount,
+    unwrapped: unwrapped,
+    traversal: traversal
+  };
+`, { maxDepth: 600, maxNodes: 5000 });
+
+const ACTIVATE_RECORDING_JS = `(function() {
+  var state = globalThis.__METRO_MCP_REC_STATE__;
+  if (!state) return false;
+  state.ready = true;
+  state.capture = true;
+  globalThis.__METRO_MCP_REC_ACTIVE__ = true;
+  return true;
+})()`;
+
+const CLEANUP_RECORDING_JS = `(function() {
+  if (globalThis.__METRO_MCP_REC_CLEANUP__) {
+    try { globalThis.__METRO_MCP_REC_CLEANUP__(); } catch (_) {}
+  }
+  globalThis.__METRO_MCP_REC_ACTIVE__ = false;
+  return true;
+})()`;
+
+const RECORDER_SESSION_REPLACED = '__mcp_recorder_session_replaced__';
+
+function sessionGuardedExpression(expression: string, sessionId: string): string {
+  return `(function() {
+    var state = globalThis.__METRO_MCP_REC_STATE__;
+    if (!state || state.sessionId !== ${JSON.stringify(sessionId)})
+      return { __mcpRecorderSession: ${JSON.stringify(RECORDER_SESSION_REPLACED)} };
+    return (${expression});
+  })()`;
+}
+
+function sessionCleanupExpression(sessionId: string): string {
+  return `(function() {
+    var state = globalThis.__METRO_MCP_REC_STATE__;
+    if (!state || state.sessionId !== ${JSON.stringify(sessionId)}) return false;
+    return ${CLEANUP_RECORDING_JS};
+  })()`;
+}
+
+interface RecordingReadiness {
+  ready?: boolean;
+  handlerCount?: number;
+  unwrapped?: string[];
+  traversal?: { complete?: boolean; truncationReason?: string };
+}
 
 // ── Recorded event shape (mirrors the JS-side object pushed to __METRO_MCP_REC_EVENTS__)
 interface RecordedEvent {
@@ -258,33 +533,91 @@ function deduplicateEvents(events: RecordedEvent[]): RecordedEvent[] {
 }
 
 // ── Emit Appium capability lines into an array
-function pushCaps(lines: string[], platform: 'ios' | 'android', bundleId: string | undefined, indent: string): void {
-  if (platform === 'ios') {
-    lines.push(`${indent}platformName: 'iOS',`);
-    lines.push(`${indent}'appium:automationName': 'XCUITest',`);
-    lines.push(bundleId
-      ? `${indent}'appium:bundleId': '${bundleId}',`
-      : `${indent}'appium:bundleId': 'com.example.app', // TODO: set bundle ID`);
-  } else {
-    lines.push(`${indent}platformName: 'Android',`);
-    lines.push(`${indent}'appium:automationName': 'UiAutomator2',`);
-    lines.push(bundleId
-      ? `${indent}'appium:appPackage': '${bundleId}',`
-      : `${indent}'appium:appPackage': 'com.example.app', // TODO: set app package`);
-    lines.push(`${indent}'appium:appActivity': '.MainActivity',`);
+//
+// Capabilities belong to the generated WDIO configuration. The generated spec
+// deliberately consumes the runner-owned `browser` session instead of opening
+// a second WebDriver connection.
+function pushCaps(
+  lines: string[],
+  platform: 'ios' | 'android',
+  options: {
+    bundleId?: string;
+    appPath?: string;
+    udid?: string;
+    deviceName?: string;
+    platformVersion?: string;
+    noReset: boolean;
+  },
+  indent: string,
+): void {
+  const push = (key: string, value: string | boolean) => lines.push(`${indent}${JSON.stringify(key)}: ${JSON.stringify(value)},`);
+  push('platformName', platform === 'ios' ? 'iOS' : 'Android');
+  push('appium:automationName', platform === 'ios' ? 'XCUITest' : 'UiAutomator2');
+  push('appium:noReset', options.noReset);
+  if (options.udid) push('appium:udid', options.udid);
+  if (options.deviceName) push('appium:deviceName', options.deviceName);
+  if (options.platformVersion) push('appium:platformVersion', options.platformVersion);
+  if (options.appPath) {
+    push('appium:app', options.appPath);
+  } else if (options.bundleId) {
+    push(platform === 'ios' ? 'appium:bundleId' : 'appium:appPackage', options.bundleId);
+    if (platform === 'android') push('appium:appActivity', '.MainActivity');
   }
 }
 
-// ── Appium swipe touchAction block
-function appiumSwipeLines(direction: string, indent: string): string[] {
-  const [sx, sy, ex, ey] = SWIPE_COORDS[direction] ?? SWIPE_COORDS.up;
-  return [
-    `${indent}await driver.touchAction([`,
-    `${indent}  { action: 'press',  x: ${sx}, y: ${sy} },`,
-    `${indent}  { action: 'moveTo', x: ${ex}, y: ${ey} },`,
-    `${indent}  { action: 'release' },`,
-    `${indent}]);`,
-  ];
+// ── WebdriverIO W3C actions used by generated specs
+function appiumActionHelpers(lines: string[]): void {
+  lines.push(`type TouchAction = {`);
+  lines.push(`  type: 'pointerMove' | 'pointerDown' | 'pointerUp' | 'pause';`);
+  lines.push(`  duration?: number; x?: number; y?: number; button?: number;`);
+  lines.push(`};`);
+  lines.push('');
+  lines.push(`async function performTouch(actions: TouchAction[]): Promise<void> {`);
+  lines.push(`  try {`);
+  lines.push(`    await browser.performActions([{`);
+  lines.push(`      type: 'pointer',`);
+  lines.push(`      id: 'metro-mcp-touch',`);
+  lines.push(`      parameters: { pointerType: 'touch' },`);
+  lines.push(`      actions,`);
+  lines.push(`    }]);`);
+  lines.push(`  } finally {`);
+  lines.push(`    await browser.releaseActions();`);
+  lines.push(`  }`);
+  lines.push(`}`);
+  lines.push('');
+  lines.push(`async function longPress(selector: string): Promise<void> {`);
+  lines.push(`  const element = await browser.$(selector);`);
+  lines.push(`  const location = await element.getLocation();`);
+  lines.push(`  const size = await element.getSize();`);
+  lines.push(`  const x = Math.round(location.x + size.width / 2);`);
+  lines.push(`  const y = Math.round(location.y + size.height / 2);`);
+  lines.push(`  await performTouch([`);
+  lines.push(`    { type: 'pointerMove', duration: 0, x, y },`);
+  lines.push(`    { type: 'pointerDown', button: 0 },`);
+  lines.push(`    { type: 'pause', duration: 800 },`);
+  lines.push(`    { type: 'pointerUp', button: 0 },`);
+  lines.push(`  ]);`);
+  lines.push(`}`);
+  lines.push('');
+  lines.push(`async function swipe(direction: string): Promise<void> {`);
+  lines.push(`  const { width, height } = await browser.getWindowSize();`);
+  lines.push(`  const cx = Math.round(width / 2);`);
+  lines.push(`  const cy = Math.round(height / 2);`);
+  lines.push(`  const distanceX = Math.round(width * 0.35);`);
+  lines.push(`  const distanceY = Math.round(height * 0.35);`);
+  lines.push(`  let from = { x: cx, y: cy };`);
+  lines.push(`  let to = { x: cx, y: cy - distanceY };`);
+  lines.push(`  if (direction === 'down') { from = { x: cx, y: cy - distanceY }; to = { x: cx, y: cy }; }`);
+  lines.push(`  if (direction === 'left') { from = { x: cx + distanceX, y: cy }; to = { x: cx, y: cy }; }`);
+  lines.push(`  if (direction === 'right') { from = { x: cx - distanceX, y: cy }; to = { x: cx, y: cy }; }`);
+  lines.push(`  await performTouch([`);
+  lines.push(`    { type: 'pointerMove', duration: 0, x: from.x, y: from.y },`);
+  lines.push(`    { type: 'pointerDown', button: 0 },`);
+  lines.push(`    { type: 'pointerMove', duration: 500, x: to.x, y: to.y },`);
+  lines.push(`    { type: 'pointerUp', button: 0 },`);
+  lines.push(`  ]);`);
+  lines.push(`}`);
+  lines.push('');
 }
 
 // ── Persistent state for the recording session
@@ -296,6 +629,8 @@ export const testRecorderPlugin = definePlugin({
   description: 'Unified mobile test recorder: captures taps, text entry, swipes and navigation via fiber patching; generates Appium, Maestro, and Detox tests',
 
   async setup(ctx) {
+    const recorderEpoch = randomUUID();
+    let recorderStartCounter = 0;
 
     // ────────────────────────────────────────────────────────────────────────────
     // start_test_recording
@@ -311,20 +646,116 @@ export const testRecorderPlugin = definePlugin({
       parameters: z.object({}),
       handler: async () => {
         storedEvents = null;
+        const attemptOrder = ++recorderStartCounter;
+        const attemptSessionId = `recording-${recorderEpoch}-${attemptOrder}`;
+
+        // Keep injection, readiness, activation, and the final route lookup
+        // inside one startup budget. EvalOptions.deadline also bounds any
+        // reconnect wait in the shared app evaluator; per-request timeouts
+        // must never reserve time beyond this deadline.
+        const deadline = Date.now() + 6000;
+        const evaluateStartup = async (expression: string, timeout: number, sessionId?: string) => {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error('recording startup deadline exceeded');
+          // A later concurrent startup may replace the app-side session while
+          // this request is waiting for readiness. Guard every post-injection
+          // expression so the older request cannot activate or inspect the
+          // newer recorder.
+          return ctx.evalInApp(sessionId ? sessionGuardedExpression(expression, sessionId) : expression, {
+            timeout: Math.min(timeout, remaining),
+            deadline,
+          });
+        };
+        const cleanupBestEffort = async (sessionId: string) => {
+          // Cleanup has its own short deadline so an exhausted readiness budget
+          // cannot leave recorder hooks installed, while reconnects and the
+          // cleanup transport are still bounded.
+          const cleanupDeadline = Date.now() + 1000;
+          await ctx.evalInApp(sessionCleanupExpression(sessionId), {
+            timeout: 1000,
+            deadline: cleanupDeadline,
+          }).catch(() => {});
+        };
 
         let injected: unknown;
         let injectError = 'script returned false (check __REACT_DEVTOOLS_GLOBAL_HOOK__ availability)';
         try {
-          injected = await ctx.evalInApp(START_RECORDING_JS, { timeout: 6000 });
+          injected = await evaluateStartup(
+            START_RECORDING_JS(attemptSessionId, recorderEpoch, attemptOrder),
+            6000,
+          );
         } catch (err) {
           injectError = err instanceof Error ? err.message : String(err);
           injected = false;
         }
+        if (isRecorderSessionReplaced(injected)) {
+          return 'Could not start recording — this recorder startup was replaced by a newer startup; the newer recorder remains active.';
+        }
         if (!injected) {
+          // CDP can report a transport error after the app evaluated part of
+          // the script. Always attempt cleanup for a partially-installed
+          // session before returning the failure.
+          await cleanupBestEffort(attemptSessionId);
           return `Could not inject recording hooks — ${injectError}`;
         }
 
-        const route = await ctx.evalInApp(CURRENT_ROUTE_JS, { timeout: 3000 }).catch(() => null) as string | null;
+        const sessionId = typeof injected === 'string' ? injected : attemptSessionId;
+        let sessionReplaced = false;
+
+        // The injection only installs instrumentation. Wait for a complete
+        // bounded scan after React has had a chance to refresh frozen props;
+        // enabling capture before this point loses the first interaction or
+        // silently misses a deep handler.
+        let readiness: RecordingReadiness | null = null;
+        while (Date.now() < deadline) {
+          try {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            const readinessResult = await evaluateStartup(RECORDING_READINESS_JS, Math.min(1000, remaining), sessionId);
+            if (isRecorderSessionReplaced(readinessResult)) {
+              sessionReplaced = true;
+              break;
+            }
+            readiness = readinessResult as RecordingReadiness;
+            if (readiness?.ready) break;
+          } catch (err) {
+            injectError = err instanceof Error ? err.message : String(err);
+          }
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
+        }
+        if (sessionReplaced) {
+          return 'Could not start recording — this recorder startup was replaced by a newer startup; the newer recorder remains active.';
+        }
+        if (!readiness?.ready) {
+          await cleanupBestEffort(sessionId);
+          const reason = readiness?.traversal?.truncationReason
+            ?? (readiness?.unwrapped?.length
+              ? `unwrapped handlers: ${[...new Set(readiness.unwrapped)].join(', ')}`
+              : injectError);
+          return `Could not start recording — React handler coverage did not become ready within 6000ms (${reason}). Instrumentation cleanup was attempted.`;
+        }
+
+        const activationResult = (deadline - Date.now() > 0
+          ? await evaluateStartup(ACTIVATE_RECORDING_JS, 1000, sessionId).catch(() => false)
+          : false);
+        if (isRecorderSessionReplaced(activationResult)) {
+          return 'Could not start recording — this recorder startup was replaced by a newer startup; the newer recorder remains active.';
+        }
+        const activated = activationResult === true;
+        if (!activated) {
+          await cleanupBestEffort(sessionId);
+          return 'Could not start recording — capture activation failed. Instrumentation cleanup was attempted.';
+        }
+
+        const routeResult = (deadline - Date.now() > 0
+          ? await evaluateStartup(CURRENT_ROUTE_JS, 3000, sessionId).catch(() => null)
+          : null) as string | null;
+        if (isRecorderSessionReplaced(routeResult)) {
+          return 'Could not start recording — this recorder startup was replaced by a newer startup; the newer recorder remains active.';
+        }
+        const route = routeResult;
         const routeInfo = route ? ` on screen "${route}"` : '';
         return (
           `Recording started${routeInfo}. ` +
@@ -345,16 +776,7 @@ export const testRecorderPlugin = definePlugin({
       annotations: { readOnlyHint: false, idempotentHint: false },
       parameters: z.object({}),
       handler: async () => {
-        // Cleanup injection
-        await ctx.evalInApp(
-          `(function(){
-            if (globalThis.__METRO_MCP_REC_CLEANUP__) {
-              globalThis.__METRO_MCP_REC_CLEANUP__();
-              delete globalThis.__METRO_MCP_REC_CLEANUP__;
-            }
-          })()`,
-          { timeout: 3000 }
-        ).catch(() => {});
+        await ctx.evalInApp(CLEANUP_RECORDING_JS, { timeout: 3000 }).catch(() => {});
 
         // Retrieve events
         const raw = await ctx.evalInApp(
@@ -381,7 +803,7 @@ export const testRecorderPlugin = definePlugin({
     ctx.registerTool('generate_test_from_recording', {
       description:
         'Convert the most recent recording into a test file. ' +
-        'Supports three formats: appium (WebdriverIO + Jest), maestro (YAML), and detox (Jest). ' +
+        'Supports three formats: appium (WebdriverIO + Mocha), maestro (YAML), and detox (Jest). ' +
         'Call stop_test_recording first.',
       annotations: { readOnlyHint: true },
       parameters: z.object({
@@ -389,7 +811,7 @@ export const testRecorderPlugin = definePlugin({
         testName: z.string().optional().describe('Name for the test / describe block'),
         platform: z.enum(['ios', 'android', 'both']).default('ios').describe('Target platform (appium only)'),
         bundleId: z.string().optional().describe('iOS bundle ID or Android app package'),
-        includeSetup: z.boolean().default(true).describe('Include driver setup / teardown boilerplate'),
+        includeSetup: z.boolean().default(true).describe('Include WDIO configuration usage comments (the runner owns setup and teardown)'),
       }),
       handler: async ({ format, testName, platform, bundleId, includeSetup }) => {
         if (!storedEvents || storedEvents.length === 0) {
@@ -411,7 +833,7 @@ export const testRecorderPlugin = definePlugin({
 
         if (format === 'maestro') return generateMaestro(name, events, bundleId, nextSelector);
         if (format === 'detox')   return generateDetox(name, events, includeSetup, nextSelector);
-        return generateAppium(name, events, platform, bundleId, includeSetup, nextSelector);
+        return generateAppium(name, events, includeSetup, nextSelector);
       },
     });
 
@@ -426,49 +848,121 @@ export const testRecorderPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'both']).default('ios'),
         bundleId: z.string().optional().describe('iOS bundle ID or Android app package'),
         appPath: z.string().optional().describe('Path to .app / .apk (leave empty to use a running simulator)'),
+        iosBundleId: z.string().optional().describe('iOS bundle ID when platform is both'),
+        androidPackageName: z.string().optional().describe('Android app package when platform is both'),
+        iosAppPath: z.string().optional().describe('Path to the iOS .app when platform is both'),
+        androidAppPath: z.string().optional().describe('Path to the Android .apk when platform is both'),
+        udid: z.string().optional().describe('Optional device UDID / serial for a single-platform config'),
+        deviceName: z.string().optional().describe('Optional Appium device name for a single-platform config'),
+        platformVersion: z.string().optional().describe('Optional OS version for a single-platform config'),
+        iosUdid: z.string().optional().describe('Optional iOS simulator UDID when platform is both'),
+        androidUdid: z.string().optional().describe('Optional Android device serial when platform is both'),
+        iosDeviceName: z.string().optional().describe('Optional iOS Appium device name when platform is both'),
+        androidDeviceName: z.string().optional().describe('Optional Android Appium device name when platform is both'),
+        iosPlatformVersion: z.string().optional().describe('Optional iOS version when platform is both'),
+        androidPlatformVersion: z.string().optional().describe('Optional Android version when platform is both'),
+        noReset: z.boolean().default(true).describe('Preserve installed app data; false allows Appium to reset the app'),
         outputPath: z.string().default('./wdio.conf.ts').describe('Shown in the output, not written to disk'),
       }),
-      handler: async ({ platform, bundleId, appPath, outputPath }) => {
+      handler: async ({
+        platform,
+        bundleId,
+        appPath,
+        iosBundleId,
+        androidPackageName,
+        iosAppPath,
+        androidAppPath,
+        udid,
+        deviceName,
+        platformVersion,
+        iosUdid,
+        androidUdid,
+        iosDeviceName,
+        androidDeviceName,
+        iosPlatformVersion,
+        androidPlatformVersion,
+        noReset,
+        outputPath,
+      }) => {
+        if (platform === 'both' && (bundleId || appPath || udid || deviceName || platformVersion)) {
+          return 'For platform "both", use separate iOS and Android app and device options so each Appium capability targets the correct app and device.';
+        }
+        const connectedTarget = platform === 'both'
+          ? undefined
+          : getConnectedDeviceTarget(ctx);
+        let connectedAppId: string | undefined;
+        let connectedDevice: ResolvedDevice | null | undefined;
+        if (
+          platform !== 'both' &&
+          !bundleId &&
+          !appPath &&
+          connectedTarget?.appId
+        ) {
+          try {
+            connectedDevice = await resolveDevice(ctx, 'auto', connectedTarget);
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            return (
+              `Cannot verify which platform the connected Metro app uses: ${reason} ` +
+              'Provide bundleId or appPath explicitly.'
+            );
+          }
+          if (
+            !connectedDevice ||
+            connectedDevice.platform !== platform ||
+            !targetIdentifiesResolvedDevice(connectedTarget, connectedDevice)
+          ) {
+            const actual = connectedDevice?.platform ?? 'an unknown platform';
+            return (
+              `The connected Metro app could not be verified as the resolved ${platform} device ` +
+              `(discovery selected ${actual}), so its app ID cannot be reused. ` +
+              'Provide bundleId or appPath explicitly.'
+            );
+          }
+          connectedAppId = connectedTarget.appId;
+        }
+        const resolvedBundleId = platform === 'both' ? undefined : (bundleId ?? connectedAppId);
+        const hasIosAppTarget = Boolean(iosAppPath || iosBundleId);
+        const hasAndroidAppTarget = Boolean(androidAppPath || androidPackageName);
+        if (platform === 'both' && (!hasIosAppTarget || !hasAndroidAppTarget)) {
+          return 'For platform "both", provide iosAppPath or iosBundleId and androidAppPath or androidPackageName.';
+        }
+        if (platform !== 'both' && !appPath && !resolvedBundleId) {
+          return 'Cannot generate a runnable Appium config without an app target. Provide bundleId, appPath, or connect to a Metro app with a bundle ID first.';
+        }
         const lines: string[] = [];
 
         const buildCaps = (p: 'ios' | 'android'): string[] => {
           const cap: string[] = [];
           cap.push(`      {`);
-          if (p === 'ios') {
-            cap.push(`        platformName: 'iOS',`);
-            cap.push(`        'appium:automationName': 'XCUITest',`);
-            cap.push(`        'appium:deviceName': 'iPhone 16',`);
-            cap.push(`        'appium:platformVersion': '18.0',`);
-            cap.push(appPath
-              ? `        'appium:app': '${appPath}',`
-              : (bundleId ? `        'appium:bundleId': '${bundleId}',` : `        'appium:bundleId': 'com.example.app',`));
-          } else {
-            cap.push(`        platformName: 'Android',`);
-            cap.push(`        'appium:automationName': 'UiAutomator2',`);
-            cap.push(`        'appium:deviceName': 'emulator-5554',`);
-            if (appPath) {
-              cap.push(`        'appium:app': '${appPath}',`);
-            } else {
-              cap.push(bundleId ? `        'appium:appPackage': '${bundleId}',` : `        'appium:appPackage': 'com.example.app',`);
-              cap.push(`        'appium:appActivity': '.MainActivity',`);
-            }
-          }
+          pushCaps(cap, p, {
+            bundleId: platform === 'both'
+              ? (p === 'ios' ? iosBundleId : androidPackageName)
+              : resolvedBundleId,
+            appPath: platform === 'both'
+              ? (p === 'ios' ? iosAppPath : androidAppPath)
+              : appPath,
+            udid: p === 'ios'
+              ? (iosUdid ?? udid ?? connectedDevice?.id)
+              : (androidUdid ?? udid ?? connectedDevice?.id),
+            deviceName: p === 'ios' ? (iosDeviceName ?? deviceName) : (androidDeviceName ?? deviceName),
+            platformVersion: p === 'ios' ? (iosPlatformVersion ?? platformVersion) : (androidPlatformVersion ?? platformVersion),
+            noReset,
+          }, '        ');
           cap.push(`        'appium:newCommandTimeout': 240,`);
           cap.push(`      },`);
           return cap;
         };
 
-        lines.push(`// ${outputPath}`);
-        lines.push(`// Install deps: npm install --save-dev @wdio/cli @wdio/local-runner @wdio/mocha-framework @wdio/spec-reporter appium wdio-appium-service`);
-        lines.push(`import type { Options } from '@wdio/types';`);
+        lines.push(`// ${safeComment(outputPath)}`);
+        lines.push(`// Install deps: npm install --save-dev @wdio/cli @wdio/local-runner @wdio/globals @wdio/mocha-framework @wdio/spec-reporter @wdio/appium-service appium`);
+        lines.push(`import type {} from '@wdio/types';`);
         lines.push('');
-        lines.push(`export const config: Options.Testrunner = {`);
+        lines.push(`export const config: WebdriverIO.Config = {`);
         lines.push(`  runner: 'local',`);
-        lines.push(`  autoCompileOpts: { autoCompile: true, tsNodeOpts: { project: './tsconfig.json' } },`);
         lines.push('');
         lines.push(`  port: 4723,`);
         lines.push(`  services: ['appium'],`);
-        lines.push(`  appium: { command: 'appium' },`);
         lines.push('');
         lines.push(`  specs: ['./e2e/**/*.test.ts'],`);
         lines.push(`  exclude: [],`);
@@ -494,8 +988,8 @@ export const testRecorderPlugin = definePlugin({
         lines.push(`};`);
         lines.push('');
         lines.push(`/*`);
-        lines.push(` * Run a single test:  npx wdio run ${outputPath} --spec ./e2e/login.test.ts`);
-        lines.push(` * Run all tests:      npx wdio run ${outputPath}`);
+        lines.push(` * Run a single test:  npx wdio run ${safeComment(outputPath)} --spec ./e2e/login.test.ts`);
+        lines.push(` * Run all tests:      npx wdio run ${safeComment(outputPath)}`);
         lines.push(` *`);
         lines.push(` * Install Appium:     npm install -g appium`);
         lines.push(` *                     appium driver install xcuitest`);
@@ -651,59 +1145,42 @@ export const testRecorderPlugin = definePlugin({
   },
 });
 
+function isRecorderSessionReplaced(value: unknown): boolean {
+  return !!value && typeof value === 'object' &&
+    (value as { __mcpRecorderSession?: unknown }).__mcpRecorderSession === RECORDER_SESSION_REPLACED;
+}
+
 // ────────────────────────────────────────────────────────────────────────────────
 // Code generators
 // ────────────────────────────────────────────────────────────────────────────────
 
+function safeComment(value: string): string {
+  return value.replace(/[\r\n]+/g, ' ').replace(/\*\//g, '* /');
+}
+
 function generateAppium(
   name: string,
   events: RecordedEvent[],
-  platform: 'ios' | 'android' | 'both',
-  bundleId: string | undefined,
   includeSetup: boolean,
   nextSelector: (i: number, fn: (e: RecordedEvent) => string | null) => string | null,
 ): string {
   const lines: string[] = [];
-  lines.push(`import { remote, Browser } from 'webdriverio';`);
+  lines.push(`import { browser } from '@wdio/globals';`);
   lines.push('');
 
+  // WDIO owns the session lifecycle in its runner configuration. Keep the
+  // option for compatibility, but never create a second remote session.
   if (includeSetup) {
-    if (platform === 'both') {
-      lines.push(`const IOS_CAPS = {`);
-      pushCaps(lines, 'ios', bundleId, '  ');
-      lines.push(`};`);
-      lines.push('');
-      lines.push(`const ANDROID_CAPS = {`);
-      pushCaps(lines, 'android', bundleId, '  ');
-      lines.push(`};`);
-      lines.push('');
-    }
+    lines.push(`// The WDIO config supplies the Appium service and runner session.`);
+    lines.push(`// Run with: npx wdio run wdio.conf.ts --spec ./e2e/recorded.test.ts`);
+    lines.push('');
+  }
+
+  if (events.some((event) => event.type === 'long_press' || event.type === 'swipe')) {
+    appiumActionHelpers(lines);
   }
 
   lines.push(`describe(${JSON.stringify(name)}, () => {`);
-
-  if (includeSetup) {
-    lines.push(`  let driver: Browser;`);
-    lines.push('');
-    lines.push(`  beforeAll(async () => {`);
-    if (platform === 'both') {
-      lines.push(`    // Run with IOS_CAPS or ANDROID_CAPS depending on target`);
-      lines.push(`    driver = await remote({ capabilities: IOS_CAPS });`);
-    } else {
-      lines.push(`    driver = await remote({`);
-      lines.push(`      capabilities: {`);
-      pushCaps(lines, platform, bundleId, '        ');
-      lines.push(`      },`);
-      lines.push(`    });`);
-    }
-    lines.push(`  });`);
-    lines.push('');
-    lines.push(`  afterAll(async () => {`);
-    lines.push(`    await driver.deleteSession();`);
-    lines.push(`  });`);
-    lines.push('');
-  }
-
   lines.push(`  it(${JSON.stringify(name)}, async () => {`);
 
   for (let i = 0; i < events.length; i++) {
@@ -713,41 +1190,40 @@ function generateAppium(
     switch (ev.type) {
       case 'tap':
         lines.push(sel
-          ? `    await driver.$(${JSON.stringify(sel)}).click();`
-          : `    // TODO: tap ${ev.componentName ?? 'unknown element'}`);
+          ? `    await browser.$(${JSON.stringify(sel)}).click();`
+          : `    // TODO: tap ${JSON.stringify(ev.componentName ?? 'unknown element')}`);
         break;
 
       case 'long_press':
         lines.push(sel
-          ? `    await driver.$(${JSON.stringify(sel)}).longClick();`
-          : `    // TODO: long press ${ev.componentName ?? 'unknown element'}`);
+          ? `    await longPress(${JSON.stringify(sel)});`
+          : `    // TODO: long press ${JSON.stringify(ev.componentName ?? 'unknown element')}`);
         break;
 
-      case 'type': {
-        const inputSel = sel ?? '~TODO';
-        lines.push(`    await driver.$(${JSON.stringify(inputSel)}).setValue(${JSON.stringify(ev.text ?? '')});`);
+      case 'type':
+        if (sel) lines.push(`    await browser.$(${JSON.stringify(sel)}).setValue(${JSON.stringify(ev.text ?? '')});`);
+        else lines.push(`    // TODO: type ${JSON.stringify(ev.text ?? '')} into an element with an accessibility ID`);
         break;
-      }
 
       case 'submit':
-        lines.push(`    await driver.keys(['Enter']);`);
+        lines.push(`    await browser.keys(['Enter']);`);
         break;
 
       case 'swipe':
-        lines.push(...appiumSwipeLines(ev.direction ?? 'up', '    '));
+        lines.push(`    await swipe(${JSON.stringify(ev.direction ?? 'up')});`);
         break;
 
       case 'navigate': {
         const assertSel = nextSelector(i, appiumSelector);
-        lines.push(`    // navigated to: ${ev.route ?? 'new screen'}`);
+        lines.push(`    // navigated to: ${safeComment(ev.route ?? 'new screen')}`);
         lines.push(assertSel
-          ? `    await driver.$(${JSON.stringify(assertSel)}).waitForDisplayed({ timeout: 5000 });`
+          ? `    await browser.$(${JSON.stringify(assertSel)}).waitForDisplayed({ timeout: 5000 });`
           : `    // TODO: assert screen loaded`);
         break;
       }
 
       case 'annotation':
-        lines.push(`    // ${ev.note ?? ''}`);
+        lines.push(`    // ${safeComment(ev.note ?? '')}`);
         break;
     }
   }

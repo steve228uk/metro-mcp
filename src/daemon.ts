@@ -39,6 +39,17 @@ export interface DaemonIdentity {
   env: Record<string, string | undefined>;
   entrypoint: string;
   runtime: string;
+  input?: {
+    nativeBackend?: 'auto' | 'simview' | 'idb';
+    simviewCommand?: string;
+    idbCommand?: string;
+  };
+}
+
+/** The resolved configuration fields that affect daemon ownership. */
+export interface DaemonIdentityOverrides {
+  projectRoot?: string;
+  input?: DaemonIdentity['input'];
 }
 
 export interface DaemonRecord {
@@ -187,6 +198,7 @@ export function createDaemonIdentity(
     env: overrides.env ?? selectedEnv(),
     entrypoint: overrides.entrypoint ?? resolvePath(process.argv[1]),
     runtime: overrides.runtime ?? resolvePath(process.execPath),
+    ...(overrides.input ? { input: structuredClone(overrides.input) } : {}),
   };
 }
 
@@ -549,9 +561,13 @@ export async function cleanupStaleDaemonRecords(): Promise<void> {
   );
 }
 
-async function ensureDaemon(args: string[]): Promise<DaemonRecord> {
+async function ensureDaemon(
+  args: string[],
+  overrides: DaemonIdentityOverrides = {},
+): Promise<DaemonRecord> {
   const identity = createDaemonIdentity(args, {
-    projectRoot: resolveProjectRoot(args),
+    ...overrides,
+    projectRoot: overrides.projectRoot ?? resolveProjectRoot(args),
   });
   const key = getDaemonKey(args, identity);
   await cleanupStaleDaemonRecords();
@@ -726,8 +742,11 @@ export function registerStdioProxyShutdown(
   };
 }
 
-export async function startStdioProxy(args: string[]): Promise<void> {
-  const record = await ensureDaemon(args);
+export async function startStdioProxy(
+  args: string[],
+  identityOverrides: DaemonIdentityOverrides = {},
+): Promise<void> {
+  const record = await ensureDaemon(args, identityOverrides);
   const lease = new DaemonLeaseClient(record);
   const stdio = new StdioServerTransport();
   const daemonTransport = new StreamableHTTPClientTransport(

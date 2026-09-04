@@ -7,10 +7,18 @@ import {
 import type { CircularBuffer } from './utils/buffer.js';
 import type { MetroTarget } from 'metro-bridge';
 
+interface CDPSendOptions {
+  timeoutMs?: number;
+}
+
 // ── CDP Connection Interface ──
 
 export interface CDPConnection {
-  send(method: string, params?: Record<string, unknown>): Promise<unknown>;
+  send(
+    method: string,
+    params?: Record<string, unknown>,
+    options?: CDPSendOptions,
+  ): Promise<unknown>;
   on(event: string, handler: (params: Record<string, unknown>) => void): void;
   off(event: string, handler: (params: Record<string, unknown>) => void): void;
   isConnected: boolean;
@@ -162,6 +170,10 @@ export interface EvalOptions {
   awaitPromise?: boolean;
   /** CDP timeout in milliseconds (default: 10000) */
   timeout?: number;
+  /** Internal absolute deadline used to bound reconnect and transport waits. */
+  deadline?: number;
+  /** Internal CDP object group used to release late remote completions. */
+  objectGroup?: string;
 }
 
 // ── Metro Events ──
@@ -189,6 +201,8 @@ export interface PluginContext {
   ): void;
   registerResource(uri: string, config: ResourceConfig): void;
   registerPrompt(name: string, config: PromptConfig): void;
+  /** Register asynchronous resource cleanup for runtime shutdown. */
+  registerCleanup?: (callback: () => void | Promise<void>) => void;
   config: Record<string, unknown>;
   logger: Logger;
   metro: {
@@ -201,7 +215,7 @@ export interface PluginContext {
   execFile(
     command: string,
     args: string[],
-    options?: { maxBuffer?: number },
+    options?: { maxBuffer?: number; timeout?: number },
   ): Promise<Buffer>;
   format: FormatUtils;
   /** Evaluate a JavaScript expression in the connected app runtime */
@@ -276,6 +290,14 @@ export interface MetroMCPConfig {
     enabled?: boolean;
     /** Port for the proxy server. Use 0 for OS-assigned. Defaults to 0. */
     port?: number;
+  };
+  input?: {
+    /** Native input provider order. Defaults to React handler, SimView, IDB. */
+    nativeBackend?: 'auto' | 'simview' | 'idb';
+    /** Optional executable path for the packaged SimView MCP server. */
+    simviewCommand?: string;
+    /** Optional executable path for IDB. */
+    idbCommand?: string;
   };
 }
 
