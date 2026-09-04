@@ -196,7 +196,10 @@ function mergePaths(left: CompletionPath, right: CompletionPath): CompletionPath
   return {
     expressions: [...left.expressions, ...right.expressions],
     clearRanges: [...left.clearRanges, ...right.clearRanges],
-    empty: left.empty || right.empty,
+    // A merged path is empty only when every contributing completion is
+    // empty. An explicit undefined completion from a catch/finally or a later
+    // empty loop iteration must replace an earlier value.
+    empty: left.empty && right.empty,
     undefined: left.undefined || right.undefined,
     normal: left.normal || right.normal,
   };
@@ -293,7 +296,7 @@ function completionForStatement(statement: StatementLike): Completion {
       // discarded, while the prior try/catch completion is retained. This is
       // why `try { 1 } finally { 2 }` evaluates to 1 in a script.
       const applied = applyFinallyCompletion(guarded, finalizer);
-      return {
+      const result = {
         ...applied,
         breaks: [
           ...guarded.breaks,
@@ -304,6 +307,7 @@ function completionForStatement(statement: StatementLike): Completion {
           ...finalizer.continues.map((path) => ({ ...path, inherit: false })),
         ],
       };
+      return result.normal ? normalizeControlCompletion(result) : result;
     }
     case 'LabeledStatement':
       return consumeLabelExits(
@@ -400,6 +404,85 @@ function completionForStatements(statements: StatementLike[]): Completion {
   return completion;
 }
 
+type SourceInsertion = { start: number; end?: number; replacement: string };
+
+function collectLoopEntryInsertions(
+  statement: StatementLike,
+  clearCompletion: string,
+  insertions: SourceInsertion[],
+): void {
+  const visit = (child: unknown): void => {
+    if (child && typeof child === 'object' && 'type' in child) {
+      collectLoopEntryInsertions(child as StatementLike, clearCompletion, insertions);
+    }
+  };
+  const visitList = (children: unknown): void => {
+    if (Array.isArray(children)) children.forEach(visit);
+  };
+
+  switch (statement.type) {
+    case 'BlockStatement':
+      visitList(statement.body);
+      return;
+    case 'IfStatement':
+      visit(statement.consequent);
+      visit(statement.alternate);
+      return;
+    case 'TryStatement':
+      visit(statement.block);
+      visit((statement.handler as { body?: unknown } | null | undefined)?.body);
+      visit(statement.finalizer);
+      return;
+    case 'LabeledStatement':
+    case 'WithStatement':
+      visit(statement.body);
+      return;
+    case 'SwitchStatement':
+      for (const switchCase of (statement.cases as Array<{ consequent?: unknown }> | undefined) ?? []) {
+        visitList(switchCase.consequent);
+      }
+      return;
+    case 'ForStatement':
+    case 'ForInStatement':
+    case 'ForOfStatement':
+    case 'WhileStatement':
+    case 'DoWhileStatement': {
+      const body = statement.body as StatementLike | undefined;
+      if (body?.start !== null && body?.start !== undefined &&
+          body.end !== null && body.end !== undefined) {
+        const bodyCompletion = completionForStatement(body);
+        // Each iteration computes a fresh body completion. A reached
+        // candidate immediately replaces this reset; a runtime path that
+        // reaches none of the candidates completes with undefined instead of
+        // leaking a value from an earlier iteration.
+        if (bodyCompletion.expressions.length === 0) {
+          visit(body);
+          return;
+        }
+        if (body.type === 'BlockStatement') {
+          const directives = (body.directives as Array<{ end?: number | null }> | undefined) ?? [];
+          const entry = directives.length > 0
+            ? directives[directives.length - 1]!.end
+            : (body.start as number) + 1;
+          if (entry !== null && entry !== undefined) {
+            insertions.push({ start: entry, replacement: ` ${clearCompletion}; ` });
+          }
+        } else {
+          insertions.push({
+            start: body.start as number,
+            replacement: `{ ${clearCompletion}; `,
+          });
+          insertions.push({ start: body.end as number, replacement: ' }' });
+        }
+      }
+      visit(body);
+      return;
+    }
+    default:
+      return;
+  }
+}
+
 function promiseObservationExpression(expression: string, completionKey?: string): string {
   let ast;
   try {
@@ -442,6 +525,10 @@ function promiseObservationExpression(expression: string, completionKey?: string
       other.label === range.label,
     ) === index,
   );
+  const loopInsertions: SourceInsertion[] = [];
+  for (const statement of ast.program.body as StatementLike[]) {
+    collectLoopEntryInsertions(statement, clearCompletion, loopInsertions);
+  }
   const replacements = [
     ...candidates.map(({ start, end }) => ({
       start: start as number,
@@ -456,9 +543,11 @@ function promiseObservationExpression(expression: string, completionKey?: string
       // capture that exit and change the caller's control flow.
       replacement: `{ ${clearCompletion}; ${kind}${label ? ` ${label}` : ''}; }`,
     })),
+    ...loopInsertions,
   ].sort((left, right) => right.start - left.start);
   for (const { start, end, replacement } of replacements) {
-    transformed = transformed.slice(0, start) + replacement + transformed.slice(end);
+    transformed = transformed.slice(0, start) + replacement +
+      transformed.slice(end === undefined ? start : end);
   }
   const directives = (ast.program.directives as Array<{
     end?: number | null;
@@ -476,8 +565,10 @@ function promiseObservationExpression(expression: string, completionKey?: string
     var state = root[${keyLiteral}];
     var value = state ? state.completionValue : void 0;
     try {
-      var PromiseCtor = root && root.Promise;
-      if (PromiseCtor) PromiseCtor.prototype.then.call(value, function() {}, function() {});
+      var PromiseCtor = state && (state.promiseConstructor || root.Promise);
+      var promiseThen = (state && state.promiseThen) ||
+        (PromiseCtor && PromiseCtor.prototype && PromiseCtor.prototype.then);
+      if (promiseThen) promiseThen.call(value, function() {}, function() {});
     } catch (_) {}
     if (state) state.completionValue = void 0;
     return value;
@@ -575,7 +666,14 @@ const SETTLE_REMOTE_FUNCTION = `function(key) {
     // Assimilate arbitrary thenables exactly once. Calling this.then
     // directly would accept a second callback or a nested thenable as the
     // final value, unlike JavaScript Promise resolution.
-    root.Promise.resolve(this).then(fulfill, reject);
+    var PromiseCtor = state.promiseConstructor || root.Promise;
+    var promiseResolve = state.promiseResolve || (PromiseCtor && PromiseCtor.resolve);
+    if (!promiseResolve) throw new Error('Promise constructor unavailable');
+    var resolved = promiseResolve.call(PromiseCtor, this);
+    var promiseThen = state.promiseThen ||
+      (PromiseCtor && PromiseCtor.prototype && PromiseCtor.prototype.then);
+    if (!promiseThen) throw new Error('Promise then unavailable');
+    promiseThen.call(resolved, fulfill, reject);
   } catch (error) { reject(error); }
   return true;
 }`;
