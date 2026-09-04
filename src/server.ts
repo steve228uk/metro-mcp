@@ -694,6 +694,7 @@ export async function createMetroRuntime(
         const { stdout } = await execFileAsync(command, args, {
           encoding: 'buffer',
           maxBuffer: options?.maxBuffer,
+          timeout: options?.timeout,
         });
         return Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout);
       },

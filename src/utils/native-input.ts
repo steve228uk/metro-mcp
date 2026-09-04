@@ -14,8 +14,19 @@ export interface NativeInputConfig {
 }
 
 export interface NativeCommandRunner {
-  execFile(command: string, args: string[], options?: { maxBuffer?: number }): Promise<Buffer>;
+  execFile(command: string, args: string[], options?: { maxBuffer?: number; timeout?: number }): Promise<Buffer>;
   exec(command: string): Promise<string>;
+}
+
+interface SimViewDirectoryEntry {
+  name: string;
+  directory: boolean;
+}
+
+interface SimViewFileSystem {
+  executable(path: string): Promise<boolean>;
+  readDirectory(path: string): Promise<SimViewDirectoryEntry[]>;
+  readFile(path: string): Promise<string>;
 }
 
 export interface NativeInputTarget {
@@ -92,6 +103,10 @@ export interface NativeInputOptions {
     client: SimViewClientLike;
     transport: SimViewTransportLike;
   };
+  /** Internal timeout override for deterministic provider tests. */
+  simviewRequestTimeoutMs?: number;
+  /** Internal filesystem override for deterministic provider discovery tests. */
+  simviewFileSystem?: SimViewFileSystem;
 }
 
 export function normalizeLogicalPoint(
@@ -106,6 +121,7 @@ export function normalizeLogicalPoint(
 }
 
 const SIMVIEW_PLUGIN_CACHE_ROOT = resolve(homedir(), '.codex/plugins/cache');
+const DEFAULT_SIMVIEW_REQUEST_TIMEOUT_MS = 2000;
 // IDB's `ui key` takes USB HID usage IDs. These are the usages for Return and
 // Backspace/Delete in the keyboard page (the same values used by IDB text).
 const IOS_HID_KEY_CODES = { ENTER: 40, DELETE: 42 } as const;
@@ -133,38 +149,76 @@ function unquoteCommandToken(value: string): string {
   return value.startsWith('"') || value.startsWith("'") ? value.slice(1, -1) : value;
 }
 
-async function executable(path: string): Promise<boolean> {
+const defaultSimViewFileSystem: SimViewFileSystem = {
+  executable: async (path) => {
+    try {
+      await access(path, constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  readDirectory: async (path) => (await readdir(path, { withFileTypes: true })).map((entry) => ({ name: entry.name, directory: entry.isDirectory() })),
+  readFile: (path) => readFile(path, 'utf8'),
+};
+
+async function boundedFileSystemOperation<T>(operation: () => Promise<T>, deadline?: number): Promise<T> {
+  const remaining = deadline === undefined ? undefined : deadline - Date.now();
+  if (remaining !== undefined && remaining <= 0) throw new Error('SimView provider discovery timed out');
+  const pending = operation();
+  if (remaining === undefined) return pending;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('SimView provider discovery timed out')), remaining);
+  });
   try {
-    await access(path, constants.X_OK);
-    return true;
+    return await Promise.race([pending, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function executable(path: string, deadline?: number, fileSystem = defaultSimViewFileSystem): Promise<boolean> {
+  try {
+    return await boundedFileSystemOperation(() => fileSystem.executable(path), deadline);
   } catch {
     return false;
   }
 }
 
-async function findSimViewPluginBinaries(roots: string[] = [SIMVIEW_PLUGIN_CACHE_ROOT]): Promise<string[]> {
+async function findSimViewPluginBinaries(
+  roots: string[] = [SIMVIEW_PLUGIN_CACHE_ROOT],
+  deadline?: number,
+  fileSystem = defaultSimViewFileSystem,
+): Promise<string[]> {
   const binaries: string[] = [];
   const seen = new Set<string>();
   const visit = async (root: string, depth: number): Promise<void> => {
-    if (seen.has(root) || depth < 0) return;
+    if (seen.has(root) || depth < 0 || (deadline !== undefined && deadline <= Date.now())) return;
     seen.add(root);
-    if (await executable(join(root, 'bin', 'simview')) && await validateSimViewPlugin(root)) {
+    if (await executable(join(root, 'bin', 'simview'), deadline, fileSystem) && await validateSimViewPlugin(root, deadline, fileSystem)) {
       binaries.push(join(root, 'bin', 'simview'));
       return;
     }
     try {
-      const entries = await readdir(root, { withFileTypes: true });
-      for (const entry of entries.filter((item) => item.isDirectory()).sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }))) await visit(join(root, entry.name), depth - 1);
+      const entries = await boundedFileSystemOperation(() => fileSystem.readDirectory(root), deadline);
+      for (const entry of entries.filter((item) => item.directory).sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }))) {
+        if (deadline !== undefined && deadline <= Date.now()) return;
+        await visit(join(root, entry.name), depth - 1);
+      }
     } catch { /* An uninstalled plugin is an ordinary unavailable provider. */ }
   };
-  for (const root of roots.length ? roots : [SIMVIEW_PLUGIN_CACHE_ROOT]) await visit(root, 3);
+  for (const root of roots.length ? roots : [SIMVIEW_PLUGIN_CACHE_ROOT]) {
+    if (deadline !== undefined && deadline <= Date.now()) break;
+    await visit(root, 3);
+  }
   return binaries;
 }
 
-async function validateSimViewPlugin(root: string): Promise<boolean> {
+async function validateSimViewPlugin(root: string, deadline?: number, fileSystem = defaultSimViewFileSystem): Promise<boolean> {
   try {
-    const manifest = JSON.parse(await readFile(join(root, '.codex-plugin/plugin.json'), 'utf8')) as Record<string, unknown>;
-    const mcp = JSON.parse(await readFile(join(root, '.mcp.json'), 'utf8')) as Record<string, unknown>;
+    const manifest = JSON.parse(await boundedFileSystemOperation(() => fileSystem.readFile(join(root, '.codex-plugin/plugin.json')), deadline)) as Record<string, unknown>;
+    const mcp = JSON.parse(await boundedFileSystemOperation(() => fileSystem.readFile(join(root, '.mcp.json')), deadline)) as Record<string, unknown>;
     const server = (mcp.mcpServers as Record<string, unknown> | undefined)?.simview as Record<string, unknown> | undefined;
     const command = server?.command;
     const args = server?.args;
@@ -180,6 +234,7 @@ async function validateSimViewPlugin(root: string): Promise<boolean> {
  */
 export async function discoverNativeProviders(
   options: NativeInputOptions,
+  deadline?: number,
 ): Promise<Provider[]> {
   const config = configValue(options.config);
   const result: Provider[] = [];
@@ -192,11 +247,13 @@ export async function discoverNativeProviders(
 
   for (const candidate of candidates) {
     let parts = commandParts(candidate.command);
+    const fileSystem = candidate.kind === 'simview' ? options.simviewFileSystem ?? defaultSimViewFileSystem : defaultSimViewFileSystem;
+    const discoveryDeadline = candidate.kind === 'simview' ? deadline : undefined;
     if (candidate.explicit) {
       const tokens = commandTokens(candidate.command);
       for (let index = tokens.length; index > 0; index--) {
         const possiblePath = tokens.slice(0, index).map(unquoteCommandToken).join(' ');
-        if (await executable(possiblePath)) {
+        if (await executable(possiblePath, discoveryDeadline, fileSystem)) {
           parts = { command: possiblePath, args: tokens.slice(index).map(unquoteCommandToken) };
           break;
         }
@@ -208,11 +265,21 @@ export async function discoverNativeProviders(
           ...(options.projectRoot ? [join(options.projectRoot, 'node_modules/.bin', parts.command)] : []),
           ...(options.projectRoot ? [join(options.projectRoot, parts.command)] : []),
           parts.command,
-          ...(candidate.kind === 'simview' ? await findSimViewPluginBinaries(options.simviewPluginRoots) : []),
         ];
     let selected: string | undefined;
+    const selectPath = async (path: string): Promise<boolean> => {
+      if (candidate.explicit || (path.includes('/') ? await executable(path) : await commandExists(options.runner, path, candidate.kind === 'simview' ? deadline : undefined))) {
+        selected = path;
+        return true;
+      }
+      return false;
+    };
     for (const path of paths) {
-      if (candidate.explicit || (path.includes('/') ? await executable(path) : await commandExists(options.runner, path))) {
+      if (await selectPath(path)) break;
+    }
+    if (!selected && candidate.kind === 'simview' && (deadline === undefined || deadline > Date.now())) {
+      const pluginPaths = await findSimViewPluginBinaries(options.simviewPluginRoots, discoveryDeadline, fileSystem);
+      for (const path of pluginPaths) {
         selected = path;
         break;
       }
@@ -222,7 +289,7 @@ export async function discoverNativeProviders(
       continue;
     }
     try {
-      const probed = await probeProvider(options.runner, candidate.kind, selected, parts.args);
+      const probed = await probeProvider(options.runner, candidate.kind, selected, parts.args, deadline);
       result.push({ kind: candidate.kind, command: selected, args: parts.args, available: true, ...probed });
     } catch (error) {
       result.push({
@@ -242,10 +309,11 @@ async function probeProvider(
   kind: Provider['kind'],
   command: string,
   args: string[],
+  deadline?: number,
 ): Promise<{ capabilities?: Set<string>; buttons?: Set<string> }> {
   let versionError: unknown;
   try {
-    await runner.execFile(command, [...args, '--version'], { maxBuffer: 64 * 1024 });
+    await boundedExecFile(runner, command, [...args, '--version'], { maxBuffer: 64 * 1024 }, kind === 'simview' ? deadline : undefined);
   } catch (error) {
     versionError = error;
   }
@@ -320,12 +388,34 @@ async function readOperationHelp(
   }
 }
 
-async function commandExists(runner: NativeCommandRunner, command: string): Promise<boolean> {
+async function commandExists(runner: NativeCommandRunner, command: string, deadline?: number): Promise<boolean> {
   try {
-    await runner.execFile('which', [command], { maxBuffer: 16 * 1024 });
+    await boundedExecFile(runner, 'which', [command], { maxBuffer: 16 * 1024 }, deadline);
     return true;
   } catch {
     return false;
+  }
+}
+
+async function boundedExecFile(
+  runner: NativeCommandRunner,
+  command: string,
+  args: string[],
+  options: { maxBuffer?: number },
+  deadline?: number,
+): Promise<Buffer> {
+  const remaining = deadline === undefined ? undefined : deadline - Date.now();
+  if (remaining !== undefined && remaining <= 0) throw new Error(`Timed out running ${command}`);
+  const operation = runner.execFile(command, args, { ...options, ...(remaining === undefined ? {} : { timeout: remaining }) });
+  if (remaining === undefined) return operation;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out running ${command}`)), remaining);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -354,14 +444,16 @@ export class NativeInputController {
   private actionQueue: Promise<void> = Promise.resolve();
   /** Track resources before connecting so shutdown can abort a pending handshake. */
   private readonly resources = new Set<SimViewResource>();
+  private readonly simviewRequestTimeoutMs: number;
 
   constructor(private readonly options: NativeInputOptions) {
     this.config = configValue(options.config);
+    this.simviewRequestTimeoutMs = Math.max(1, Math.floor(options.simviewRequestTimeoutMs ?? DEFAULT_SIMVIEW_REQUEST_TIMEOUT_MS));
     this.registerCleanup();
   }
 
-  async providersFor(target: NativeInputTarget): Promise<Provider[]> {
-    if (!this.providers) this.providers = await discoverNativeProviders(this.options);
+  async providersFor(target: NativeInputTarget, deadline = this.simviewDeadline()): Promise<Provider[]> {
+    if (!this.providers) this.providers = await discoverNativeProviders(this.options, deadline);
     return this.providers.filter((provider) =>
       this.config.nativeBackend === 'auto' || provider.kind === this.config.nativeBackend,
     ).filter((provider) => target.platform === 'ios' || provider.kind === 'simview');
@@ -379,10 +471,11 @@ export class NativeInputController {
   async tapLabel(target: NativeInputTarget, label: string): Promise<NativeDispatchResult> {
     if (this.closed) return result('none', 'unavailable', false, 'Native input controller is closed');
     if (target.platform !== 'ios') return result('none', 'unsupported', false, 'Label lookup is only available through IDB on iOS');
-    const providers = await this.providersFor(target);
+    const deadline = this.simviewDeadline();
+    const providers = await this.providersFor(target, deadline);
     const simview = providers.find((candidate) => candidate.kind === 'simview' && candidate.available);
     if (simview) {
-      const semantic = await this.simviewLabel(target, label, simview);
+      const semantic = await this.simviewLabel(target, label, simview, deadline);
       if (semantic.status !== 'unavailable' && semantic.status !== 'unsupported') return semantic;
     }
     const provider = providers.find((candidate) => candidate.kind === 'idb' && candidate.available);
@@ -405,11 +498,12 @@ export class NativeInputController {
   async longPressLabel(target: NativeInputTarget, label: string, duration: number): Promise<NativeDispatchResult> {
     if (this.closed) return result('none', 'unavailable', false, 'Native input controller is closed');
 
-    const providers = await this.providersFor(target);
+    const deadline = this.simviewDeadline();
+    const providers = await this.providersFor(target, deadline);
     let fallback: NativeDispatchResult | undefined;
     const simview = providers.find((candidate) => candidate.kind === 'simview' && candidate.available);
     if (simview) {
-      const semantic = await this.simviewLongPressLabel(target, label, duration, simview);
+      const semantic = await this.simviewLongPressLabel(target, label, duration, simview, deadline);
       if (semantic.status !== 'unavailable' && semantic.status !== 'unsupported') return semantic;
       fallback = semantic;
     }
@@ -431,21 +525,32 @@ export class NativeInputController {
     }
   }
 
-  private async simviewLabel(target: NativeInputTarget, label: string, provider: Provider): Promise<NativeDispatchResult> {
+  private async simviewLabel(target: NativeInputTarget, label: string, provider: Provider, requestDeadline?: number): Promise<NativeDispatchResult> {
     if (this.closed) return result('simview', 'unavailable', false, 'Native input controller is closed');
     let inputAttempted = false;
     try {
       return await this.withActionQueue(async () => {
-        const session = await this.getSession(target, provider);
+        const deadline = requestDeadline ?? this.simviewDeadline();
+        const session = await this.getSession(target, provider, deadline);
         return this.withSessionQueue(session, async () => {
           try {
-            await this.refreshSession(session);
+            await this.refreshSession(session, deadline);
           } catch (error) {
-            await this.invalidateSession(session);
+            await this.invalidateSession(session, deadline);
             throw error;
           }
           if (!session.tools.has('find_elements') || !session.tools.has('tap_element')) return result('simview', 'unsupported', false, 'SimView does not provide semantic label input');
-          const searchResponse = await session.client.callTool({ name: 'find_elements', arguments: { name: label, exact: true } });
+          let searchResponse: SimViewCallResult;
+          try {
+            searchResponse = await this.simviewRequest(
+              () => session.client.callTool({ name: 'find_elements', arguments: { name: label, exact: true } }),
+              `find element "${label}"`,
+              deadline,
+            );
+          } catch (error) {
+            await this.invalidateSession(session, deadline);
+            throw error;
+          }
           if (searchResponse.isError) return result('simview', 'unavailable', false, 'SimView semantic search is unavailable');
           const found = readStructuredResult(searchResponse);
           const matches = Array.isArray(found.matches) ? found.matches : [];
@@ -457,6 +562,7 @@ export class NativeInputController {
           }).filter((ref): ref is string => typeof ref === 'string');
           if (refs.length === 0) return result('simview', 'unsupported', false, `Element "${label}" was not found by SimView`);
           if (refs.length !== 1) return result('simview', 'failed', false, `Element "${label}" is ambiguous`);
+          if (Date.now() >= deadline) return result('simview', 'unavailable', false, 'SimView setup timed out before input dispatch', 'not-sent');
           inputAttempted = true;
           const tapResponse = await session.client.callTool({ name: 'tap_element', arguments: { ref: refs[0] } });
           const tapped = readStructuredResult(tapResponse);
@@ -497,17 +603,18 @@ export class NativeInputController {
     }
   }
 
-  private async simviewLongPressLabel(target: NativeInputTarget, label: string, duration: number, provider: Provider): Promise<NativeDispatchResult> {
+  private async simviewLongPressLabel(target: NativeInputTarget, label: string, duration: number, provider: Provider, requestDeadline?: number): Promise<NativeDispatchResult> {
     if (this.closed) return result('simview', 'unavailable', false, 'Native input controller is closed');
     let inputAttempted = false;
     try {
       return await this.withActionQueue(async () => {
-        const session = await this.getSession(target, provider);
+        const deadline = requestDeadline ?? this.simviewDeadline();
+        const session = await this.getSession(target, provider, deadline);
         return this.withSessionQueue(session, async () => {
           try {
-            await this.refreshSession(session);
+            await this.refreshSession(session, deadline);
           } catch (error) {
-            await this.invalidateSession(session);
+            await this.invalidateSession(session, deadline);
             throw error;
           }
           if (!session.tools.has('find_elements') || !session.tools.has('long_press')) {
@@ -517,7 +624,17 @@ export class NativeInputController {
           if (input?.touch !== true) {
             return result('simview', 'unsupported', false, 'SimView does not support touch input');
           }
-          const searchResponse = await session.client.callTool({ name: 'find_elements', arguments: { name: label, exact: true } });
+          let searchResponse: SimViewCallResult;
+          try {
+            searchResponse = await this.simviewRequest(
+              () => session.client.callTool({ name: 'find_elements', arguments: { name: label, exact: true } }),
+              `find element "${label}"`,
+              deadline,
+            );
+          } catch (error) {
+            await this.invalidateSession(session, deadline);
+            throw error;
+          }
           if (searchResponse.isError) return result('simview', 'unavailable', false, 'SimView semantic search is unavailable');
           const found = readStructuredResult(searchResponse);
           const matches = Array.isArray(found.matches) ? found.matches : [];
@@ -531,6 +648,7 @@ export class NativeInputController {
             : undefined;
           const point = simViewFrameCenter(element, session.width, session.height);
           if (!point) return result('simview', 'unsupported', false, `Element "${label}" has no usable frame`);
+          if (Date.now() >= deadline) return result('simview', 'unavailable', false, 'SimView setup timed out before input dispatch', 'not-sent');
           inputAttempted = true;
           const response = await session.client.callTool({ name: 'long_press', arguments: { ...point, durationMs: duration } });
           const structured = readStructuredResult(response);
@@ -595,7 +713,8 @@ export class NativeInputController {
     if (this.closed) return result(target.platform === 'android' ? 'adb' : 'none', 'unavailable', false, 'Native input controller is closed');
     return this.withActionQueue(async () => {
       if (this.closed) return result(target.platform === 'android' ? 'adb' : 'none', 'unavailable', false, 'Native input controller is closed');
-      const geometry = await this.geometry(target);
+      const deadline = this.simviewDeadline();
+      const geometry = await this.geometry(target, deadline);
       if (!geometry) return result('none', 'unavailable', false, 'Device geometry is unavailable; refusing to guess swipe coordinates');
       const { width, height } = geometry;
       const insetX = width * 0.2;
@@ -610,11 +729,11 @@ export class NativeInputController {
         to = { x: width / 2, y: direction === 'up' ? insetY : height * 0.75 };
       }
       if (target.platform === 'android') return this.adb(target, ['shell', 'input', 'swipe', String(from.x), String(from.y), String(to.x), String(to.y), String(duration)], 'swipe');
-      return this.dispatchSimViewOrIdb(target, 'swipe', { from, to, durationMs: duration }, true);
+      return this.dispatchSimViewOrIdb(target, 'swipe', { from, to, durationMs: duration }, true, deadline, geometry.simviewUnavailable);
     });
   }
 
-  private async geometry(target: NativeInputTarget): Promise<{ width: number; height: number } | null> {
+  private async geometry(target: NativeInputTarget, deadline = this.simviewDeadline()): Promise<({ width: number; height: number; simviewUnavailable?: boolean }) | null> {
     if (target.platform === 'android') {
       try {
         const output = (await this.options.runner.execFile('adb', ['-s', target.id, 'shell', 'wm', 'size'], { maxBuffer: 16 * 1024 })).toString('utf8');
@@ -623,15 +742,15 @@ export class NativeInputController {
         return match ? { width: Number(match[2]), height: Number(match[3]) } : null;
       } catch { return null; }
     }
-    const providers = await this.providersFor(target);
+    const providers = await this.providersFor(target, deadline);
     const simview = providers.find((provider) => provider.kind === 'simview' && provider.available);
     if (simview) {
       try {
-        const session = await this.getSession(target, simview);
-        await this.refreshSession(session);
+        const session = await this.getSession(target, simview, deadline);
+        await this.refreshSession(session, deadline);
         return { width: session.width, height: session.height };
       } catch (error) {
-        if (this.session) await this.invalidateSession(this.session);
+        if (this.session) await this.invalidateSession(this.session, deadline);
         /* Try IDB when SimView is unavailable. */
       }
     }
@@ -643,7 +762,7 @@ export class NativeInputController {
       const dimensions = (parsed.screen_dimensions ?? parsed.screenDimensions) as Record<string, unknown> | undefined;
       const width = Number(dimensions?.width_points ?? dimensions?.widthPoints);
       const height = Number(dimensions?.height_points ?? dimensions?.heightPoints);
-      return Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0 ? { width, height } : null;
+      return Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0 ? { width, height, simviewUnavailable: Boolean(simview) } : null;
     } catch { return null; }
   }
 
@@ -676,13 +795,21 @@ export class NativeInputController {
     }
   }
 
-  private async dispatchSimViewOrIdb(target: NativeInputTarget, operation: string, args: Record<string, unknown>, inActionQueue = false): Promise<NativeDispatchResult> {
-    const providers = await this.providersFor(target);
+  private async dispatchSimViewOrIdb(
+    target: NativeInputTarget,
+    operation: string,
+    args: Record<string, unknown>,
+    inActionQueue = false,
+    deadline = this.simviewDeadline(),
+    skipSimView = false,
+  ): Promise<NativeDispatchResult> {
+    const providers = await this.providersFor(target, deadline);
     let fallback: NativeDispatchResult | undefined;
     for (const provider of providers) {
       if (!provider.available) continue;
+      if (skipSimView && provider.kind === 'simview') continue;
       const dispatched = provider.kind === 'simview'
-        ? await this.simview(target, operation, args, provider, inActionQueue)
+        ? await this.simview(target, operation, args, provider, inActionQueue, deadline)
         : await this.idb(target, operation, args, provider);
       if (dispatched.status === 'unavailable' || dispatched.status === 'unsupported') {
         fallback = dispatched;
@@ -740,17 +867,31 @@ export class NativeInputController {
     }
   }
 
-  private simview(target: NativeInputTarget, operation: string, args: Record<string, unknown>, provider: Provider, inActionQueue = false): Promise<NativeDispatchResult> {
+  private simview(
+    target: NativeInputTarget,
+    operation: string,
+    args: Record<string, unknown>,
+    provider: Provider,
+    inActionQueue = false,
+    deadline?: number,
+  ): Promise<NativeDispatchResult> {
     return inActionQueue
-      ? this.simviewInternal(target, operation, args, provider)
-      : this.withActionQueue(() => this.simviewInternal(target, operation, args, provider));
+      ? this.simviewInternal(target, operation, args, provider, deadline)
+      : this.withActionQueue(() => this.simviewInternal(target, operation, args, provider, deadline));
   }
 
-  private async simviewInternal(target: NativeInputTarget, operation: string, args: Record<string, unknown>, provider: Provider): Promise<NativeDispatchResult> {
+  private async simviewInternal(
+    target: NativeInputTarget,
+    operation: string,
+    args: Record<string, unknown>,
+    provider: Provider,
+    requestDeadline?: number,
+  ): Promise<NativeDispatchResult> {
     if (this.closed) return result('simview', 'unavailable', false, 'Native input controller is closed');
+    const deadline = requestDeadline ?? this.simviewDeadline();
     let session: SimViewSession;
     try {
-      session = await this.getSession(target, provider);
+      session = await this.getSession(target, provider, deadline);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // A failed handshake happens before SimView receives an input action.
@@ -762,9 +903,9 @@ export class NativeInputController {
     return this.withSessionQueue(session, async () => {
       if (this.closed) return result('simview', 'unavailable', false, 'Native input controller is closed');
       try {
-        await this.refreshSession(session);
+        await this.refreshSession(session, deadline);
       } catch (error) {
-        await this.invalidateSession(session);
+        await this.invalidateSession(session, deadline);
         // Refresh only reads the session/device state and precedes the actual
         // input call, so a refresh failure cannot have dispatched input.
         return result('simview', 'unavailable', false, error instanceof Error ? error.message : String(error), 'not-sent');
@@ -785,6 +926,7 @@ export class NativeInputController {
       // versions advertise one, so honor it when present while retaining
       // compatibility with that public release.
       if (operation === 'press_key' && Array.isArray(input?.keys) && !input.keys.includes(args.key)) return result('simview', 'unsupported', false, `SimView does not support key ${String(args.key)}`);
+      if (Date.now() >= deadline) return result('simview', 'unavailable', false, 'SimView setup timed out before input dispatch', 'not-sent');
       const normalized = this.normalizeArgs(operation, args, session.width, session.height);
       try {
         const response = await session.client.callTool({ name: tool, arguments: normalized });
@@ -828,7 +970,7 @@ export class NativeInputController {
     return args;
   }
 
-  private async getSession(target: NativeInputTarget, provider: Provider): Promise<SimViewSession> {
+  private async getSession(target: NativeInputTarget, provider: Provider, deadline = this.simviewDeadline()): Promise<SimViewSession> {
     if (this.closed) throw new Error('Native input controller is closed');
     const deviceId = `${target.platform}:${target.id}`;
     if (this.session) {
@@ -838,25 +980,29 @@ export class NativeInputController {
     if (this.session) {
       const session = this.session;
       return this.withSessionQueue(session, async () => {
-        if (this.closed) throw new Error('Native input controller is closed');
-        const switched = await session.client.callTool({ name: 'connect_device', arguments: { deviceId, observationMode: 'semantic' } });
-        if (switched.isError) throw new Error(`SimView could not connect to ${deviceId}`);
-        session.deviceId = deviceId;
         try {
-          await this.refreshSession(session);
+          if (this.closed) throw new Error('Native input controller is closed');
+          const switched = await this.simviewRequest(
+            () => session.client.callTool({ name: 'connect_device', arguments: { deviceId, observationMode: 'semantic' } }),
+            `connect to ${deviceId}`,
+            deadline,
+          );
+          if (switched.isError) throw new Error(`SimView could not connect to ${deviceId}`);
+          session.deviceId = deviceId;
+          await this.refreshSession(session, deadline);
           return session;
         } catch (error) {
-          await this.invalidateSession(session);
+          await this.invalidateSession(session, deadline);
           throw error;
         }
       });
     }
-    if (this.pendingSession) return this.pendingSession.then(() => this.getSession(target, provider));
-    this.pendingSession = this.createSession(target, provider);
+    if (this.pendingSession) return this.pendingSession.then(() => this.getSession(target, provider, deadline));
+    this.pendingSession = this.createSession(target, provider, deadline);
     try { return await this.pendingSession; } finally { this.pendingSession = null; }
   }
 
-  private async createSession(target: NativeInputTarget, provider: Provider): Promise<SimViewSession> {
+  private async createSession(target: NativeInputTarget, provider: Provider, deadline = this.simviewDeadline()): Promise<SimViewSession> {
     const deviceId = `${target.platform}:${target.id}`;
     const mcpArgs = provider.args.at(-1) === 'mcp' ? provider.args : [...provider.args, 'mcp'];
     const created = this.options.simviewClientFactory?.(provider.command, mcpArgs);
@@ -865,22 +1011,26 @@ export class NativeInputController {
     const resource: SimViewResource = { client, transport, closePromise: null };
     this.resources.add(resource);
     try {
-      await client.connect(transport);
+      await this.simviewRequest(() => client.connect(transport), 'connect', deadline);
       if (this.closed) throw new Error('Native input controller is closed');
-      const tools = await client.listTools();
+      const tools = await this.simviewRequest(() => client.listTools(), 'list tools', deadline);
       if (this.closed) throw new Error('Native input controller is closed');
       if (!tools.tools.some((tool) => tool.name === 'connect_device')) throw new Error('SimView MCP server does not provide connect_device');
-      const connected = await client.callTool({ name: 'connect_device', arguments: { deviceId, observationMode: 'semantic' } });
+      const connected = await this.simviewRequest(
+        () => client.callTool({ name: 'connect_device', arguments: { deviceId, observationMode: 'semantic' } }),
+        `connect to ${deviceId}`,
+        deadline,
+      );
       if (this.closed) throw new Error('Native input controller is closed');
       if (connected.isError) throw new Error('SimView could not connect to the selected device');
-      const state = await client.callTool({ name: 'get_simview_state', arguments: {} });
+      const state = await this.simviewRequest(() => client.callTool({ name: 'get_simview_state', arguments: {} }), 'read device state', deadline);
       if (this.closed) throw new Error('Native input controller is closed');
-      const session = await this.sessionFromState(resource, deviceId, tools.tools.map((tool) => tool.name), state);
+      const session = await this.sessionFromState(resource, deviceId, tools.tools.map((tool) => tool.name), state, deadline);
       if (this.closed) throw new Error('Native input controller is closed');
       this.session = session;
       return session;
     } catch (error) {
-      await settleWithin(this.closeResource(resource));
+      await this.closeResourceBeforeDeadline(resource, deadline);
       throw error;
     }
   }
@@ -890,6 +1040,7 @@ export class NativeInputController {
     deviceId: string,
     toolNames: string[],
     state: SimViewCallResult,
+    deadline = this.simviewDeadline(),
   ): Promise<SimViewSession> {
     const { client, transport } = resource;
     if (this.closed) throw new Error('Native input controller is closed');
@@ -906,7 +1057,11 @@ export class NativeInputController {
     let height = stateHeight;
     if (toolNames.includes('observe_screen')) {
       if (this.closed) throw new Error('Native input controller is closed');
-      const observation = await client.callTool({ name: 'observe_screen', arguments: { mode: 'semantic' } });
+      const observation = await this.simviewRequest(
+        () => client.callTool({ name: 'observe_screen', arguments: { mode: 'semantic' } }),
+        'observe screen geometry',
+        deadline,
+      );
       if (observation.isError) throw new Error('SimView did not report a semantic observation for device geometry');
       const observed = extractObservationGeometry(readStructuredResult(observation));
       if (observed) {
@@ -918,21 +1073,59 @@ export class NativeInputController {
     return { client, transport, resource, deviceId, width, height, capabilities, tools: new Set(toolNames), queue: Promise.resolve(), closed: false };
   }
 
-  private async refreshSession(session: SimViewSession): Promise<void> {
+  private async refreshSession(session: SimViewSession, deadline = this.simviewDeadline()): Promise<void> {
     if (session.closed) throw new Error('SimView session is closed');
-    const state = await session.client.callTool({ name: 'get_simview_state', arguments: {} });
+    const state = await this.simviewRequest(() => session.client.callTool({ name: 'get_simview_state', arguments: {} }), 'refresh device state', deadline);
     if (state.isError) throw new Error('SimView could not refresh the selected device state');
-    const refreshed = await this.sessionFromState(session.resource, session.deviceId, [...session.tools], state);
+    const refreshed = await this.sessionFromState(session.resource, session.deviceId, [...session.tools], state, deadline);
     session.width = refreshed.width;
     session.height = refreshed.height;
     session.capabilities = refreshed.capabilities;
   }
 
-  private async invalidateSession(session: SimViewSession): Promise<void> {
+  /**
+   * Bound every SimView request made before native input dispatch. The MCP
+   * client cannot cancel a stalled call, so callers invalidate and close its
+   * resource after this deadline before considering a fallback provider.
+   */
+  private simviewDeadline(): number {
+    return Date.now() + this.simviewRequestTimeoutMs;
+  }
+
+  private async simviewRequest<T>(operation: () => Promise<T>, description: string, deadline = this.simviewDeadline()): Promise<T> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`SimView ${description} timed out before the request started`);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`SimView ${description} timed out after ${this.simviewRequestTimeoutMs}ms`)), remaining);
+    });
+    try {
+      return await Promise.race([Promise.resolve().then(operation), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async invalidateSession(session: SimViewSession, deadline = this.simviewDeadline()): Promise<void> {
     if (session.closed) return;
     session.closed = true;
     if (this.session === session) this.session = null;
-    await this.closeResource(session.resource);
+    await this.closeResourceBeforeDeadline(session.resource, deadline);
+  }
+
+  private async closeResourceBeforeDeadline(resource: SimViewResource, deadline: number): Promise<void> {
+    const close = this.closeResource(resource);
+    const remaining = Math.max(0, deadline - Date.now());
+    if (remaining > 0) {
+      await settleWithin(close, remaining);
+    } else {
+      // The resource is detached above and closeResource has already claimed
+      // its closePromise. Consume late failures without extending fallback.
+      void close.catch(() => {});
+    }
+    // Do not retain a resource whose bounded cleanup has already been handed
+    // off. Its closePromise remains the once-only guard for late completion.
+    this.resources.delete(resource);
   }
 
   private async withSessionQueue<T>(session: SimViewSession, operation: () => Promise<T>): Promise<T> {
