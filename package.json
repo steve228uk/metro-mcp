@@ -63,6 +63,7 @@
   "author": "Stephen Radford",
   "license": "MIT",
   "dependencies": {
+    "@babel/parser": "^7.29.2",
     "@clack/prompts": "^1.2.0",
     "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/node": "^2.0.0",
