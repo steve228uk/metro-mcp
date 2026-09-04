@@ -2,7 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import type { z } from 'zod';
 import type { MetroTarget } from 'metro-bridge';
 import type { ComponentNode, PluginContext, ToolHandlerResult } from '../plugin.js';
-import { deeplinkPlugin, extractAndroidSchemeDump, parseBundleUrlSchemes } from './deeplink.js';
+import {
+  deeplinkPlugin,
+  extractAndroidSchemeDump,
+  isValidAndroidApplicationId,
+  parseBundleUrlSchemes,
+} from './deeplink.js';
 
 type RegisteredTool = {
   parameters: z.ZodType;
@@ -19,7 +24,11 @@ function createHarness(options: {
   androidInventory?: string;
 } = {}) {
   const tools = new Map<string, RegisteredTool>();
-  const calls: Array<{ command: string; args: string[] }> = [];
+  const calls: Array<{
+    command: string;
+    args: string[];
+    options?: { maxBuffer?: number };
+  }> = [];
   const target = options.target === undefined ? {
     id: 'target',
     title: 'Test app',
@@ -58,8 +67,8 @@ function createHarness(options: {
     logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
     metro: { host: 'localhost', port: 8081, fetch: async () => new Response() },
     exec: async () => '',
-    execFile: async (command, args) => {
-      calls.push({ command, args });
+    execFile: async (command, args, execOptions) => {
+      calls.push(execOptions ? { command, args, options: execOptions } : { command, args });
       if (command === 'xcrun' && args[1] === 'list') {
         return Buffer.from(JSON.stringify({ devices: {
           'com.apple.CoreSimulator.SimRuntime.iOS-18-0': [
@@ -161,6 +170,7 @@ describe('list_url_schemes', () => {
     expect(harness.calls).toContainEqual({
       command: 'adb',
       args: ['-s', 'emulator-2', 'shell', 'pm', 'dump', 'com.example.android'],
+      options: { maxBuffer: 64 * 1024 * 1024 },
     });
   });
 
@@ -178,8 +188,46 @@ describe('list_url_schemes', () => {
     expect(harness.calls).toContainEqual({
       command: 'adb',
       args: ['-s', 'emulator-2', 'shell', 'pm', 'dump', 'com.example.android'],
+      options: { maxBuffer: 64 * 1024 * 1024 },
     });
     expect(harness.calls.some(({ command }) => command === 'xcrun')).toBe(false);
+  });
+
+  test('rejects unsafe Android IDs before running adb', async () => {
+    for (const bundleId of ['com.example;id', 'com.example app', 'com.example$(id)']) {
+      const harness = createHarness();
+      const tool = await harness.setup();
+
+      expect(await call(tool, { platform: 'android', bundleId }))
+        .toContain(`Invalid Android application ID ${JSON.stringify(bundleId)}`);
+      expect(harness.calls.filter(({ command }) => command === 'adb')).toEqual([]);
+      expect(isValidAndroidApplicationId(bundleId)).toBe(false);
+    }
+  });
+
+  test('rejects an unsafe connected Android app ID before package dump dispatch', async () => {
+    const bundleId = 'com.example;id';
+    const harness = createHarness({
+      target: {
+        id: 'android-target', title: 'Android app', description: 'React Native', type: 'node',
+        appId: bundleId, deviceName: 'Pixel 8',
+        reactNative: { logicalDeviceId: 'emulator-2' },
+      },
+      androidInventory: 'List of devices attached\nemulator-2\tdevice model:Pixel_8\n',
+    });
+    const tool = await harness.setup();
+
+    expect(await call(tool, { platform: 'auto' }))
+      .toContain(`Invalid Android application ID ${JSON.stringify(bundleId)}`);
+    expect(harness.calls.some(({ command, args }) =>
+      command === 'adb' && args.includes('pm'))).toBe(false);
+  });
+
+  test('accepts Android application IDs with valid segment syntax', () => {
+    expect(isValidAndroidApplicationId('com.example.app_2')).toBe(true);
+    expect(isValidAndroidApplicationId('Com.Example2.Feature_')).toBe(true);
+    expect(isValidAndroidApplicationId('example')).toBe(false);
+    expect(isValidAndroidApplicationId('2com.example')).toBe(false);
   });
 
   test('requires an explicit app ID before discovering an explicit platform', async () => {

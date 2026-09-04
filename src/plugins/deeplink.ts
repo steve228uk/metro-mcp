@@ -10,6 +10,26 @@ function outputText(output: Buffer | string): string {
   return typeof output === 'string' ? output : output.toString('utf8');
 }
 
+// Package dumps can include the complete set of declared components and intent
+// filters. Keep enough headroom for large applications while retaining an
+// explicit child-process limit instead of relying on Node's default buffer.
+const ANDROID_PACKAGE_DUMP_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Validate a package name before passing it to `adb shell pm dump`.
+ *
+ * `execFile` protects the host process, but adb still reconstructs the
+ * arguments for the remote shell. Android application IDs therefore need a
+ * stricter check at this boundary.
+ */
+export function isValidAndroidApplicationId(value: string): boolean {
+  return /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(value);
+}
+
+function invalidAndroidApplicationId(value: string): string {
+  return `Invalid Android application ID ${JSON.stringify(value)}. Expected at least two dot-separated segments; each segment must start with an ASCII letter and contain only ASCII letters, digits, or underscores.`;
+}
+
 /**
  * Extract the schemes declared in an iOS Info.plist JSON representation.
  * Invalid entries are ignored because an app may declare URL types for other
@@ -134,6 +154,13 @@ export const deeplinkPlugin = definePlugin({
             : `Bundle ID is required when selecting the ${platform} platform explicitly.`;
         }
 
+        // Validate explicit Android IDs before discovery so malformed input
+        // cannot cause even an adb inventory command to run.
+        if (platform === 'android' &&
+            (bundleId === undefined || !isValidAndroidApplicationId(bundleId))) {
+          return invalidAndroidApplicationId(bundleId ?? requestedBundleId);
+        }
+
         // Keep device selection and the connected app ID tied to one target
         // snapshot if Metro changes its active runtime during discovery.
         const target = await resolveTarget(platform, targetInfo);
@@ -152,6 +179,10 @@ export const deeplinkPlugin = definePlugin({
           }
         }
 
+        if (!isValidAndroidApplicationId(requestedBundleId)) {
+          return invalidAndroidApplicationId(requestedBundleId);
+        }
+
         // Android has no Info.plist equivalent. Keep the established package
         // dump response, but scope it to the resolved serial and filter it in
         // memory rather than sending an interpolated shell pipeline.
@@ -164,7 +195,7 @@ export const deeplinkPlugin = definePlugin({
               'pm',
               'dump',
               requestedBundleId,
-            ]),
+            ], { maxBuffer: ANDROID_PACKAGE_DUMP_MAX_BYTES }),
           );
           return extractAndroidSchemeDump(output) || 'No URL schemes found.';
         } catch (error) {
