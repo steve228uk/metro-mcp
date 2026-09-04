@@ -102,6 +102,8 @@ export async function awaitPromiseBeforeDeadline<T>(
 }
 
 export interface AwaitAppResultOptions {
+  /** Absolute caller deadline shared by every awaited stage. */
+  deadline?: number;
   /**
    * Evaluation used for mailbox reads. This may reconnect before a read, but
    * must never replay the expression that created the mailbox.
@@ -186,7 +188,10 @@ export async function awaitAppResult(
   const mailboxName = `__METRO_MCP_ASYNC_${randomUUID()}`;
   const objectGroup = `__METRO_MCP_ASYNC_GROUP_${randomUUID()}`;
   const key = JSON.stringify(mailboxName);
-  const deadline = Date.now() + timeout;
+  const timeoutDeadline = Date.now() + timeout;
+  const deadline = options?.deadline === undefined
+    ? timeoutDeadline
+    : Math.min(timeoutDeadline, options.deadline);
   let sourceCompletedByValue = false;
   let remoteHandleReleased = false;
   let sourceEvaluation: Promise<AppEvaluationCompletion> | undefined;
@@ -194,15 +199,22 @@ export async function awaitAppResult(
 
   const releaseGroup = async (): Promise<void> => {
     if (!options?.releaseObjectGroup) return;
-    const releaseDeadline = Date.now() + 100;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return;
+    const releaseTimeout = Math.min(100, remaining);
+    const releaseDeadline = Date.now() + releaseTimeout;
     await awaitPromiseBeforeDeadline(
-      options.releaseObjectGroup(objectGroup, { timeout: 100 }),
+      options.releaseObjectGroup(objectGroup, { timeout: releaseTimeout }),
       releaseDeadline,
-      100,
+      releaseTimeout,
     ).catch(() => {});
   };
 
   try {
+    const mailboxLifetime = Math.max(
+      0,
+      Math.min(timeout, deadline - Date.now()),
+    ) + 1000;
     const mailboxSetup = `(function() {
       var state = { status: 'pending' };
       Object.defineProperty(globalThis, ${key}, {
@@ -210,7 +222,7 @@ export async function awaitAppResult(
       });
       state.timer = setTimeout(function() {
         if (globalThis[${key}] === state) delete globalThis[${key}];
-      }, ${timeout + 1000});
+      }, ${mailboxLifetime});
       return true;
     })()`;
     const mailboxGeneration = options?.setupMailbox
