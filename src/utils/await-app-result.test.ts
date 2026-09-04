@@ -170,6 +170,34 @@ describe('async app read results', () => {
     }
   });
 
+  test('returns a by-value primitive without a mailbox write or poll', async () => {
+    const { evaluate, evaluateScript } = hermesHarness();
+    const evaluatedExpressions: string[] = [];
+    const trackingEvaluate: PluginContext['evalInApp'] = async (source, options) => {
+      evaluatedExpressions.push(source);
+      return evaluate(source, options);
+    };
+
+    await expect(awaitAppResult(
+      trackingEvaluate,
+      '42',
+      1000,
+      {
+        evaluateScript: async (source) => {
+          expect(source).toBe('42');
+          return evaluateScript(source);
+        },
+      },
+    )).resolves.toBe(42);
+
+    expect(evaluatedExpressions).toHaveLength(2);
+    expect(evaluatedExpressions[0]).toContain("status: 'pending'");
+    expect(evaluatedExpressions[1]).toContain('delete root[');
+    expect(
+      evaluatedExpressions.some((source) => source.includes('status: state.status')),
+    ).toBe(false);
+  });
+
   test('preserves script completion values and executes the source once', async () => {
     const { runtime, awaitResult, releasedGroups } = hermesHarness();
     expect(await awaitResult(
@@ -244,51 +272,6 @@ describe('async app read results', () => {
     expect(runtime).toMatchObject({ evaluationCount: 1 });
     expect(pollReads).toBeGreaterThan(1);
     expect(transportRecovered).toBe(true);
-  });
-
-  test('retries a mailbox completion write without replaying the source', async () => {
-    const {
-      runtime,
-      evaluate,
-      evaluateScript,
-      settleRemote,
-      releasedGroups,
-    } = hermesHarness();
-    let mailboxWriteAttempts = 0;
-    let reconnects = 0;
-    const evaluateWithDisconnect: PluginContext['evalInApp'] = async (expression, options) => {
-      if (expression.includes('state.unserializableValue = void 0;')) {
-        mailboxWriteAttempts += 1;
-        if (mailboxWriteAttempts === 1) throw new Error('transport disconnected');
-      }
-      return evaluate(expression, options);
-    };
-    const pollEvaluate: PluginContext['evalInApp'] = async (expression, options) => {
-      try {
-        return await evaluateWithDisconnect(expression, options);
-      } catch (error) {
-        if (!expression.includes('state.unserializableValue = void 0;')) throw error;
-        reconnects += 1;
-        return evaluateWithDisconnect(expression, options);
-      }
-    };
-
-    await expect(awaitAppResult(
-      evaluateWithDisconnect,
-      `globalThis.evaluationCount = (globalThis.evaluationCount || 0) + 1;
-       globalThis.evaluationCount;`,
-      1000,
-      {
-        pollEvaluate,
-        evaluateScript,
-        settleRemote,
-        releaseObjectGroup: async (objectGroup) => { releasedGroups.push(objectGroup); },
-      },
-    )).resolves.toBe(1);
-    expect(runtime).toMatchObject({ evaluationCount: 1 });
-    expect(mailboxWriteAttempts).toBe(2);
-    expect(reconnects).toBe(1);
-    expect(releasedGroups).toHaveLength(0);
   });
 
   test('keeps global script declarations across awaited evaluations', async () => {
