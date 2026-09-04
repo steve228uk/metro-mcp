@@ -440,13 +440,15 @@ export function createAppEvaluator(
   cdp: Pick<CDPConnection, 'send'>,
   lifecycle: AppEvaluationLifecycle,
 ): (expression: string, options?: EvalOptions) => Promise<unknown> {
-  const ensureConnectedForDispatch = async (options?: EvalOptions): Promise<void> => {
+  const ensureConnectedForDispatch = async (options?: EvalOptions): Promise<boolean> => {
     try {
       await lifecycle.ensureConnected(options?.deadline);
+      return false;
     } catch (error) {
       if (!isServerDisconnectedError(error)) throw error;
       await recoverTransport(options?.deadline, options?.timeout);
       await lifecycle.ensureConnected(options?.deadline);
+      return true;
     }
   };
 
@@ -488,7 +490,16 @@ export function createAppEvaluator(
   ): Promise<AppEvaluationCompletion> => {
     let sourceGeneration = options?.generation;
     const evaluateOnce = async (): Promise<AppEvaluationCompletion> => {
-      await ensureConnectedForDispatch(options);
+      const recovered = await ensureConnectedForDispatch(options);
+      if (recovered && options?.retryMailboxSetup) {
+        if (options.deadline === undefined) {
+          throw new Error('App evaluation retry requires a deadline');
+        }
+        sourceGeneration = await options.retryMailboxSetup({
+          timeout: options.timeout,
+          deadline: options.deadline,
+        });
+      }
       if (
         sourceGeneration !== undefined &&
         lifecycle.getGeneration &&

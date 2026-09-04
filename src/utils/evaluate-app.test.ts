@@ -966,6 +966,43 @@ describe('shared app evaluation policy', () => {
       String(call.params.expression).includes('sourceMutation'))).toHaveLength(0);
   });
 
+  test('recreates the mailbox after server-level recovery changes the runtime generation', async () => {
+    const { transport, calls } = vmTransport();
+    let generation = 1;
+    let ensureAttempts = 0;
+    let mailboxSetups = 0;
+    const originalSend = transport.send;
+    transport.send = async (method, params) => {
+      if (method === 'Runtime.evaluate' &&
+          String(params?.expression).includes('Object.defineProperty(globalThis')) {
+        mailboxSetups += 1;
+      }
+      return originalSend(method, params);
+    };
+    const base = lifecycle({
+      ensureConnected: async () => {
+        ensureAttempts += 1;
+        if (ensureAttempts === 2) {
+          throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+        }
+      },
+      reconnect: async () => { generation = 2; },
+    });
+    const evalInApp = createAppEvaluator(transport, {
+      ...base,
+      getGeneration: () => generation,
+    });
+
+    await expect(evalInApp(
+      'globalThis.generationRecoverySource = (globalThis.generationRecoverySource || 0) + 1; Promise.resolve(generationRecoverySource);',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(1);
+    expect(generation).toBe(2);
+    expect(mailboxSetups).toBe(2);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('generationRecoverySource'))).toHaveLength(1);
+  });
+
   test('does not retry remote settlement after a deadline-bounded reconnect', async () => {
     const { transport } = vmTransport();
     const originalSend = transport.send;
