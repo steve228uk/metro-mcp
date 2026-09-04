@@ -13,6 +13,8 @@ import {
 } from '../utils/fiber.js';
 import {
   adbPrefix,
+  discoverAndroidDevices,
+  discoverBootedSimulators,
   getConnectedDeviceTarget,
   resolveDevice,
 } from '../utils/device-discovery.js';
@@ -51,6 +53,29 @@ export const uiInteractPlugin = definePlugin({
     const nativeResult = (action: string, dispatch: NativeDispatchResult): string => {
       const outcome = dispatch.status === 'handled' ? action : `${action} failed`;
       return `${outcome} [backend=${dispatch.backend}, dispatch=${dispatch.dispatch}, dispatched=${dispatch.dispatched}, status=${dispatch.status}]${dispatch.message ? `: ${dispatch.message}` : ''}`;
+    };
+    const prepareExplicitTarget = async (platform: 'ios' | 'android') => {
+      const connected = getConnectedDeviceTarget(ctx);
+      const logicalId = connected?.reactNative?.logicalDeviceId?.trim();
+      const target = await resolveDevice(ctx, platform, connected);
+      const sameId = (left: string, right: string, idPlatform: 'ios' | 'android') =>
+        idPlatform === 'ios' ? left.toLowerCase() === right.toLowerCase() : left === right;
+      if (!target || !logicalId || !sameId(target.id, logicalId, platform)) {
+        return { target, canUseReact: false };
+      }
+      try {
+        let oppositeHasId = false;
+        if (platform === 'ios') {
+          const opposite = await discoverAndroidDevices(ctx);
+          oppositeHasId = opposite.some((device) => sameId(device.id, logicalId, 'android'));
+        } else {
+          const opposite = await discoverBootedSimulators(ctx);
+          oppositeHasId = opposite.some((device) => sameId(device.udid, logicalId, 'ios'));
+        }
+        return { target, canUseReact: !oppositeHasId };
+      } catch {
+        return { target, canUseReact: false };
+      }
     };
 
     ctx.registerTool('list_elements', {
@@ -122,8 +147,9 @@ export const uiInteractPlugin = definePlugin({
         if (!label) return 'Provide a label/testID or x,y coordinates.';
 
         // ── Label/testID tap: CDP fiber tree (works on both platforms) ───────
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsLabel = JSON.stringify(label);
-        const tapped = await ctx.evalInApp(`
+        const tapped = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             ${FIND_AND_INVOKE_JS}
@@ -135,7 +161,7 @@ export const uiInteractPlugin = definePlugin({
         });
         if (tapped) return `Tapped "${label}"`;
 
-        const target = await resolveTarget(platform);
+        const target = prepared ? prepared.target : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
 
         // ── Android fallback: adb uiautomator ───────────────────────────────
@@ -185,9 +211,10 @@ export const uiInteractPlugin = definePlugin({
       }),
       handler: async ({ text, testID, platform }) => {
         // ── CDP: find TextInput and call onChangeText ─────────────────────────
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsText = JSON.stringify(text);
         const jsTestID = testID ? JSON.stringify(testID) : 'null';
-        const typed = await ctx.evalInApp(buildFiberReadExpression(`
+        const typed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(buildFiberReadExpression(`
           ${FIBER_ROOT_JS}
           var targetID = ${jsTestID};
           var target = null;
@@ -212,7 +239,7 @@ export const uiInteractPlugin = definePlugin({
         });
         if (typed) return `Typed "${text}"`;
 
-        const target = await resolveTarget(platform);
+        const target = prepared ? prepared.target : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const dispatch = await nativeInput.typeText(target, text);
         return nativeResult(`Typed "${text}"`, dispatch);
@@ -232,9 +259,13 @@ export const uiInteractPlugin = definePlugin({
       }),
       handler: async ({ label, x, y, duration, platform }) => {
         // ── CDP: find element by label/testID and call onLongPress ────────────
-        if (label && x === undefined && y === undefined) {
+        const hasCoordinates = x !== undefined && y !== undefined;
+        const prepared = label && !hasCoordinates && platform !== 'auto'
+          ? await prepareExplicitTarget(platform)
+          : undefined;
+        if (label && !hasCoordinates) {
           const jsLabel = JSON.stringify(label);
-          const pressed = await ctx.evalInApp(`
+          const pressed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
@@ -256,7 +287,7 @@ export const uiInteractPlugin = definePlugin({
         }
 
         if (label) {
-          const target = await resolveTarget(platform);
+          const target = prepared ? prepared.target : await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
           const dispatch = await nativeInput.longPressLabel(target, label, duration);
           return nativeResult(`Long pressed "${label}"`, dispatch);
@@ -276,10 +307,11 @@ export const uiInteractPlugin = definePlugin({
       }),
       handler: async ({ direction, platform }) => {
         let result: string | null = null;
+        const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
 
         // ── CDP: find ScrollView and invoke scrollTo on its native node ────────
         const jsDir = JSON.stringify(direction);
-        const scrolled = await ctx.evalInApp(`
+        const scrolled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             var dir = ${jsDir};
@@ -326,7 +358,7 @@ export const uiInteractPlugin = definePlugin({
         if (scrolled) result = `Swiped ${direction}`;
 
         if (!result) {
-          const target = await resolveTarget(platform);
+          const target = prepared ? prepared.target : await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
           // ── Native fallback using current device geometry ───────────────────
           const dispatch = await nativeInput.swipeDirection(target, direction, 300);
@@ -335,7 +367,7 @@ export const uiInteractPlugin = definePlugin({
         }
 
         // ── Log to test recorder if a recording is active ─────────────────────
-        await ctx.evalInApp(`
+        if (prepared?.canUseReact ?? true) await ctx.evalInApp(`
           (function() {
             if (!globalThis.__METRO_MCP_REC_ACTIVE__) return;
             ${GET_ROUTE_FUNC_JS}
@@ -360,10 +392,13 @@ export const uiInteractPlugin = definePlugin({
         platform: z.enum(['ios', 'android', 'auto']).default('auto'),
       }),
       handler: async ({ button, platform }) => {
+        const prepared = (button === 'ENTER' || button === 'DELETE') && platform !== 'auto'
+          ? await prepareExplicitTarget(platform)
+          : undefined;
         // ── ENTER/DELETE: bounded CDP handler on every platform ───────────────
         if (button === 'ENTER' || button === 'DELETE') {
           const handler = button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText';
-          const handled = await ctx.evalInApp(buildFiberReadExpression(`
+          const handled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(buildFiberReadExpression(`
             var handled = false;
             var nativeRequired = false;
             metroWalkFibers(FIBER_OPTIONS, function(fiber) {
@@ -423,7 +458,7 @@ export const uiInteractPlugin = definePlugin({
           if (handled) return `Pressed ${button}`;
         }
 
-        const target = await resolveTarget(platform);
+        const target = prepared ? prepared.target : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
 
         const dispatch = await nativeInput.button(target, button);

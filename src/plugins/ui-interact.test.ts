@@ -28,16 +28,26 @@ async function createAppOnlyHarness(
     blurOnSubmit?: boolean;
     multiline?: boolean;
   } = {},
+  connectedLogicalDeviceId?: string,
+  sharedInventoryDeviceId = false,
+  unavailablePlatform?: 'ios' | 'android',
+  androidStatus: 'device' | 'offline' | 'unauthorized' = 'device',
 ) {
   const tools = new Map<string, Tool>();
   let nativeCalls = 0;
   const execFileCalls: Array<{ command: string; args: string[] }> = [];
   const reactCalls: Array<{ type: 'submit' | 'change'; value: unknown }> = [];
+  const evaluations: string[] = [];
   let blurCalls = 0;
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
-      getTarget: () => ({ deviceName: 'Connected app' } as never),
+      getTarget: () => ({
+        deviceName: 'Connected app',
+        ...(connectedLogicalDeviceId
+          ? { reactNative: { logicalDeviceId: connectedLogicalDeviceId } }
+          : {}),
+      } as never),
       send: async () => ({}),
     },
     events: { on: () => {}, off: () => {}, isConnected: () => true },
@@ -53,24 +63,39 @@ async function createAppOnlyHarness(
     metro: { host: 'localhost', port: 8081, fetch: async () => new Response() },
     exec: async (command) => {
       nativeCalls++;
+      if (command.includes('pull /sdcard/uidump.xml')) {
+        await Bun.write('/tmp/metro-mcp-uidump.xml', '<node text="Save" content-desc="Save" bounds="[0,0][100,100]"/>');
+      }
       if (nativeAvailable) return '';
       throw new Error('native inventory unavailable');
     },
     execFile: async (command, args) => {
       nativeCalls++;
       execFileCalls.push({ command, args });
+      if (nativeAvailable && unavailablePlatform === 'ios' && command === 'xcrun') {
+        throw new Error('simctl inventory unavailable');
+      }
+      if (nativeAvailable && unavailablePlatform === 'android' && command === 'adb') {
+        throw new Error('adb inventory unavailable');
+      }
       if (nativeAvailable && command === 'xcrun') {
+        const simulatorId = sharedInventoryDeviceId && connectedLogicalDeviceId
+          ? connectedLogicalDeviceId
+          : 'SIMULATOR123';
         return Buffer.from(JSON.stringify({
           devices: {
             'com.apple.CoreSimulator.SimRuntime.iOS-26-5': [
-              { name: 'Acceptance', udid: 'SIMULATOR123', state: 'Booted', isAvailable: true },
+              { name: 'Acceptance', udid: simulatorId, state: 'Booted', isAvailable: true },
             ],
           },
         }));
       }
       if (nativeAvailable && command === 'adb') {
         if (args[0] === 'devices') {
-          return Buffer.from('List of devices attached\nemulator-42\tdevice model:Pixel_8\n');
+          const androidId = sharedInventoryDeviceId && connectedLogicalDeviceId
+            ? connectedLogicalDeviceId
+            : 'emulator-42';
+          return Buffer.from(`List of devices attached\n${androidId}\t${androidStatus} model:Pixel_8\n`);
         }
         return Buffer.from('');
       }
@@ -103,6 +128,7 @@ async function createAppOnlyHarness(
     },
     // A true result means the app-side handler was found and invoked.
     evalInApp: async (expression) => {
+      evaluations.push(expression);
       if (evaluation === 'failure') throw new Error('CDP disconnected');
       if (evaluation === 'pre-dispatch') {
         throw new Error('Not connected to Metro. Use list_devices to check connection status.');
@@ -159,6 +185,7 @@ async function createAppOnlyHarness(
     getNativeCalls: () => nativeCalls,
     execFileCalls,
     reactCalls,
+    evaluations,
     getBlurCalls: () => blurCalls,
   };
 }
@@ -199,13 +226,24 @@ describe('UI handler actions without native inventory', () => {
     expect(harness.getNativeCalls()).toBe(0);
   });
 
+  test('uses Android key events when no focused app handler accepts the action', async () => {
+    const harness = await createAppOnlyHarness('unhandled', true, {}, undefined, false);
+    const press = harness.tools.get('press_button')!;
+    for (const button of ['ENTER', 'DELETE'] as const) {
+      const result = await press.handler(press.parameters.parse({ button, platform: 'android' }) as Record<string, unknown>);
+      expect(result).toContain('backend=adb');
+      expect(result).toContain('status=handled');
+    }
+    expect(harness.reactCalls).toEqual([]);
+  });
+
   test('invokes focused controlled Paper and Fabric key handlers with exact payloads', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
       for (const [state, value] of [['focused', 'hello'], ['empty', '']] as const) {
         const harness = await createAppOnlyHarness(`${renderer}-${state}`);
         const press = harness.tools.get('press_button')!;
         for (const button of ['ENTER', 'DELETE'] as const) {
-          expect(await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>))
+          expect(await press.handler(press.parameters.parse({ button, platform: 'auto' }) as Record<string, unknown>))
             .toBe(`Pressed ${button}`);
         }
         expect(harness.reactCalls).toEqual([
@@ -219,7 +257,7 @@ describe('UI handler actions without native inventory', () => {
 
   test('uses native focused keys for uncontrolled Paper and Fabric inputs', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
-      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true);
+      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true, {}, 'SIMULATOR123');
       const press = harness.tools.get('press_button')!;
       for (const button of ['ENTER', 'DELETE'] as const) {
         const result = await press.handler(press.parameters.parse({ button, platform: 'ios' }) as Record<string, unknown>);
@@ -240,7 +278,7 @@ describe('UI handler actions without native inventory', () => {
 
   test('uses Android key events for uncontrolled Paper and Fabric inputs', async () => {
     for (const renderer of ['paper', 'fabric'] as const) {
-      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true);
+      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true, {}, 'emulator-42');
       const press = harness.tools.get('press_button')!;
       for (const button of ['ENTER', 'DELETE'] as const) {
         const result = await press.handler(press.parameters.parse({
@@ -269,8 +307,9 @@ describe('UI handler actions without native inventory', () => {
       ]) {
         const blurred = await createAppOnlyHarness(
           `${renderer}-focused`,
-          false,
+          true,
           inputBehavior,
+          'emulator-42',
         );
         const press = blurred.tools.get('press_button')!;
         expect(await press.handler(press.parameters.parse({
@@ -281,13 +320,14 @@ describe('UI handler actions without native inventory', () => {
           { type: 'submit', value: { nativeEvent: { text: 'hello' } } },
         ]);
         expect(blurred.getBlurCalls()).toBe(1);
-        expect(blurred.getNativeCalls()).toBe(0);
+        expect(blurred.execFileCalls.filter(({ command, args }) => command === 'idb' && args[0] === 'ui')).toHaveLength(0);
       }
 
       const submitted = await createAppOnlyHarness(
         `${renderer}-focused`,
-        false,
+        true,
         { submitBehavior: 'submit' },
+        'emulator-42',
       );
       const submitPress = submitted.tools.get('press_button')!;
       expect(await submitPress.handler(submitPress.parameters.parse({
@@ -337,6 +377,30 @@ describe('UI handler actions without native inventory', () => {
     });
   });
 
+  test('leaves uncontrolled Paper and Fabric inputs for native handling', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true, {}, 'emulator-42');
+      const keyPress = harness.tools.get('press_button')!;
+      await keyPress.handler(keyPress.parameters.parse({ button: 'ENTER', platform: 'android' }) as Record<string, unknown>);
+      await keyPress.handler(keyPress.parameters.parse({ button: 'DELETE', platform: 'android' }) as Record<string, unknown>);
+      expect(harness.reactCalls).toEqual([]);
+      expect(harness.execFileCalls).toContainEqual({ command: 'adb', args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '66'] });
+      expect(harness.execFileCalls).toContainEqual({ command: 'adb', args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '67'] });
+    }
+  });
+
+  test('uses IDB HID keys for uncontrolled Paper and Fabric inputs on iOS', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      const harness = await createAppOnlyHarness(`${renderer}-uncontrolled`, true, {}, 'SIMULATOR123');
+      const keyPress = harness.tools.get('press_button')!;
+      await keyPress.handler(keyPress.parameters.parse({ button: 'ENTER', platform: 'ios' }) as Record<string, unknown>);
+      await keyPress.handler(keyPress.parameters.parse({ button: 'DELETE', platform: 'ios' }) as Record<string, unknown>);
+      expect(harness.reactCalls).toEqual([]);
+      expect(harness.execFileCalls).toContainEqual({ command: 'idb', args: ['ui', 'key', '40', '--udid', 'SIMULATOR123'] });
+      expect(harness.execFileCalls).toContainEqual({ command: 'idb', args: ['ui', 'key', '42', '--udid', 'SIMULATOR123'] });
+    }
+  });
+
   test('does not replay a possibly dispatched action after a CDP rejection', async () => {
     const harness = await createAppOnlyHarness('failure');
     const tool = harness.tools.get('tap_element')!;
@@ -346,7 +410,7 @@ describe('UI handler actions without native inventory', () => {
   });
 
   test('uses native fallback after a known pre-dispatch connection failure', async () => {
-    const harness = await createAppOnlyHarness('pre-dispatch', true);
+    const harness = await createAppOnlyHarness('pre-dispatch', true, {}, 'SIMULATOR123');
     const tool = harness.tools.get('tap_element')!;
     const result = await tool.handler(tool.parameters.parse({ label: 'Save', platform: 'ios' }) as Record<string, unknown>);
     expect(result).toContain('Tapped "Save"');
@@ -356,7 +420,7 @@ describe('UI handler actions without native inventory', () => {
   });
 
   test('uses native fallback for other known pre-dispatch handler failures', async () => {
-    const harness = await createAppOnlyHarness('pre-dispatch', true);
+    const harness = await createAppOnlyHarness('pre-dispatch', true, {}, 'SIMULATOR123');
     const cases = [
       ['type_text', { text: 'hello', platform: 'ios' }, 'Typed "hello"'],
       ['swipe', { direction: 'up', platform: 'ios' }, 'Swiped up'],
@@ -373,7 +437,7 @@ describe('UI handler actions without native inventory', () => {
   });
 
   test('uses native fallback for the exact pre-dispatch evaluation timeout', async () => {
-    const harness = await createAppOnlyHarness('timeout', true);
+    const harness = await createAppOnlyHarness('timeout', true, {}, 'SIMULATOR123');
     const cases = [
       ['tap_element', { label: 'Save', platform: 'ios' }, 'Tapped "Save"'],
       ['type_text', { text: 'hello', platform: 'ios' }, 'Typed "hello"'],
@@ -390,14 +454,144 @@ describe('UI handler actions without native inventory', () => {
     expect(harness.getNativeCalls()).toBeGreaterThan(0);
   });
 
+  test('requires a verified iOS target before explicit React-first actions', async () => {
+    const harness = await createAppOnlyHarness('success', true, {}, 'emulator-42');
+    const cases = [
+      ['tap_element', { label: 'Save', platform: 'ios' }],
+      ['type_text', { text: 'hello', platform: 'ios' }],
+      ['long_press', { label: 'Save', platform: 'ios' }],
+      ['swipe', { direction: 'up', platform: 'ios' }],
+      ['press_button', { button: 'ENTER', platform: 'ios' }],
+      ['press_button', { button: 'DELETE', platform: 'ios' }],
+    ] as const;
+    for (const [name, args] of cases) {
+      const tool = harness.tools.get(name)!;
+      await tool.handler(tool.parameters.parse(args) as Record<string, unknown>);
+    }
+    expect(harness.evaluations).toHaveLength(0);
+  });
+
+  test('requires a verified Android target before explicit React-first actions', async () => {
+    const harness = await createAppOnlyHarness('success', true, {}, 'SIMULATOR123');
+    const cases = [
+      ['tap_element', { label: 'Save', platform: 'android' }],
+      ['type_text', { text: 'hello', platform: 'android' }],
+      ['long_press', { label: 'Save', platform: 'android' }],
+      ['swipe', { direction: 'up', platform: 'android' }],
+      ['press_button', { button: 'ENTER', platform: 'android' }],
+      ['press_button', { button: 'DELETE', platform: 'android' }],
+    ] as const;
+    for (const [name, args] of cases) {
+      const tool = harness.tools.get(name)!;
+      await tool.handler(tool.parameters.parse(args) as Record<string, unknown>);
+    }
+    expect(harness.evaluations).toHaveLength(0);
+  });
+
+  test('never dispatches React handlers when the connected ID is shared across platforms', async () => {
+    for (const platform of ['ios', 'android'] as const) {
+      const harness = await createAppOnlyHarness('success', true, {}, 'SHARED-DEVICE', true);
+      const cases = [
+        ['tap_element', { label: 'Save', platform }],
+        ['type_text', { text: 'hello', platform }],
+        ['long_press', { label: 'Save', platform }],
+        ['swipe', { direction: 'up', platform }],
+        ['press_button', { button: 'ENTER', platform }],
+        ['press_button', { button: 'DELETE', platform }],
+      ] as const;
+      for (const [name, args] of cases) {
+        const tool = harness.tools.get(name)!;
+        await tool.handler(tool.parameters.parse(args) as Record<string, unknown>);
+      }
+      expect(harness.evaluations).toHaveLength(0);
+    }
+  });
+
+  test('treats offline and unauthorized opposite Android IDs as collisions', async () => {
+    for (const androidStatus of ['offline', 'unauthorized'] as const) {
+      const harness = await createAppOnlyHarness(
+        'success',
+        true,
+        {},
+        'SHARED-DEVICE',
+        true,
+        undefined,
+        androidStatus,
+      );
+      const cases = [
+        ['tap_element', { label: 'Save', platform: 'ios' }],
+        ['type_text', { text: 'hello', platform: 'ios' }],
+        ['long_press', { label: 'Save', platform: 'ios' }],
+        ['swipe', { direction: 'up', platform: 'ios' }],
+        ['press_button', { button: 'ENTER', platform: 'ios' }],
+        ['press_button', { button: 'DELETE', platform: 'ios' }],
+      ] as const;
+      for (const [name, args] of cases) {
+        const tool = harness.tools.get(name)!;
+        await tool.handler(tool.parameters.parse(args) as Record<string, unknown>);
+      }
+      expect(harness.evaluations).toHaveLength(0);
+    }
+  });
+
+  test('keeps explicit React-first handling for a verified same-platform target', async () => {
+    const harness = await createAppOnlyHarness('success', true, {}, 'SIMULATOR123');
+    const tool = harness.tools.get('tap_element')!;
+    expect(await tool.handler(tool.parameters.parse({ label: 'Save', platform: 'ios' }) as Record<string, unknown>))
+      .toBe('Tapped "Save"');
+    expect(harness.evaluations).toHaveLength(1);
+  });
+
+  test('requires the opposite inventory before explicit React-first handling', async () => {
+    for (const [platform, logicalId, unavailablePlatform] of [
+      ['ios', 'SIMULATOR123', 'android'],
+      ['android', 'emulator-42', 'ios'],
+    ] as const) {
+      const harness = await createAppOnlyHarness(
+        'success',
+        true,
+        {},
+        logicalId,
+        false,
+        unavailablePlatform,
+      );
+      const tool = harness.tools.get('tap_element')!;
+      await tool.handler(tool.parameters.parse({ label: 'Save', platform }) as Record<string, unknown>);
+      expect(harness.evaluations).toHaveLength(0);
+      expect(harness.getNativeCalls()).toBeGreaterThan(0);
+    }
+  });
+
+  test('keeps explicit coordinate actions native-direct', async () => {
+    const harness = await createAppOnlyHarness('success', true, {}, 'SIMULATOR123');
+    const tool = harness.tools.get('tap_element')!;
+    expect(await tool.handler(tool.parameters.parse({
+      x: 10, y: 20, platform: 'ios',
+    }) as Record<string, unknown>)).toContain('Tapped at (10, 20)');
+    expect(harness.evaluations).toHaveLength(0);
+  });
+
+  test('keeps label React handling when long press has only one coordinate', async () => {
+    for (const args of [
+      { label: 'Save', x: 10, platform: 'auto' as const },
+      { label: 'Save', y: 20, platform: 'auto' as const },
+    ]) {
+      const harness = await createAppOnlyHarness();
+      const tool = harness.tools.get('long_press')!;
+      expect(await tool.handler(tool.parameters.parse(args) as Record<string, unknown>))
+        .toBe('Long pressed "Save"');
+      expect(harness.evaluations).toHaveLength(1);
+    }
+  });
+
   test('does not use native fallback for a timed out evaluation with an ambiguous dispatch', async () => {
-    const harness = await createAppOnlyHarness('ambiguous-timeout', true);
+    const harness = await createAppOnlyHarness('ambiguous-timeout', true, {}, 'SIMULATOR123');
     const tool = harness.tools.get('tap_element')!;
     await expect(tool.handler(tool.parameters.parse({
       label: 'Save',
       platform: 'ios',
     }) as Record<string, unknown>)).rejects.toThrow('App evaluation timed out after 30ms');
-    expect(harness.getNativeCalls()).toBe(0);
+    expect(harness.execFileCalls.filter(({ command, args }) => command === 'idb' && args[0] === 'ui')).toHaveLength(0);
   });
 
   test('uses native fallback for a label-only long press after a pre-dispatch failure', async () => {
