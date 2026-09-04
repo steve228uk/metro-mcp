@@ -82,6 +82,18 @@ function appWithNaturalScroll() {
   return app;
 }
 
+function appWithMomentumOnlyScroll() {
+  const app = appWithDeepButton();
+  vm.runInContext(`
+    var scrollRoot = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current;
+    scrollRoot.memoizedProps = Object.freeze({
+      testID: 'momentum-only-scroll',
+      onMomentumScrollEnd: function() {}
+    });
+  `, app);
+  return app;
+}
+
 function appWithoutFiberRefresh() {
   const app = appWithDeepButton();
   vm.runInContext(`
@@ -414,6 +426,18 @@ describe('test recorder readiness', () => {
       var scrollProps = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current.memoizedProps;
       scrollProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
       scrollProps.onScrollEndDrag({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
+    `, app);
+    expect(await call('stop_test_recording')).toContain('1 swipe');
+  });
+
+  test('instruments a scroll view identified only by its momentum callback', async () => {
+    const app = appWithMomentumOnlyScroll();
+    const call = await createHarness(app, [testRecorderPlugin]);
+    expect(await call('start_test_recording')).toContain('Recording started');
+    vm.runInContext(`
+      var scrollProps = __REACT_DEVTOOLS_GLOBAL_HOOK__.getFiberRoots(12).values().next().value.current.memoizedProps;
+      scrollProps.onScrollBeginDrag({ nativeEvent: { contentOffset: { x: 0, y: 0 } } });
+      scrollProps.onMomentumScrollEnd({ nativeEvent: { contentOffset: { x: 0, y: 250 } } });
     `, app);
     expect(await call('stop_test_recording')).toContain('1 swipe');
   });
