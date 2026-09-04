@@ -1282,6 +1282,41 @@ describe('native input providers', () => {
     expect(calls).not.toContain('long_press');
   });
 
+  test('does not probe IDB while discovering SimView for Android', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    runner.execFile = async (command, args, options) => {
+      if (command === 'idb' && args.at(-1) === '--version') return new Promise<never>(() => {});
+      return baseExecFile(command, args, options);
+    };
+    const calls: string[] = [];
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'find_elements', 'long_press'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push(name);
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'android:device-a', pointWidth: 400, pointHeight: 800, capabilities: { input: { touch: true } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        if (name === 'find_elements') return { structuredContent: { matches: [{ element: { frame: { points: { x: 10, y: 20, width: 80, height: 40 } } } }] } };
+        return { structuredContent: { accepted: true, inputDispatched: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+      simviewRequestTimeoutMs: 50,
+    });
+
+    await expect(controller.longPressLabel({ platform: 'android', id: 'device-a' }, 'Continue', 900)).resolves.toMatchObject({
+      backend: 'simview', status: 'handled', dispatched: true,
+    });
+    expect(calls).toContain('long_press');
+    expect(runner.calls.some(({ command, args }) => command === 'idb' && args.at(-1) === '--version')).toBe(false);
+    await controller.close();
+  });
+
   test('falls back to IDB long press using the accessibility frame center', async () => {
     const runner = fakeRunner();
     const baseExecFile = runner.execFile;

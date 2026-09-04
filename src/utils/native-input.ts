@@ -459,6 +459,12 @@ export class NativeInputController {
   }
 
   private async discoverProviders(target: NativeInputTarget, deadline: number): Promise<Provider[]> {
+    // IDB's CLI and accessibility model are iOS-only. Keep it out of Android
+    // discovery entirely so a stalled installation cannot consume the budget
+    // before SimView gets a chance to handle the action.
+    if (target.platform === 'android') {
+      return discoverNativeProviders(this.options, deadline, ['simview']);
+    }
     if (this.config.nativeBackend !== 'auto' || target.platform !== 'ios') {
       return discoverNativeProviders(this.options, deadline);
     }
