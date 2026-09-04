@@ -23,15 +23,20 @@ export interface AppEvaluationLifecycle {
 }
 
 /** An exception returned by the app runtime, after Runtime.evaluate ran. */
-class AppEvaluationError extends Error {
+export class AppEvaluationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AppEvaluationError';
   }
 }
 
+/** Identify an exception returned by the app after Runtime.evaluate ran. */
+export function isAppEvaluationError(error: unknown): boolean {
+  return error instanceof AppEvaluationError;
+}
+
 function isTransportError(error: unknown): boolean {
-  if (error instanceof AppEvaluationError) return false;
+  if (isAppEvaluationError(error)) return false;
   return (
     error instanceof Error &&
     (error.message === 'WebSocket closed' ||
@@ -48,7 +53,7 @@ function isTransportError(error: unknown): boolean {
 function isDefinitivePreDispatchFailure(error: unknown): boolean {
   return (
     error instanceof Error &&
-    !(error instanceof AppEvaluationError) &&
+    !isAppEvaluationError(error) &&
     error.message === 'Not connected to CDP target'
   );
 }
