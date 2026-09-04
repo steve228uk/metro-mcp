@@ -50,7 +50,9 @@ function isDefinitivePreDispatchFailure(error: unknown): boolean {
   return (
     error instanceof Error &&
     !(error instanceof AppEvaluationError) &&
-    error.message === 'Not connected to CDP target'
+    (error.message === 'Not connected to CDP target' ||
+      error.message ===
+        'Not connected to Metro. Use list_devices to check connection status.')
   );
 }
 

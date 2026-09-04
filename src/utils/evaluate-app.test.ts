@@ -257,6 +257,28 @@ describe('shared app evaluation policy', () => {
     expect(state.state().reconnectCount).toBe(1);
   });
 
+  test('retries the server-level disconnected error before raw source dispatch', async () => {
+    const { transport, calls } = vmTransport();
+    let ensureAttempts = 0;
+    const state = lifecycle({
+      ensureConnected: async () => {
+        ensureAttempts += 1;
+        if (ensureAttempts === 1) {
+          throw new Error('Not connected to Metro. Use list_devices to check connection status.');
+        }
+      },
+    });
+    const evalInApp = createAppEvaluator(transport, state);
+
+    await expect(evalInApp(
+      'globalThis.serverLevelRetryCount = (globalThis.serverLevelRetryCount || 0) + 1; serverLevelRetryCount;',
+      { awaitPromise: false, timeout: 1000 },
+    )).resolves.toBe(1);
+    expect(ensureAttempts).toBe(2);
+    expect(calls.filter((call) => call.method === 'Runtime.evaluate' &&
+      String(call.params.expression).includes('serverLevelRetryCount'))).toHaveLength(1);
+  });
+
   test('does not retry a duration-bearing evaluation timeout after dispatch', async () => {
     const { transport, calls } = vmTransport();
     const originalSend = transport.send;
