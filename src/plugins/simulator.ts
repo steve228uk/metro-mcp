@@ -15,7 +15,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { definePlugin, nativeToolResult } from '../plugin.js';
-import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
+import {
+  adbPrefix,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
 
 const SCREENSHOT_PREFIX = 'metro-mcp-screenshot-';
 const SCREENSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -92,7 +96,7 @@ export const simulatorPlugin = definePlugin({
 
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
-      resolveDevice(ctx, platform, ctx.cdp.getTarget());
+      resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
 
     ctx.registerTool('take_screenshot', {
       description: 'Capture a screenshot from the connected iOS simulator or Android device.',

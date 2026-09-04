@@ -21,11 +21,17 @@ async function createAppOnlyHarness(
     | 'fabric-uncontrolled'
     | 'paper-uncontrolled' = 'success',
   nativeAvailable = false,
+  inputBehavior: {
+    submitBehavior?: 'newline' | 'submit' | 'blurAndSubmit';
+    blurOnSubmit?: boolean;
+    multiline?: boolean;
+  } = {},
 ) {
   const tools = new Map<string, Tool>();
   let nativeCalls = 0;
   const execFileCalls: Array<{ command: string; args: string[] }> = [];
   const reactCalls: Array<{ type: 'submit' | 'change'; value: unknown }> = [];
+  let blurCalls = 0;
   const ctx: PluginContext = {
     cdp: {
       on: () => {}, off: () => {}, isConnected: true,
@@ -101,7 +107,10 @@ async function createAppOnlyHarness(
       }
       if (evaluation === 'unhandled') return false;
       if (evaluation.endsWith('-focused') || evaluation.endsWith('-empty') || evaluation.endsWith('-uncontrolled')) {
-        const publicInstance = { isFocused: () => true };
+        const publicInstance = {
+          isFocused: () => true,
+          blur: () => { blurCalls++; },
+        };
         const fabric = evaluation.startsWith('fabric-');
         const controlled = !evaluation.endsWith('-uncontrolled');
         const value = evaluation.endsWith('-empty') ? '' : 'hello';
@@ -114,6 +123,7 @@ async function createAppOnlyHarness(
           type: { displayName: 'TextInput' },
           memoizedProps: {
             ...(controlled ? { value } : { defaultValue: value }),
+            ...inputBehavior,
             onSubmitEditing: (event: unknown) => reactCalls.push({ type: 'submit', value: event }),
             onChangeText: (text: unknown) => reactCalls.push({ type: 'change', value: text }),
           },
@@ -138,7 +148,13 @@ async function createAppOnlyHarness(
     notifyResourceUpdated: () => {},
   };
   await uiInteractPlugin.setup(ctx);
-  return { tools, getNativeCalls: () => nativeCalls, execFileCalls, reactCalls };
+  return {
+    tools,
+    getNativeCalls: () => nativeCalls,
+    execFileCalls,
+    reactCalls,
+    getBlurCalls: () => blurCalls,
+  };
 }
 
 describe('UI handler actions without native inventory', () => {
@@ -235,6 +251,72 @@ describe('UI handler actions without native inventory', () => {
         { command: 'adb', args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '66'] },
         { command: 'adb', args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '67'] },
       ]);
+    }
+  });
+
+  test('preserves Android controlled TextInput submit and blur behavior', async () => {
+    for (const renderer of ['paper', 'fabric'] as const) {
+      for (const inputBehavior of [
+        { submitBehavior: 'blurAndSubmit' as const },
+        { blurOnSubmit: true },
+        {},
+      ]) {
+        const blurred = await createAppOnlyHarness(
+          `${renderer}-focused`,
+          false,
+          inputBehavior,
+        );
+        const press = blurred.tools.get('press_button')!;
+        expect(await press.handler(press.parameters.parse({
+          button: 'ENTER',
+          platform: 'android',
+        }) as Record<string, unknown>)).toBe('Pressed ENTER');
+        expect(blurred.reactCalls).toEqual([
+          { type: 'submit', value: { nativeEvent: { text: 'hello' } } },
+        ]);
+        expect(blurred.getBlurCalls()).toBe(1);
+        expect(blurred.getNativeCalls()).toBe(0);
+      }
+
+      const submitted = await createAppOnlyHarness(
+        `${renderer}-focused`,
+        false,
+        { submitBehavior: 'submit' },
+      );
+      const submitPress = submitted.tools.get('press_button')!;
+      expect(await submitPress.handler(submitPress.parameters.parse({
+        button: 'ENTER',
+        platform: 'android',
+      }) as Record<string, unknown>)).toBe('Pressed ENTER');
+      expect(submitted.reactCalls).toHaveLength(1);
+      expect(submitted.getBlurCalls()).toBe(0);
+    }
+  });
+
+  test('uses native Android ENTER for controlled newline behavior', async () => {
+    for (const inputBehavior of [
+      { submitBehavior: 'newline' as const },
+      { blurOnSubmit: false },
+      { multiline: true },
+    ]) {
+      const harness = await createAppOnlyHarness(
+        'fabric-focused',
+        true,
+        inputBehavior,
+      );
+      const press = harness.tools.get('press_button')!;
+      const result = await press.handler(press.parameters.parse({
+        button: 'ENTER',
+        platform: 'android',
+      }) as Record<string, unknown>);
+      expect(result).toContain('backend=adb');
+      expect(result).toContain('status=handled');
+      expect(harness.reactCalls).toEqual([]);
+      expect(harness.getBlurCalls()).toBe(0);
+      expect(harness.execFileCalls).toContainEqual({
+        command: 'adb',
+        args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '66'],
+      });
     }
   });
 

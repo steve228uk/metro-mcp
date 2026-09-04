@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
+import {
+  adbPrefix,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
 
 const MAX_BYTES_DEFAULT = 50 * 1024;  // 50 KB
 const MAX_BYTES_CAP     = 1024 * 1024; // 1 MB
@@ -19,7 +23,7 @@ export const filesystemPlugin = definePlugin({
 
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
-      resolveDevice(ctx, platform, ctx.cdp.getTarget());
+      resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
 
     function assertSafePath(p: string): void {
       if (p.split('/').includes('..')) {

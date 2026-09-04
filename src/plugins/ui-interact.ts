@@ -11,7 +11,11 @@ import {
   MAX_FIBER_NODES,
   buildFiberReadExpression,
 } from '../utils/fiber.js';
-import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
+import {
+  adbPrefix,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
 import { NativeInputController, type NativeDispatchResult, type NativeInputConfig } from '../utils/native-input.js';
 
 // Connection setup failures happen before Runtime.evaluate is dispatched, so
@@ -32,7 +36,7 @@ export const uiInteractPlugin = definePlugin({
 
   async setup(ctx) {
     const resolveTarget = (platform: 'ios' | 'android' | 'auto') =>
-      resolveDevice(ctx, platform, ctx.cdp.getTarget());
+      resolveDevice(ctx, platform, getConnectedDeviceTarget(ctx));
     const nativeInput = new NativeInputController({
       projectRoot: typeof ctx.config.projectRoot === 'string' ? ctx.config.projectRoot : undefined,
       config: (ctx.config.input ?? {}) as NativeInputConfig,
@@ -357,8 +361,9 @@ export const uiInteractPlugin = definePlugin({
           const handler = button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText';
           const handled = await ctx.evalInApp(buildFiberReadExpression(`
             var handled = false;
+            var nativeRequired = false;
             metroWalkFibers(FIBER_OPTIONS, function(fiber) {
-              if (handled || metroFiberName(fiber) !== 'TextInput') return;
+              if (handled || nativeRequired || metroFiberName(fiber) !== 'TextInput') return;
               var props = fiber.memoizedProps || {};
               if (typeof props[${JSON.stringify(handler)}] !== 'function') return;
               // Uncontrolled inputs keep their authoritative text natively;
@@ -387,14 +392,26 @@ export const uiInteractPlugin = definePlugin({
               }
               if (!focused) return;
               if (${JSON.stringify(button)} === 'ENTER') {
+                var submitBehavior = props.submitBehavior;
+                if (typeof submitBehavior !== 'string') {
+                  if (props.blurOnSubmit === true) submitBehavior = 'blurAndSubmit';
+                  else if (props.blurOnSubmit === false) submitBehavior = 'newline';
+                  else submitBehavior = props.multiline === true ? 'newline' : 'blurAndSubmit';
+                }
+                if (submitBehavior === 'newline') {
+                  nativeRequired = true;
+                  return { prune: true };
+                }
                 props.onSubmitEditing({ nativeEvent: { text: props.value } });
+                if (submitBehavior === 'blurAndSubmit' && instance &&
+                  typeof instance.blur === 'function') instance.blur();
               } else {
                 props.onChangeText(props.value.slice(0, -1));
               }
               handled = true;
               return { prune: true };
             });
-            return handled;
+            return handled && !nativeRequired;
           `, { maxDepth: MAX_FIBER_DEPTH, maxNodes: MAX_FIBER_NODES })).catch((error) => {
             if (!isPreDispatchConnectionFailure(error)) throw error;
             return false;

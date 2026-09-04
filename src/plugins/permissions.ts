@@ -1,6 +1,10 @@
 import { z } from 'zod';
 import { definePlugin } from '../plugin.js';
-import { adbPrefix, resolveDevice } from '../utils/device-discovery.js';
+import {
+  adbPrefix,
+  getConnectedDeviceTarget,
+  resolveDevice,
+} from '../utils/device-discovery.js';
 
 // Bundle IDs are stable for a plugin session; device state is deliberately
 // resolved on every call so a simulator booted after a miss is visible.
@@ -117,7 +121,7 @@ export const permissionsPlugin = definePlugin({
       const device = await resolveDevice(
         ctx,
         platform === 'auto' || !platform ? 'auto' : platform,
-        ctx.cdp.getTarget(),
+        getConnectedDeviceTarget(ctx),
       );
       if (!device) return 'No simulator/emulator detected.';
       const p = device.platform;
@@ -351,7 +355,7 @@ export const permissionsPlugin = definePlugin({
         const device = await resolveDevice(
           ctx,
           platform === 'auto' ? 'auto' : platform,
-          ctx.cdp.getTarget(),
+          getConnectedDeviceTarget(ctx),
         );
         if (!device) return 'No simulator/emulator detected.';
         const p = device.platform;
@@ -384,7 +388,7 @@ export const permissionsPlugin = definePlugin({
         'Current permission statuses for the connected app (auto-detected platform and bundle ID)',
       mimeType: 'text/plain',
       handler: async () => {
-        const target = await resolveDevice(ctx, 'auto', ctx.cdp.getTarget());
+        const target = await resolveDevice(ctx, 'auto', getConnectedDeviceTarget(ctx));
         if (!target) return '(no simulator/emulator detected)';
         const p = target.platform;
         const id = await detectBundleId(p);
