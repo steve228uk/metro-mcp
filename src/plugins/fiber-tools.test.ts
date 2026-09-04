@@ -415,7 +415,7 @@ describe('fiber read tools', () => {
       current = child;
     }
     const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
-    expect(await call('type_text', { text: 'immediate', platform: 'ios' })).toBe('Typed "immediate"');
+    expect(await call('type_text', { text: 'immediate', platform: 'auto' })).toBe('Typed "immediate"');
     expect(received).toBe('immediate');
   });
 
@@ -437,7 +437,7 @@ describe('fiber read tools', () => {
       current = child;
     }
     const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
-    expect(await call('press_button', { button: 'ENTER', platform: 'ios' })).toBe('Pressed ENTER');
+    expect(await call('press_button', { button: 'ENTER', platform: 'auto' })).toBe('Pressed ENTER');
     expect(submitted).toBe(true);
   });
 
@@ -446,7 +446,7 @@ describe('fiber read tools', () => {
     host.stateNode = { scrollTo: () => { throw new Error('scroll dispatch uncertain'); } };
     const root = append(fiber('ScrollView'), host);
     const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
-    await expect(call('swipe', { direction: 'up', platform: 'ios' }))
+    await expect(call('swipe', { direction: 'up', platform: 'auto' }))
       .rejects.toThrow('scroll dispatch uncertain');
   });
 
@@ -479,7 +479,7 @@ describe('fiber read tools', () => {
       current = child;
     }
     const call = await createHarness(runtimeFor([root]), [uiInteractPlugin]);
-    await expect(call('type_text', { text: 'reject', platform: 'ios' })).rejects.toThrow('handler failed');
+    await expect(call('type_text', { text: 'reject', platform: 'auto' })).rejects.toThrow('handler failed');
   });
 });
 
