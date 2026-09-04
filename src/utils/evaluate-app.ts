@@ -185,6 +185,11 @@ function inheritEmptyExits(prior: CompletionPath, paths: ExitPath[]): ExitPath[]
   return paths.map((path) => inheritEmptyExit(prior, path));
 }
 
+function completionWithEscapingValues(completion: Completion): CompletionPath {
+  return [...completion.breaks, ...completion.continues]
+    .reduce(mergePaths, completion);
+}
+
 function mergeCompletions(left: Completion, right: Completion): Completion {
   const merged = mergePaths(left, right);
   return {
@@ -266,8 +271,9 @@ function completionForStatement(statement: StatementLike): Completion {
       const guarded = mergeCompletions(body, handler);
       if (!statement.finalizer) return guarded;
       const finalizer = completionForStatement(statement.finalizer as StatementLike);
-      const finalizerBreaks = inheritEmptyExits(guarded, finalizer.breaks);
-      const finalizerContinues = inheritEmptyExits(guarded, finalizer.continues);
+      const guardedWithEscapingValues = completionWithEscapingValues(guarded);
+      const finalizerBreaks = inheritEmptyExits(guardedWithEscapingValues, finalizer.breaks);
+      const finalizerContinues = inheritEmptyExits(guardedWithEscapingValues, finalizer.continues);
       if (!finalizer.normal) {
         return {
           ...finalizer,
