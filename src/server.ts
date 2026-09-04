@@ -194,6 +194,48 @@ export function waitForReconnect(
   });
 }
 
+/**
+ * Wait for an in-flight CDP connection without allowing it to outlive the
+ * caller's evaluation deadline. The underlying connection attempt cannot be
+ * cancelled, so consume its eventual result while clearing the only timer we
+ * own when either side settles.
+ */
+export function waitForConnectionUntil(
+  waitForConnection: () => Promise<boolean>,
+  deadline?: number,
+  timers: ReconnectWaitTimers = reconnectWaitTimers,
+): Promise<boolean> {
+  if (deadline === undefined) return waitForConnection();
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new Error('App evaluation timed out'));
+
+  return new Promise<boolean>((resolve, reject) => {
+    let deadlineTimer: ReturnType<typeof setTimeout> | null = timers.setTimeout(
+      () => {
+        deadlineTimer = null;
+        reject(new Error('App evaluation timed out'));
+      },
+      remaining,
+    );
+    void waitForConnection().then(
+      (connected) => {
+        if (deadlineTimer) {
+          timers.clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
+        resolve(connected);
+      },
+      (error) => {
+        if (deadlineTimer) {
+          timers.clearTimeout(deadlineTimer);
+          deadlineTimer = null;
+        }
+        reject(error);
+      },
+    );
+  });
+}
+
 type RuntimeRegistration = (server: McpServer) => { remove: () => void };
 
 interface McpSession {
@@ -437,8 +479,16 @@ export async function createMetroRuntime(
             // Reset the attempt counter so the background scheduler can resume
             // after this tool-triggered reconnect, rather than staying capped.
             reconnectAttempts = 0;
-            const connected = await cdpSession.waitForConnection();
-            if (!connected) await connectToMetro();
+            const connected = await waitForConnectionUntil(
+              () => cdpSession.waitForConnection(),
+              deadline,
+            );
+            if (!connected) {
+              await waitForConnectionUntil(() => connectToMetro(), deadline);
+            }
+          }
+          if (deadline !== undefined && Date.now() >= deadline) {
+            throw new Error('App evaluation timed out');
           }
         }
         if (!cdpSession.isConnected) {
