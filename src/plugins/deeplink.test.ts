@@ -12,6 +12,7 @@ type RegisteredTool = {
 function createHarness(options: {
   target?: MetroTarget | null;
   targets?: Array<MetroTarget | null>;
+  connected?: boolean;
   iosPlist?: unknown;
   appContainer?: string;
   androidDump?: string;
@@ -39,7 +40,7 @@ function createHarness(options: {
     cdp: {
       on: () => {},
       off: () => {},
-      isConnected: true,
+      isConnected: options.connected ?? true,
       getTarget: () => {
         if (!options.targets) return target;
         const index = Math.min(targetCallCount, options.targets.length - 1);
@@ -216,6 +217,48 @@ describe('list_url_schemes', () => {
     });
     expect(harness.calls.some(({ command, args }) =>
       command === 'adb' && args.includes('dump'))).toBe(false);
+  });
+
+  test('requires a bundle ID without using stale target metadata after disconnect', async () => {
+    const harness = createHarness({
+      connected: false,
+      target: {
+        id: 'stale-target', title: 'Stale app', description: 'React Native', type: 'node',
+        appId: 'com.example.stale', deviceName: 'Old iPhone',
+        reactNative: { logicalDeviceId: 'STALE-UDID' },
+      },
+    });
+    const tool = await harness.setup();
+
+    expect(await call(tool, {}))
+      .toBe('Bundle ID is required when no connected app target is available.');
+    expect(harness.calls).toEqual([]);
+    expect(harness.getTargetCallCount()).toBe(0);
+  });
+
+  test('discovers and queries the replacement sole simulator for an explicit bundle ID', async () => {
+    const harness = createHarness({
+      connected: false,
+      target: {
+        id: 'stale-target', title: 'Stale app', description: 'React Native', type: 'node',
+        appId: 'com.example.stale', deviceName: 'Old iPhone',
+        reactNative: { logicalDeviceId: 'STALE-UDID' },
+      },
+      iosPlist: { CFBundleURLTypes: [{ CFBundleURLSchemes: ['replacement'] }] },
+    });
+    const tool = await harness.setup();
+
+    expect(await call(tool, { bundleId: 'com.example.requested' })).toEqual(['replacement']);
+    expect(harness.calls).toContainEqual({
+      command: 'xcrun',
+      args: ['simctl', 'list', 'devices', 'booted', '--json'],
+    });
+    expect(harness.calls).toContainEqual({
+      command: 'xcrun',
+      args: ['simctl', 'get_app_container', 'SIM-UDID', 'com.example.requested', 'app'],
+    });
+    expect(harness.calls.some(({ args }) => args.includes('STALE-UDID'))).toBe(false);
+    expect(harness.getTargetCallCount()).toBe(0);
   });
 });
 
