@@ -124,16 +124,17 @@ export async function reloadApp(ctx: PluginContext, timeout: number): Promise<Re
   const requireOriginalRuntime = async () => {
     if (Date.now() >= deadline) throw new Error('Reload deadline exceeded before dispatch');
     if (!sameTarget()) throw new Error('Connected app changed before reload dispatch.');
-    const present = await beforeDeadline(ctx.evalInApp(`globalThis[${marker}] === true`, {
+    const present = await beforeDeadline(ctx.evalInApp(`this[${marker}] === true`, {
       awaitPromise: true, timeout: Math.max(1, deadline - Date.now()),
     }), deadline);
     if (present !== true || !sameTarget()) throw new Error('App runtime changed before reload dispatch; reload was not sent.');
   };
   try {
     const installed = await ctx.evalInApp(`(function() {
-      globalThis[${marker}] = true;
-      setTimeout(function() { delete globalThis[${marker}]; }, ${timeout + 60_000});
-      return globalThis[${marker}];
+      var root = this;
+      root[${marker}] = true;
+      root.setTimeout(function() { delete root[${marker}]; }, ${timeout + 60_000});
+      return root[${marker}];
     })()`, { awaitPromise: true, timeout: Math.max(1, deadline - Date.now()) });
     if (installed !== true || !sameTarget()) throw new Error('Connected app changed before reload dispatch.');
     await requireOriginalRuntime();
@@ -178,7 +179,7 @@ export async function reloadApp(ctx: PluginContext, timeout: number): Promise<Re
         // Let the shared evaluator reconnect after a reload drops the CDP
         // target. Validate the refreshed target pin only after that read so a
         // reconnect to another app can never be reported as a restart.
-        const present = await beforeDeadline(ctx.evalInApp(`globalThis[${marker}] === true`, {
+        const present = await beforeDeadline(ctx.evalInApp(`this[${marker}] === true`, {
           awaitPromise: true, timeout: Math.max(1, Math.min(1000, deadline - Date.now())),
         }), deadline);
         if (present === false && sameTarget()) {

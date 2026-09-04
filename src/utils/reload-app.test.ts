@@ -95,6 +95,15 @@ describe('verified app reload', () => {
     expect(app.reloads).toBe(1);
   });
 
+  test('uses the intrinsic global when evaluated source shadows globalThis', async () => {
+    const app = harness(async () => { app.restart(); });
+    expect(await app.ctx.evalInApp('let globalThis = null; 42')).toBe(42);
+    expect(await reloadApp(app.ctx, 100)).toMatchObject({
+      status: 'reloaded', method: 'Page.reload', dispatch: 'submitted', verified: true,
+    });
+    expect(app.reloads).toBe(1);
+  });
+
   test('a successful command response alone is unverified', async () => {
     const app = harness(async () => ({}));
     expect(await reloadApp(app.ctx, 100)).toMatchObject({ status: 'unverified', verified: false });
