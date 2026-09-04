@@ -29,6 +29,7 @@ async function createAppOnlyHarness(
     submitBehavior?: 'newline' | 'submit' | 'blurAndSubmit';
     blurOnSubmit?: boolean;
     multiline?: boolean;
+    value?: string;
   } = {},
   connectedLogicalDeviceId?: string,
   sharedInventoryDeviceId = false,
@@ -150,7 +151,7 @@ async function createAppOnlyHarness(
         };
         const fabric = evaluation.startsWith('fabric-');
         const controlled = !evaluation.endsWith('-uncontrolled');
-        const value = evaluation.endsWith('-empty') ? '' : 'hello';
+        const value = inputBehavior.value ?? (evaluation.endsWith('-empty') ? '' : 'hello');
         const host = {
           stateNode: fabric ? { canonical: { publicInstance } } : publicInstance,
           child: null,
@@ -301,6 +302,16 @@ describe('UI handler actions without native inventory', () => {
         { command: 'adb', args: ['-s', 'emulator-42', 'shell', 'input', 'keyevent', '67'] },
       ]);
     }
+  });
+
+  test('deletes a complete non-BMP code point from controlled inputs', async () => {
+    const harness = await createAppOnlyHarness('paper-focused', false, { value: 'A😀' });
+    const press = harness.tools.get('press_button')!;
+    expect(await press.handler(press.parameters.parse({ button: 'DELETE' }) as Record<string, unknown>))
+      .toBe('Pressed DELETE');
+    expect(harness.reactCalls).toEqual([
+      { type: 'change', value: 'A' },
+    ]);
   });
 
   test('preserves Android controlled TextInput submit and blur behavior', async () => {

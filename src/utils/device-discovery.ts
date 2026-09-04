@@ -299,13 +299,13 @@ export async function resolveDevice(
       iosResult.status === 'fulfilled' &&
       isUnavailableToolError(androidResult.reason)
     ) {
-      const nameMatches = findIosNames(iosResult.value, connectedName);
-      if (nameMatches.length === 1) return toResolvedIos(nameMatches[0]);
       // A connected opaque inspector ID plus one booted simulator is the
       // symmetric iOS case: the missing Android executable cannot hide a
-      // competing local Android device.
+      // competing local Android device. A matching name alone cannot prove
+      // that the connected target is iOS, so require the target to omit a
+      // name before using this sole-device fallback.
       if (connectedId && iosResult.value.length === 1 &&
-        (!connectedName || nameMatches.length === 1)) {
+        !connectedName) {
         return toResolvedIos(iosResult.value[0]);
       }
     }

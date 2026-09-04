@@ -447,7 +447,16 @@ export const uiInteractPlugin = definePlugin({
                 if (submitBehavior === 'blurAndSubmit' && instance &&
                   typeof instance.blur === 'function') instance.blur();
               } else {
-                props.onChangeText(props.value.slice(0, -1));
+                var value = props.value;
+                var end = value.length;
+                var last = end > 0 ? value.charCodeAt(end - 1) : 0;
+                var previous = end > 1 ? value.charCodeAt(end - 2) : 0;
+                // Remove one complete Unicode code point. Hermes supports
+                // these primitive operations on all supported RN versions.
+                if (last >= 0xdc00 && last <= 0xdfff &&
+                  previous >= 0xd800 && previous <= 0xdbff) end -= 2;
+                else if (end > 0) end -= 1;
+                props.onChangeText(value.slice(0, end));
               }
               handled = true;
               return { prune: true };
