@@ -545,7 +545,7 @@ describe('shared app evaluation policy', () => {
       'if (true) Promise.reject(new Error("if completion rejection"));',
       'if (false) {} else Promise.reject(new Error("else completion rejection"));',
       'try { Promise.reject(new Error("try completion rejection")); } finally {}',
-      'try { Promise.reject(new Error("try/finally completion rejection")); } finally { Promise.resolve(1); }',
+      'try { Promise.resolve(1); } finally { Promise.reject(new Error("try/finally completion rejection")); }',
       'switch (1) { case 1: Promise.resolve(1); case 2: Promise.reject(new Error("switch completion rejection")); break; }',
     ];
     let unhandledRejections = 0;
@@ -680,7 +680,29 @@ describe('shared app evaluation policy', () => {
       .resolves.toBe(2);
   });
 
-  test('keeps guarded values only when a finally exit is not taken', async () => {
+  test('returns normal finally values as direct Hermes evaluation does', async () => {
+    for (const source of [
+      'try { 1; } finally { 2; }',
+      'L: try { 1; } finally { 2; if (false) break L; }',
+      'try { Promise.resolve(1); } finally { Promise.resolve(2); }',
+      'L: try { Promise.resolve(1); } finally { Promise.resolve(2); if (false) break L; }',
+      'L: { try { Promise.resolve(1); break L; } finally { Promise.resolve(2); } }',
+    ]) {
+      const evaluate = createAppEvaluator(vmTransport().transport, lifecycle());
+      await expect(evaluate(source, { awaitPromise: true, timeout: 1000 })).resolves.toBe(2);
+    }
+  });
+
+  test('does not observe a guarded thenable replaced by a normal finalizer', async () => {
+    const evaluate = createAppEvaluator(vmTransport().transport, lifecycle());
+    await expect(evaluate(
+      'this.finallyThenCalls = 0; try { ({ then(resolve) { finallyThenCalls += 1; resolve(1); } }); } finally { Promise.resolve(2); }',
+      { awaitPromise: true, timeout: 1000 },
+    )).resolves.toBe(2);
+    await expect(evaluate('finallyThenCalls', { awaitPromise: true, timeout: 1000 })).resolves.toBe(0);
+  });
+
+  test('preserves the last reached Hermes value through normal and abrupt finalizers', async () => {
     const taken = createAppEvaluator(vmTransport().transport, lifecycle());
     await expect(taken(
       'globalThis.flag = true; L: try { Promise.resolve("guarded"); } finally { if (flag) break L; }',
@@ -703,7 +725,7 @@ describe('shared app evaluation policy', () => {
     await expect(skippedAfterValue(
       'globalThis.flag = false; L: try { Promise.resolve("guarded"); } finally { Promise.resolve("discarded finalizer"); if (flag) break L; }',
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBe('guarded');
+    )).resolves.toBe('discarded finalizer');
 
     const takenAfterValue = createAppEvaluator(vmTransport().transport, lifecycle());
     await expect(takenAfterValue(
@@ -715,19 +737,19 @@ describe('shared app evaluation policy', () => {
     await expect(skippedContinueAfterValue(
       'let i = 0; outer: while (i < 1) { i += 1; try { Promise.resolve("guarded"); } finally { Promise.resolve("discarded finalizer"); if (i > 1) continue outer; } }',
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBe('guarded');
+    )).resolves.toBe('discarded finalizer');
 
     const nested = createAppEvaluator(vmTransport().transport, lifecycle());
     await expect(nested(
       'L: try { Promise.resolve("guarded"); } finally { try { Promise.resolve("discarded outer finalizer"); } finally { Promise.resolve("discarded inner finalizer"); if (false) break L; } }',
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBe('guarded');
+    )).resolves.toBe('discarded inner finalizer');
 
     const directive = createAppEvaluator(vmTransport().transport, lifecycle());
     await expect(directive(
       'L: try { Promise.resolve("guarded"); } finally { "use strict"; Promise.resolve("discarded finalizer"); if (false) break L; }',
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBe('guarded');
+    )).resolves.toBe('discarded finalizer');
 
     const nestedFinallyExit = createAppEvaluator(vmTransport().transport, lifecycle());
     await expect(nestedFinallyExit(
@@ -739,7 +761,7 @@ describe('shared app evaluation policy', () => {
     await expect(nestedConditionalFinallyExit(
       'globalThis.flag = false; L: try { Promise.resolve("outer"); } finally { try { Promise.resolve("inner"); } finally { if (flag) break L; } }',
       { awaitPromise: true, timeout: 1000 },
-    )).resolves.toBe('outer');
+    )).resolves.toBe('inner');
 
     const nestedFinallyContinue = createAppEvaluator(vmTransport().transport, lifecycle());
     await expect(nestedFinallyContinue(
