@@ -177,6 +177,44 @@ describe('scheduled reconnect takeover', () => {
     expect(timers.filter((timer) => !timer.cancelled)).toHaveLength(1);
   });
 
+  test('schedules a retry when the connection drops before a successful attempt settles', async () => {
+    type FakeTimer = { callback: () => void; delay: number; cancelled: boolean };
+    const timers: FakeTimer[] = [];
+    const timerApi = {
+      setTimeout(callback: () => void, delay: number) {
+        const timer = { callback, delay, cancelled: false };
+        timers.push(timer);
+        return timer as unknown as ReturnType<typeof setTimeout>;
+      },
+      clearTimeout(handle: ReturnType<typeof setTimeout>) {
+        (handle as unknown as FakeTimer).cancelled = true;
+      },
+    };
+    let resolveAttempt: ((connected: boolean) => void) | undefined;
+    let isConnected = true;
+    const controller = createReconnectController({
+      connect: () => new Promise<boolean>((resolve) => { resolveAttempt = resolve; }),
+      isConnected: () => isConnected,
+      isClosed: () => false,
+      timers: timerApi,
+      delays: [500],
+      maxBurstAttempts: 1,
+      backgroundDelay: 30_000,
+    });
+
+    const attempt = controller.connectNow();
+    await Promise.resolve();
+    // Model connectToTarget opening the socket, then CDP emitting
+    // `disconnected` before performConnectToMetro settles.
+    isConnected = false;
+    controller.schedule();
+    resolveAttempt?.(true);
+
+    await expect(attempt).resolves.toBe(false);
+    expect(timers.filter((timer) => !timer.cancelled)).toHaveLength(1);
+    expect(timers.find((timer) => !timer.cancelled)?.delay).toBe(500);
+  });
+
   test('keeps escalated backoff when a reconnect flaps before stability', async () => {
     type FakeTimer = {
       callback: () => void;

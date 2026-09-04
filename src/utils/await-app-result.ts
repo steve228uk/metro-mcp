@@ -226,8 +226,14 @@ export async function awaitAppResult(
       Math.min(timeout, deadline - Date.now()),
     ) + 1000;
     const mailboxSetup = `(function() {
-      var state = { status: 'pending' };
       var root = this;
+      var PromiseCtor = root.Promise;
+      var state = {
+        status: 'pending',
+        promiseConstructor: PromiseCtor,
+        promiseResolve: PromiseCtor && PromiseCtor.resolve,
+        promiseThen: PromiseCtor && PromiseCtor.prototype && PromiseCtor.prototype.then
+      };
       root.Object.defineProperty(root, ${key}, {
         value: state, configurable: true
       });
