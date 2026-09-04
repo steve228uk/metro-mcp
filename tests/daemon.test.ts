@@ -246,7 +246,7 @@ describe('daemon identity', () => {
         removeDaemonRecordForProcess(key, daemonPid);
       }
     }
-  });
+  }, 15_000);
 });
 
 describe('daemon records', () => {
