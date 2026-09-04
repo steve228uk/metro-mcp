@@ -453,7 +453,13 @@ export class NativeInputController {
   }
 
   async providersFor(target: NativeInputTarget, deadline = this.simviewDeadline()): Promise<Provider[]> {
-    if (!this.providers) this.providers = await discoverNativeProviders(this.options, deadline);
+    // Keep successful discovery cheap, but do not make an unavailable
+    // provider permanent for the lifetime of the controller. A provider can
+    // be installed, added to PATH, or recover from a transient probe failure
+    // while the daemon is still running.
+    if (!this.providers || this.providers.some((provider) => !provider.available)) {
+      this.providers = await discoverNativeProviders(this.options, deadline);
+    }
     return this.providers.filter((provider) =>
       this.config.nativeBackend === 'auto' || provider.kind === this.config.nativeBackend,
     ).filter((provider) => target.platform === 'ios' || provider.kind === 'simview');
@@ -569,7 +575,7 @@ export class NativeInputController {
           const interaction = tapped.interaction && typeof tapped.interaction === 'object'
             ? tapped.interaction as Record<string, unknown>
             : undefined;
-          const accepted = interaction?.accepted;
+          const accepted = typeof interaction?.accepted === 'boolean' ? interaction.accepted : tapped.accepted;
           const inputDispatched = typeof interaction?.inputDispatched === 'boolean'
             ? interaction.inputDispatched
             : tapped.inputDispatched;
@@ -585,6 +591,14 @@ export class NativeInputController {
             );
           }
           if (accepted === false) return result('simview', 'failed', dispatched, 'SimView rejected the semantic tap', dispatched ? 'submitted' : 'not-sent');
+          if (accepted === true && inputDispatched === false) {
+            return result(
+              'simview',
+              this.config.nativeBackend === 'auto' ? 'unsupported' : 'failed',
+              false,
+              'SimView accepted the request without dispatching input',
+            );
+          }
           if (accepted !== true || inputDispatched !== true) return result('simview', 'failed', dispatched, 'SimView returned no complete semantic action receipt', dispatched ? 'submitted' : 'unknown');
           return result('simview', 'handled', true);
         });
@@ -665,7 +679,14 @@ export class NativeInputController {
             return result('simview', 'failed', dispatched, 'SimView reported that it is unsafe to continue after the long press', dispatchEvidence(inputDispatched));
           }
           if (accepted === false) return result('simview', 'failed', dispatched, 'SimView rejected the long press', dispatched ? 'submitted' : 'not-sent');
-          if (accepted === true && inputDispatched === false) return result('simview', 'failed', false, 'SimView accepted the request without dispatching input');
+          if (accepted === true && inputDispatched === false) {
+            return result(
+              'simview',
+              this.config.nativeBackend === 'auto' ? 'unsupported' : 'failed',
+              false,
+              'SimView accepted the request without dispatching input',
+            );
+          }
           if (accepted !== true) return result('simview', 'failed', dispatched, 'SimView returned no accepted long press receipt', dispatched ? 'submitted' : 'unknown');
           // SimView's public long_press output schema is `{ accepted: true }`.
           // Newer implementations may add inputDispatched telemetry, but the
@@ -950,7 +971,17 @@ export class NativeInputController {
           );
         }
         if (accepted === false) return result('simview', 'failed', dispatched, 'SimView rejected the action', dispatched ? 'submitted' : 'not-sent');
-        if (accepted === true && inputDispatched === false) return result('simview', 'failed', false, 'SimView accepted the request without dispatching input');
+        if (accepted === true && inputDispatched === false) {
+          // In auto mode SimView has explicitly proved that no input was
+          // dispatched, so another provider may safely take over. Preserve a
+          // terminal failure for explicit SimView selection.
+          return result(
+            'simview',
+            this.config.nativeBackend === 'auto' ? 'unsupported' : 'failed',
+            false,
+            'SimView accepted the request without dispatching input',
+          );
+        }
         if (accepted !== true) return result('simview', 'failed', dispatched, 'SimView returned no accepted action receipt', dispatched ? 'submitted' : 'unknown');
         return result('simview', 'handled', true);
       } catch (error) {

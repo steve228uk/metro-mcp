@@ -93,6 +93,51 @@ describe('native input providers', () => {
     expect(directoryReads).toBe(1);
   });
 
+  test('retries unavailable provider discovery so a later installation can recover', async () => {
+    const runner = fakeRunner();
+    const baseExecFile = runner.execFile;
+    let simviewInstalled = false;
+    runner.execFile = async (command, args, options) => {
+      if (command === 'which' && args[0] === 'simview') {
+        runner.calls.push({ command, args });
+        if (!simviewInstalled) throw new Error('simview is not installed');
+        return Buffer.from('/usr/local/bin/simview');
+      }
+      if (command === '/usr/local/bin/simview' && args.at(-1) === '--version') return Buffer.from('0.4.0');
+      return baseExecFile(command, args, options);
+    };
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'tap'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:recoverable-device', capabilities: { input: { touch: true } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        return { structuredContent: { accepted: true, inputDispatched: true } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', idbCommand: 'idb' },
+      runner,
+      simviewFileSystem: {
+        executable: async () => false,
+        readDirectory: async () => [],
+        readFile: async () => '',
+      },
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    await expect(controller.tap({ platform: 'ios', id: 'recoverable-device' }, 1, 2)).resolves.toMatchObject({
+      backend: 'idb', status: 'handled', dispatched: true,
+    });
+    simviewInstalled = true;
+    await expect(controller.tap({ platform: 'ios', id: 'recoverable-device' }, 3, 4)).resolves.toMatchObject({
+      backend: 'simview', status: 'handled', dispatched: true,
+    });
+    expect(runner.calls.filter(({ command, args }) => command === 'which' && args[0] === 'simview')).toHaveLength(2);
+    await controller.close();
+  });
+
   test('keeps a PATH SimView ahead of a stalled plugin cache scan', async () => {
     const runner = fakeRunner();
     const baseExecFile = runner.execFile;
@@ -839,6 +884,34 @@ describe('native input providers', () => {
     await expect(controller.tap({ platform: 'ios', id: 'device-a' }, 1, 2)).resolves.toMatchObject({
       backend: 'simview', status: 'failed', dispatched: false, dispatch: 'not-sent',
     });
+  });
+
+  test('falls through to IDB when SimView explicitly reports that input was not sent', async () => {
+    const runner = fakeRunner();
+    const calls: string[] = [];
+    const client = {
+      connect: async () => {},
+      listTools: async () => ({ tools: ['connect_device', 'get_simview_state', 'observe_screen', 'tap'].map((name) => ({ name })) }),
+      callTool: async ({ name }: { name: string; arguments: Record<string, unknown> }) => {
+        calls.push(name);
+        if (name === 'get_simview_state') return { structuredContent: { device: { id: 'ios:not-sent-device', capabilities: { input: { touch: true } } } } };
+        if (name === 'observe_screen') return { structuredContent: { viewport: { width: 400, height: 800 } } };
+        return { structuredContent: { accepted: true, inputDispatched: false } };
+      },
+      close: async () => {},
+    };
+    const controller = new NativeInputController({
+      config: { nativeBackend: 'auto', simviewCommand: '/bin/echo', idbCommand: 'idb' },
+      runner,
+      simviewClientFactory: () => ({ client, transport: { close: async () => {} } }),
+    });
+
+    await expect(controller.tap({ platform: 'ios', id: 'not-sent-device' }, 1, 2)).resolves.toMatchObject({
+      backend: 'idb', status: 'handled', dispatched: true, dispatch: 'submitted',
+    });
+    expect(calls).toContain('tap');
+    expect(runner.calls).toContainEqual({ command: 'idb', args: ['ui', 'tap', '1', '2', '--udid', 'not-sent-device'] });
+    await controller.close();
   });
 
   test('uses the public semantic search match element ref and stops on tap uncertainty', async () => {
