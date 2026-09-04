@@ -58,6 +58,9 @@ type DeadlineEvaluate<T> = (
   options: { timeout?: number; deadline: number; objectGroup?: string },
 ) => Promise<T>;
 
+const RELEASE_GROUP_TIMEOUT_MS = 100;
+const RELEASE_GROUP_AFTER_DEADLINE_MS = 250;
+
 async function evaluateBeforeDeadline<T>(
   evaluate: DeadlineEvaluate<T>,
   expression: string,
@@ -194,14 +197,19 @@ export async function awaitAppResult(
     : Math.min(timeoutDeadline, options.deadline);
   let sourceCompletedByValue = false;
   let remoteHandleReleased = false;
+  let sourceEvaluationStarted = false;
   let sourceEvaluation: Promise<AppEvaluationCompletion> | undefined;
   let sourceEvaluationSettled = false;
 
   const releaseGroup = async (): Promise<void> => {
     if (!options?.releaseObjectGroup) return;
     const remaining = deadline - Date.now();
-    if (remaining <= 0) return;
-    const releaseTimeout = Math.min(100, remaining);
+    // Cleanup is detached from the caller, so it may use a small independent
+    // budget after the caller deadline to release a handle whose evaluate
+    // response arrived late. Before the deadline, retain the caller bound.
+    const releaseTimeout = remaining > 0
+      ? Math.min(RELEASE_GROUP_TIMEOUT_MS, remaining)
+      : RELEASE_GROUP_AFTER_DEADLINE_MS;
     const releaseDeadline = Date.now() + releaseTimeout;
     await awaitPromiseBeforeDeadline(
       options.releaseObjectGroup(objectGroup, { timeout: releaseTimeout }),
@@ -247,6 +255,7 @@ export async function awaitAppResult(
     let completion: AppEvaluationCompletion;
     if (options?.evaluateScript) {
       if (Date.now() >= deadline) throw timeoutError(timeout);
+      sourceEvaluationStarted = true;
       sourceEvaluation = options.evaluateScript(expression, {
         timeout,
         deadline,
@@ -319,7 +328,7 @@ export async function awaitAppResult(
     // Runtime.evaluate may still complete after the host-side deadline and
     // return an object handle that never reaches settleRemote. Release the
     // whole group best effort so late completions cannot accumulate handles.
-    if (!sourceCompletedByValue && !remoteHandleReleased) {
+    if (sourceEvaluationStarted && !sourceCompletedByValue && !remoteHandleReleased) {
       // Cleanup has its own transport and host deadline. Keep it detached so
       // a result found within the caller's deadline is never delayed past it.
       void releaseGroup();
