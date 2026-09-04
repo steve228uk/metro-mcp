@@ -222,6 +222,8 @@ export interface PluginContext {
   evalInApp(expression: string, options?: EvalOptions): Promise<unknown>;
   /** Returns the active device key (`${port}-${targetId}`), or null if not connected. */
   getActiveDeviceKey(): string | null;
+  /** Monotonic runtime generation; changes invalidate in-flight app targets. */
+  getRuntimeGeneration?(): number;
   /** Returns a human-readable name for the active device, or null if not connected. */
   getActiveDeviceName(): string | null;
   /** Notify subscribed clients that a resource's content has changed */

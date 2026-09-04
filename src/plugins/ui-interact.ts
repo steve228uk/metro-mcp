@@ -15,9 +15,18 @@ import {
   discoverBootedSimulators,
   getConnectedDeviceTarget,
   resolveDevice,
+  snapshotConnectedDeviceTarget,
+  type ResolvedDevice,
 } from '../utils/device-discovery.js';
 import { NativeInputController, type NativeDispatchResult, type NativeInputConfig } from '../utils/native-input.js';
 import { isAppEvaluationError } from '../utils/evaluate-app.js';
+
+interface PreparedTarget {
+  target: ResolvedDevice | null;
+  canUseReact: boolean;
+  isCurrent(): boolean;
+  isTargetCurrent(): boolean;
+}
 
 // Connection setup failures happen before Runtime.evaluate is dispatched, so
 // native input remains safe. Any other rejection may follow an app-side action
@@ -54,29 +63,70 @@ export const uiInteractPlugin = definePlugin({
       const outcome = dispatch.status === 'handled' ? action : `${action} failed`;
       return `${outcome} [backend=${dispatch.backend}, dispatch=${dispatch.dispatch}, dispatched=${dispatch.dispatched}, status=${dispatch.status}]${dispatch.message ? `: ${dispatch.message}` : ''}`;
     };
-    const prepareExplicitTarget = async (platform: 'ios' | 'android') => {
-      const connected = getConnectedDeviceTarget(ctx);
-      const logicalId = connected?.reactNative?.logicalDeviceId?.trim();
-      const target = await resolveDevice(ctx, platform, connected);
+    const prepareExplicitTarget = async (platform: 'ios' | 'android'): Promise<PreparedTarget> => {
+      const connectedSnapshot = snapshotConnectedDeviceTarget(getConnectedDeviceTarget(ctx));
+      const hasConnectedSnapshot = connectedSnapshot !== undefined;
+      const targetId = connectedSnapshot?.id?.trim();
+      const logicalId = connectedSnapshot?.reactNative?.logicalDeviceId?.trim();
+      const generation = ctx.getRuntimeGeneration?.();
+      const target = await resolveDevice(ctx, platform, connectedSnapshot);
       const sameId = (left: string, right: string, idPlatform: 'ios' | 'android') =>
-        idPlatform === 'ios' ? left.toLowerCase() === right.toLowerCase() : left === right;
+        idPlatform === 'ios'
+          ? left.toLowerCase() === right.toLowerCase()
+          : left === right;
+      const isTargetCurrent = () => {
+        // An explicit platform request may legitimately have no CDP target
+        // yet. In that case inventory resolution is the native target source;
+        // there is no prior target to become stale.
+        if (!hasConnectedSnapshot) return true;
+        const current = getConnectedDeviceTarget(ctx);
+        if (!current) return false;
+        if (targetId && current.id?.trim() !== targetId) return false;
+        const currentLogicalId = current.reactNative?.logicalDeviceId?.trim();
+        if (logicalId && (!currentLogicalId || !sameId(currentLogicalId, logicalId, platform))) {
+          return false;
+        }
+        return true;
+      };
+      const isCurrent = () => {
+        if (!isTargetCurrent()) return false;
+        const currentGeneration = ctx.getRuntimeGeneration?.();
+        return generation === undefined || currentGeneration === undefined ||
+          currentGeneration === generation;
+      };
       if (!target || !logicalId || !sameId(target.id, logicalId, platform)) {
-        return { target, canUseReact: false };
+        return { target, canUseReact: false, isCurrent, isTargetCurrent };
       }
+      const verifiedLogicalId = logicalId;
+
+      // A requested-platform match alone cannot prove which runtime owns a
+      // connected logical ID. The opposite inventory must also be available
+      // and must not contain that ID before app-side dispatch is permitted.
       try {
         let oppositeHasId = false;
         if (platform === 'ios') {
           const opposite = await discoverAndroidDevices(ctx);
-          oppositeHasId = opposite.some((device) => sameId(device.id, logicalId, 'android'));
+          oppositeHasId = opposite.some(
+            (device) => sameId(device.id, verifiedLogicalId, 'android'),
+          );
         } else {
           const opposite = await discoverBootedSimulators(ctx);
-          oppositeHasId = opposite.some((device) => sameId(device.udid, logicalId, 'ios'));
+          oppositeHasId = opposite.some((device) => sameId(device.udid, verifiedLogicalId, 'ios'));
         }
-        return { target, canUseReact: !oppositeHasId };
+        return { target, canUseReact: !oppositeHasId, isCurrent, isTargetCurrent };
       } catch {
-        return { target, canUseReact: false };
+        // Without a successful opposite inventory, the ID's platform is not
+        // proven. Keep the requested target for native fallback.
+        return { target, canUseReact: false, isCurrent, isTargetCurrent };
       }
     };
+
+    const canUsePreparedReact = (prepared: PreparedTarget | undefined) =>
+      !prepared || (prepared.canUseReact && prepared.isCurrent());
+
+    const preparedNativeTarget = (
+      prepared: PreparedTarget,
+    ) => prepared.isTargetCurrent() ? prepared.target : null;
 
     ctx.registerTool('list_elements', {
       description:
@@ -149,7 +199,7 @@ export const uiInteractPlugin = definePlugin({
         // ── Label/testID tap: CDP fiber tree (works on both platforms) ───────
         const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsLabel = JSON.stringify(label);
-        const tapped = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
+        const tapped = canUsePreparedReact(prepared) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             ${FIND_AND_INVOKE_JS}
@@ -161,7 +211,7 @@ export const uiInteractPlugin = definePlugin({
         });
         if (tapped) return `Tapped "${label}"`;
 
-        const target = prepared ? prepared.target : await resolveTarget(platform);
+        const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
 
         const dispatch = await nativeInput.tapLabel(target, label);
@@ -186,7 +236,7 @@ export const uiInteractPlugin = definePlugin({
         const prepared = platform === 'auto' ? undefined : await prepareExplicitTarget(platform);
         const jsText = JSON.stringify(text);
         const jsTestID = testID ? JSON.stringify(testID) : 'null';
-        const typed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(buildFiberReadExpression(`
+        const typed = canUsePreparedReact(prepared) && await ctx.evalInApp(buildFiberReadExpression(`
           ${FIBER_ROOT_JS}
           var targetID = ${jsTestID};
           var target = null;
@@ -211,7 +261,7 @@ export const uiInteractPlugin = definePlugin({
         });
         if (typed) return `Typed "${text}"`;
 
-        const target = prepared ? prepared.target : await resolveTarget(platform);
+        const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
         const dispatch = await nativeInput.typeText(target, text);
         return nativeResult(`Typed "${text}"`, dispatch);
@@ -237,7 +287,7 @@ export const uiInteractPlugin = definePlugin({
           : undefined;
         if (label && !hasCoordinates) {
           const jsLabel = JSON.stringify(label);
-          const pressed = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
+          const pressed = canUsePreparedReact(prepared) && await ctx.evalInApp(`
             (function() {
               ${FIBER_ROOT_JS}
               ${FIND_AND_INVOKE_JS}
@@ -259,7 +309,7 @@ export const uiInteractPlugin = definePlugin({
         }
 
         if (label) {
-          const target = prepared ? prepared.target : await resolveTarget(platform);
+          const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
           const dispatch = await nativeInput.longPressLabel(target, label, duration);
           return nativeResult(`Long pressed "${label}"`, dispatch);
@@ -283,7 +333,7 @@ export const uiInteractPlugin = definePlugin({
 
         // ── CDP: find ScrollView and invoke scrollTo on its native node ────────
         const jsDir = JSON.stringify(direction);
-        const scrolled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(`
+        const scrolled = canUsePreparedReact(prepared) && await ctx.evalInApp(`
           (function() {
             ${FIBER_ROOT_JS}
             var dir = ${jsDir};
@@ -330,7 +380,7 @@ export const uiInteractPlugin = definePlugin({
         if (scrolled) result = `Swiped ${direction}`;
 
         if (!result) {
-          const target = prepared ? prepared.target : await resolveTarget(platform);
+          const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
           if (!target) return 'No simulator/emulator detected.';
           // ── Native fallback using current device geometry ───────────────────
           const dispatch = await nativeInput.swipeDirection(target, direction, 300);
@@ -339,7 +389,7 @@ export const uiInteractPlugin = definePlugin({
         }
 
         // ── Log to test recorder if a recording is active ─────────────────────
-        if (prepared?.canUseReact ?? true) await ctx.evalInApp(`
+        if (canUsePreparedReact(prepared)) await ctx.evalInApp(`
           (function() {
             if (!globalThis.__METRO_MCP_REC_ACTIVE__) return;
             ${GET_ROUTE_FUNC_JS}
@@ -370,7 +420,7 @@ export const uiInteractPlugin = definePlugin({
         // ── ENTER/DELETE: bounded CDP handler on every platform ───────────────
         if (button === 'ENTER' || button === 'DELETE') {
           const handler = button === 'ENTER' ? 'onSubmitEditing' : 'onChangeText';
-          const handled = (prepared?.canUseReact ?? true) && await ctx.evalInApp(buildFiberReadExpression(`
+          const handled = canUsePreparedReact(prepared) && await ctx.evalInApp(buildFiberReadExpression(`
             var handled = false;
             var nativeRequired = false;
             metroWalkFibers(FIBER_OPTIONS, function(fiber) {
@@ -472,7 +522,7 @@ export const uiInteractPlugin = definePlugin({
           if (handled) return `Pressed ${button}`;
         }
 
-        const target = prepared ? prepared.target : await resolveTarget(platform);
+        const target = prepared ? preparedNativeTarget(prepared) : await resolveTarget(platform);
         if (!target) return 'No simulator/emulator detected.';
 
         const dispatch = await nativeInput.button(target, button);

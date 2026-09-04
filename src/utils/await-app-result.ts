@@ -213,9 +213,18 @@ export async function awaitAppResult(
         state.observing = true;
         try { fulfill(await value); } catch (error) { reject(error); }
       };
-      root.Object.defineProperty(root, ${key}, {
-        value: state, configurable: true
-      });
+      // Keep setup viable after the app replaces Object or defineProperty.
+      // With normal intrinsics, hide and protect the temporary mailbox as before.
+      var descriptor = {
+        value: state, configurable: true, enumerable: false, writable: false
+      };
+      try {
+        root.Reflect.defineProperty(root, ${key}, descriptor);
+      } catch (_) {}
+      if (root[${key}] !== state) {
+        try { root.Object.defineProperty(root, ${key}, descriptor); } catch (_) {}
+      }
+      if (root[${key}] !== state) root[${key}] = state;
       state.timer = root.setTimeout(function() {
         if (root[${key}] === state) delete root[${key}];
       }, ${mailboxLifetime});
